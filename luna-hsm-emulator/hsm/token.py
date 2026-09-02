@@ -16,6 +16,7 @@ from pkcs11.constants import (
     PKCS11Error, CKR_TOKEN_NOT_PRESENT, CKR_TOKEN_WRITE_PROTECTED,
     CKR_TOKEN_NOT_RECOGNIZED, CKR_SESSION_READ_ONLY,
     CKF_TOKEN_INITIALIZED, CKF_LOGIN_REQUIRED, CKF_RNG,
+    CKR_ACTION_PROHIBITED, CKR_ARGUMENTS_BAD,
 )
 from hsm.auth import AuthManager, ROLE_CO, ROLE_CU, ROLE_SO
 
@@ -595,49 +596,278 @@ class TokenManager:
             lines.append(f"  {name:<30} {kr:<16} {flags}")
         return "\n".join(lines)
 
-    def show_policies(self, slot_id: int) -> str:
-        """Show partition policies (partition showpolicies)."""
+    def show_policies(self, slot_id: int, verbose: bool = False) -> str:
+        """Show partition policies (partition showpolicies).
+
+        Displays all partition capabilities and their corresponding policy
+        settings. With verbose=True, shows full descriptions and
+        destructiveness information.
+        """
+        from hsm.policies import POLICY_CATALOG, format_policies_table
         p = self.storage.get_partition(slot_id)
         if p is None:
             return f"  Slot {slot_id}: No partition present"
 
-        policies = [
-            ("NOSIGNATURE", "Require signed firmware for this partition", True),
-            ("NOLOGINOBJ", "Do not allow login objects", False),
-            ("FORCE_PIN_CHANGE", "Force PIN change on first login", False),
-            ("ALLOW_KEY_CLONE", "Allow key cloning to backup HSM", True),
-            ("ALLOW_KEY_DERIVE", "Allow key derivation operations", True),
-            ("ALLOW_BULK", "Allow bulk data operations", True),
-            ("MIN_PIN_LEN", "Minimum PIN length", 4),
-            ("MAX_PIN_LEN", "Maximum PIN length", 32),
-            ("MAX_LOGIN_ATTEMPTS", "Maximum failed login attempts before lockout", p.get("max_login_attempts", 10)),
-        ]
+        stored = self.storage.get_partition_policies(slot_id)
+        policies = {}
+        for pol in POLICY_CATALOG:
+            policies[pol.policy_id] = stored.get(pol.policy_id, pol.default_value)
 
-        lines = [
-            f"  Partition Policies for '{p['name']}' (slot {slot_id}):",
-            "",
-            f"  {'Policy':<25} {'Description':<50} {'Value'}",
-            "  " + "-" * 90,
-        ]
-        for name, desc, value in policies:
-            lines.append(f"  {name:<25} {desc:<50} {value}")
-        return "\n".join(lines)
+        header = f"  Partition Policies for '{p['name']}' (slot {slot_id}):\n"
+        return header + format_policies_table(policies, verbose=verbose)
 
     def change_policy(self, slot_id: int, policy_name: str, value,
-                      audit=None, session_id: int = 0):
-        """Change a partition policy value (partition changepolicy)."""
+                      audit=None, session_id: int = 0, force: bool = False):
+        """Change a partition policy value (partition changepolicy).
+
+        On a real Luna 7, this is done with:
+          lunacm:> partition changepolicy -policy <id> -value <value>
+
+        Some policy changes are destructive (delete all objects on the
+        partition). The caller must confirm by passing force=True.
+        """
+        from hsm.policies import get_policy, get_policy_by_name, validate_policy_change, check_mutual_exclusion, check_firmware_support
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
 
-        if policy_name.upper() == "MAX_LOGIN_ATTEMPTS":
-            self.storage.update_partition(slot_id, max_login_attempts=int(value))
-            if audit:
-                audit.log(session_id, "SO", "PartitionChangePolicy", success=True,
-                           detail=f"slot={slot_id}, {policy_name}={value}")
+        # Look up policy by name or numeric ID
+        policy = None
+        if isinstance(policy_name, int) or policy_name.isdigit():
+            policy = get_policy(int(policy_name))
         else:
+            policy = get_policy_by_name(policy_name)
+
+        if policy is None:
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
-                              f"Policy '{policy_name}' is not modifiable or does not exist.")
+                              f"Policy '{policy_name}' not found. Use 'partition showpolicies' to see available policies.")
+
+        # Check firmware support
+        current_fw = self._get_firmware_version()
+        if not check_firmware_support(policy, current_fw):
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              f"Policy '{policy.name}' requires firmware {policy.firmware_min} or newer. Current: {current_fw}")
+
+        # Get current value
+        stored = self.storage.get_partition_policies(slot_id)
+        old_value = stored.get(policy.policy_id, policy.default_value)
+
+        # Parse value
+        if policy.value_type == "integer":
+            new_value = int(value)
+        else:
+            new_value = int(value) if isinstance(value, (int, str)) and str(value).isdigit() else (1 if str(value).lower() in ("on", "1", "true", "yes") else 0)
+
+        # Validate the change
+        is_valid, err_msg, is_destructive = validate_policy_change(policy, old_value, new_value)
+        if not is_valid:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, err_msg)
+
+        # Check mutual exclusion using effective values (with defaults)
+        all_policies = {}
+        from hsm.policies import POLICY_CATALOG
+        for pol in POLICY_CATALOG:
+            all_policies[pol.policy_id] = stored.get(pol.policy_id, pol.default_value)
+        all_policies[policy.policy_id] = new_value
+        valid, err = check_mutual_exclusion(all_policies, policy.policy_id, new_value)
+        if not valid:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, err)
+
+        # Check destructiveness
+        if is_destructive and not force:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              f"Changing policy '{policy.name}' is DESTRUCTIVE — it will delete all objects on the partition. "
+                              f"Pass force=True to confirm.")
+
+        # Apply the change
+        self.storage.set_partition_policy(slot_id, policy.policy_id, new_value)
+
+        # If destructive, clear all objects
+        if is_destructive:
+            objs = self.storage.get_all_objects(slot_id)
+            for obj, _ in objs:
+                self.storage.delete_object(obj.handle)
+
+        if audit:
+            audit.log(session_id, "SO", "PartitionChangePolicy", success=True,
+                       detail=f"slot={slot_id}, policy={policy.name}({policy.policy_id}), "
+                              f"value={old_value}->{new_value}"
+                              f"{', DESTRUCTIVE' if is_destructive else ''}")
+
+    def get_policy_value(self, slot_id: int, policy_name: str) -> int:
+        """Get the current value of a partition policy."""
+        from hsm.policies import get_policy, get_policy_by_name, POLICY_CATALOG
+        policy = None
+        if isinstance(policy_name, int) or str(policy_name).isdigit():
+            policy = get_policy(int(policy_name))
+        else:
+            policy = get_policy_by_name(policy_name)
+        if policy is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              f"Policy '{policy_name}' not found.")
+        stored = self.storage.get_partition_policies(slot_id)
+        return stored.get(policy.policy_id, policy.default_value)
+
+    def is_cloning_allowed(self, slot_id: int) -> bool:
+        """Check if private key cloning is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_PRIVATE_KEY_CLONING") == 1
+
+    def is_secret_key_cloning_allowed(self, slot_id: int) -> bool:
+        """Check if secret key cloning is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_SECRET_KEY_CLONING") == 1
+
+    def is_wrapping_allowed(self, slot_id: int) -> bool:
+        """Check if private key wrapping is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_PRIVATE_KEY_WRAPPING") == 1
+
+    def is_secret_key_wrapping_allowed(self, slot_id: int) -> bool:
+        """Check if secret key wrapping is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_SECRET_KEY_WRAPPING") == 1
+
+    def is_unwrapping_allowed(self, slot_id: int) -> bool:
+        """Check if private key unwrapping is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_PRIVATE_KEY_UNWRAPPING") == 1
+
+    def is_secret_key_unwrapping_allowed(self, slot_id: int) -> bool:
+        """Check if secret key unwrapping is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_SECRET_KEY_UNWRAPPING") == 1
+
+    def is_multipurpose_keys_allowed(self, slot_id: int) -> bool:
+        """Check if multipurpose keys are allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_MULTIPURPOSE_KEYS") == 1
+
+    def is_raw_rsa_allowed(self, slot_id: int) -> bool:
+        """Check if raw RSA operations are allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_RAW_RSA_OPERATIONS") == 1
+
+    def is_digest_key_allowed(self, slot_id: int) -> bool:
+        """Check if DigestKey is allowed on this partition."""
+        return self.get_policy_value(slot_id, "ALLOW_DIGEST_KEY") == 1
+
+    def get_min_pin_length(self, slot_id: int) -> int:
+        """Get the minimum PIN length for this partition."""
+        return self.get_policy_value(slot_id, "MIN_PIN_LENGTH")
+
+    def get_max_login_attempts(self, slot_id: int) -> int:
+        """Get the max login attempts for this partition."""
+        return self.get_policy_value(slot_id, "MAX_LOGIN_ATTEMPTS")
+
+    # ------------------------------------------------------------------
+    # Partition Policy Templates (PPT)
+    # ------------------------------------------------------------------
+
+    def list_policy_templates(self) -> list:
+        """List all available PPT templates (predefined + custom)."""
+        from hsm.policies import list_predefined_templates
+        templates = list_predefined_templates()
+        # Add custom templates from storage
+        custom = self.storage.get_all_ppt_templates()
+        for name, data in custom.items():
+            templates.append({
+                "name": name,
+                "description": data.get("description", ""),
+                "policy_count": len(data.get("policies", {})),
+                "custom": True,
+            })
+        return templates
+
+    def get_policy_template(self, name: str) -> Optional[dict]:
+        """Get a PPT template by name (predefined or custom)."""
+        from hsm.policies import get_predefined_template
+        # Check predefined first
+        predef = get_predefined_template(name)
+        if predef:
+            return {"description": predef["description"],
+                    "policies": predef["policies"], "predefined": True}
+        # Check custom
+        custom = self.storage.get_ppt_template(name)
+        if custom:
+            return {"description": custom.get("description", ""),
+                    "policies": custom.get("policies", {}), "predefined": False}
+        return None
+
+    def create_policy_template(self, name: str, description: str,
+                               policies: dict, audit=None, session_id: int = 0):
+        """Create a custom PPT template."""
+        from hsm.policies import validate_template
+        current_fw = self._get_firmware_version()
+        valid, errors = validate_template(policies, current_fw)
+        if not valid:
+            raise PKCS11Error(CKR_ARGUMENTS_BAD,
+                              "Template validation failed: " + "; ".join(errors))
+        self.storage.save_ppt_template(name, description, policies)
+        if audit:
+            audit.log(session_id, "SO", "CreatePolicyTemplate", success=True,
+                       detail=f"name={name}, policies={len(policies)}")
+
+    def delete_policy_template(self, name: str, audit=None, session_id: int = 0):
+        """Delete a custom PPT template."""
+        from hsm.policies import PREDEFINED_TEMPLATES
+        if name.upper() in PREDEFINED_TEMPLATES:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              f"Cannot delete predefined template '{name}'.")
+        deleted = self.storage.delete_ppt_template(name)
+        if not deleted:
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              f"Template '{name}' not found.")
+        if audit:
+            audit.log(session_id, "SO", "DeletePolicyTemplate", success=True,
+                       detail=f"name={name}")
+
+    def apply_policy_template(self, slot_id: int, template_name: str,
+                               audit=None, session_id: int = 0, force: bool = False):
+        """Apply a PPT template to a partition.
+
+        On a real Luna 7, this is done during partition initialization:
+          lunacm:> partition init -policytemplate <name>
+        """
+        from hsm.policies import apply_template_to_policies, validate_template, POLICY_CATALOG, validate_policy_change_safe
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+
+        template = self.get_policy_template(template_name)
+        if template is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              f"Template '{template_name}' not found.")
+
+        template_policies = template["policies"]
+        current_fw = self._get_firmware_version()
+        valid, errors = validate_template(template_policies, current_fw)
+        if not valid:
+            raise PKCS11Error(CKR_ARGUMENTS_BAD,
+                              "Template validation failed: " + "; ".join(errors))
+
+        current = self.storage.get_partition_policies(slot_id)
+        new_policies = apply_template_to_policies(template_policies, current)
+
+        # Check if any changes are destructive
+        any_destructive = False
+        for pid, val in template_policies.items():
+            policy = POLICY_CATALOG[pid] if pid < len(POLICY_CATALOG) else None
+            if policy is None:
+                continue
+            old_val = current.get(pid, policy.default_value)
+            _, _, is_destr = validate_policy_change_safe(policy, old_val, val)
+            if is_destr:
+                any_destructive = True
+
+        if any_destructive and not force:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              "Applying this template is DESTRUCTIVE — it will delete all objects on the partition. "
+                              "Pass force=True to confirm.")
+
+        self.storage.set_partition_policies(slot_id, new_policies)
+
+        if any_destructive:
+            objs = self.storage.get_all_objects(slot_id)
+            for obj, _ in objs:
+                self.storage.delete_object(obj.handle)
+
+        if audit:
+            audit.log(session_id, "SO", "ApplyPolicyTemplate", success=True,
+                       detail=f"slot={slot_id}, template={template_name}"
+                              f"{', DESTRUCTIVE' if any_destructive else ''}")
 
     # ------------------------------------------------------------------
     # Role operations (matching real LunaCM commands)

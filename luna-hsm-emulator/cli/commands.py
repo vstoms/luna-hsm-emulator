@@ -121,7 +121,8 @@ class CommandHandler:
     def cmd_partition(self, args: list):
         """Handle 'partition' commands."""
         if not args:
-            print("  Usage: partition create | delete | list | showinfo | init | changelabel | clear | contents | showmechanism | showpolicies | changepolicy")
+            print("  Usage: partition create | delete | list | showinfo | init | changelabel | clear | contents |")
+            print("         showmechanism | showpolicies | changepolicy | policytemplate")
             return
         sub = args[0]
         args = self._parse_flags(args[1:])
@@ -239,32 +240,167 @@ class CommandHandler:
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            print(self.api.tokens.show_policies(self.active_slot))
+            verbose = "-verbose" in args or "-v" in args
+            print(self.api.tokens.show_policies(self.active_slot, verbose=verbose))
             self._print_explain([
                 "Partition policies control security behaviors on the Luna 7.",
-                "These include key extraction, cloning, PIN rules, and more.",
-                "Policies are set at partition creation time and some cannot be",
-                "changed afterward, ensuring security invariants are maintained.",
+                "Each policy has a capability (inherited from HSM policies) and",
+                "a configurable policy setting. Some changes are destructive —",
+                "they delete all objects on the partition.",
+                "",
+                "Use 'partition showpolicies -verbose' for full descriptions.",
+                "Use 'partition changepolicy -policy <id> -value <v>' to change.",
+                "Use 'partition policytemplate' for template management.",
             ])
         elif sub == "changepolicy":
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            policy_name = self._get_arg(args, "-name")
+            policy_name = self._get_arg(args, "-policy") or self._get_arg(args, "-name")
             value = self._get_arg(args, "-value")
+            force = "-force" in args
             if not policy_name or value is None:
-                print("  Usage: partition changepolicy -name <policy> -value <value>")
+                print("  Usage: partition changepolicy -policy <id_or_name> -value <value> [-force]")
+                print("  Use 'partition showpolicies' to see available policies.")
                 return
             try:
+                # Pre-check: is this destructive?
+                from hsm.policies import get_policy, get_policy_by_name, validate_policy_change_safe
+                policy = None
+                if policy_name.isdigit():
+                    policy = get_policy(int(policy_name))
+                else:
+                    policy = get_policy_by_name(policy_name)
+                if policy:
+                    stored = self.api.storage.get_partition_policies(self.active_slot)
+                    old_val = stored.get(policy.policy_id, policy.default_value)
+                    _, _, is_destr = validate_policy_change_safe(policy, old_val, int(value) if str(value).isdigit() else (1 if str(value).lower() in ("on","1","true","yes") else 0))
+                    if is_destr and not force:
+                        print(f"  WARNING: Changing policy '{policy.name}' is DESTRUCTIVE!")
+                        print(f"  This will delete ALL objects on the partition.")
+                        confirm = input("  Type 'DESTROY' to confirm: ")
+                        if confirm != "DESTROY":
+                            print("  Cancelled.")
+                            return
+                        force = True
                 self.api.tokens.change_policy(
                     self.active_slot, policy_name, value,
-                    audit=self.api.audit, session_id=self.session_id or 0
+                    audit=self.api.audit, session_id=self.session_id or 0,
+                    force=force
                 )
                 print(f"  Policy '{policy_name}' set to '{value}'.")
             except PKCS11Error as e:
                 print(f"  Error: {e}")
+        elif sub == "policytemplate":
+            self._partition_policy_template(args[1:])
         else:
             print(f"  Unknown partition subcommand: {sub}")
+
+    def _partition_policy_template(self, args: list):
+        """Handle 'partition policytemplate' subcommands."""
+        if not args:
+            print("  Usage: partition policytemplate list | show -name <name> |")
+            print("         create -name <name> -desc <desc> -policies <id=val,...> |")
+            print("         delete -name <name> | apply -name <name> [-force]")
+            return
+        sub = args[0]
+        rest = self._parse_flags(args[1:])
+
+        if sub == "list":
+            templates = self.api.tokens.list_policy_templates()
+            print(f"  {'Name':<20} {'Type':<12} {'Policies':<10} {'Description'}")
+            print("  " + "-" * 80)
+            for t in templates:
+                ttype = "Custom" if t.get("custom") else "Predefined"
+                print(f"  {t['name']:<20} {ttype:<12} {t['policy_count']:<10} {t['description'][:50]}")
+            self._print_explain([
+                "Partition Policy Templates (PPT) allow consistent policy",
+                "sets across multiple partitions. Predefined templates cover",
+                "common configurations (FIPS, High Security, Development).",
+                "Custom templates can be created and saved for reuse.",
+            ])
+
+        elif sub == "show":
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: partition policytemplate show -name <name>")
+                return
+            template = self.api.tokens.get_policy_template(name)
+            if template is None:
+                print(f"  Template '{name}' not found.")
+                return
+            print(f"  Template: {name}")
+            print(f"  Type: {'Predefined' if template.get('predefined') else 'Custom'}")
+            print(f"  Description: {template['description']}")
+            print(f"  Policies:")
+            from hsm.policies import POLICY_CATALOG
+            for pid, val in template["policies"].items():
+                policy = POLICY_CATALOG[pid] if pid < len(POLICY_CATALOG) else None
+                pname = policy.name if policy else f"Unknown({pid})"
+                pval = "On" if val == 1 else "Off" if val == 0 else str(val)
+                print(f"    {pid}: {pname} = {pval}")
+
+        elif sub == "create":
+            name = self._get_arg(rest, "-name")
+            desc = self._get_arg(rest, "-desc") or ""
+            policies_str = self._get_arg(rest, "-policies")
+            if not name or not policies_str:
+                print("  Usage: partition policytemplate create -name <name> -desc <desc> -policies <id=val,...>")
+                return
+            policies = {}
+            for pair in policies_str.split(","):
+                if "=" in pair:
+                    pid, val = pair.split("=", 1)
+                    policies[int(pid)] = int(val)
+            try:
+                self.api.tokens.create_policy_template(
+                    name, desc, policies,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Template '{name}' created with {len(policies)} policy setting(s).")
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "delete":
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: partition policytemplate delete -name <name>")
+                return
+            try:
+                self.api.tokens.delete_policy_template(
+                    name, audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Template '{name}' deleted.")
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "apply":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            name = self._get_arg(rest, "-name")
+            force = "-force" in args
+            if not name:
+                print("  Usage: partition policytemplate apply -name <name> [-force]")
+                return
+            try:
+                self.api.tokens.apply_policy_template(
+                    self.active_slot, name,
+                    audit=self.api.audit, session_id=self.session_id or 0,
+                    force=force
+                )
+                print(f"  Template '{name}' applied to slot {self.active_slot}.")
+                self._print_explain([
+                    "Applying a PPT sets all policies defined in the template.",
+                    "If any policy change is destructive, all objects on the",
+                    "partition will be deleted. The PPT feature is intended",
+                    "for consistent setup of new or zeroized partitions.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        else:
+            print(f"  Unknown policytemplate subcommand: {sub}")
+            print("  Available: list, show, create, delete, apply")
 
     # ------------------------------------------------------------------
     # Role / Authentication commands
@@ -1546,8 +1682,13 @@ class CommandHandler:
     partition clear                    Delete all objects on partition
     partition contents                 Show all objects on partition
     partition showmechanism            Show available PKCS#11 mechanisms
-    partition showpolicies             Show partition policies
-    partition changepolicy -name <p> -value <v>  Change a partition policy
+    partition showpolicies [-verbose]     Show partition policies (use -verbose for full details)
+    partition changepolicy -policy <id> -value <v> [-force]  Change a partition policy
+    partition policytemplate list          List available policy templates
+    partition policytemplate show -name <n> Show a specific template
+    partition policytemplate create -name <n> -desc <d> -policies <id=val,...>  Create a custom template
+    partition policytemplate delete -name <n>  Delete a custom template
+    partition policytemplate apply -name <n> [-force]  Apply a template to the active partition
 
   Authentication:
     role login -name <co|cu|so>        Login as a role

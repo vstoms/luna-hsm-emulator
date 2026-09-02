@@ -756,15 +756,14 @@ class TestPartitionCommands(unittest.TestCase):
     def test_partition_showpolicies(self):
         """Test showing partition policies."""
         output = self.api.tokens.show_policies(self.slot_id)
-        self.assertIn("ALLOW_KEY_CLONE", output)
+        self.assertIn("ALLOW_PRIVATE_KEY_CLONING", output)
         self.assertIn("MAX_LOGIN_ATTEMPTS", output)
 
     def test_partition_changepolicy(self):
         """Test changing a partition policy."""
         self.api.tokens.change_policy(self.slot_id, "MAX_LOGIN_ATTEMPTS", "5",
-                                        audit=self.api.audit)
-        p = self.storage.get_partition(self.slot_id)
-        self.assertEqual(p["max_login_attempts"], 5)
+                                        audit=self.api.audit, force=True)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MAX_LOGIN_ATTEMPTS"), 5)
 
     def test_partition_changepolicy_invalid(self):
         """Test that changing an invalid policy fails."""
@@ -1204,6 +1203,255 @@ class TestBackupHSM(unittest.TestCase):
         logs = self.api.storage.get_audit_logs()
         ops = [l["operation"] for l in logs]
         self.assertIn("RestoreObjects", ops)
+
+
+class TestPartitionPolicies(unittest.TestCase):
+    """Test the full partition capabilities and policies system."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.session_id = self.api.C_OpenSession(self.slot_id)
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_policy_catalog_exists(self):
+        """Test that the policy catalog has all expected policies."""
+        from hsm.policies import POLICY_CATALOG
+        self.assertGreater(len(POLICY_CATALOG), 20)
+        # Check key policies exist
+        ids = [p.policy_id for p in POLICY_CATALOG]
+        self.assertIn(0, ids)  # ALLOW_PRIVATE_KEY_CLONING
+        self.assertIn(1, ids)  # ALLOW_PRIVATE_KEY_WRAPPING
+        self.assertIn(23, ids)  # MIN_PIN_LENGTH
+        self.assertIn(25, ids)  # MAX_LOGIN_ATTEMPTS
+
+    def test_show_policies_default(self):
+        """Test showing policies with default values."""
+        output = self.api.tokens.show_policies(self.slot_id)
+        self.assertIn("ALLOW_PRIVATE_KEY_CLONING", output)
+        self.assertIn("ALLOW_PRIVATE_KEY_WRAPPING", output)
+        self.assertIn("MIN_PIN_LENGTH", output)
+
+    def test_show_policies_verbose(self):
+        """Test showing policies in verbose mode."""
+        output = self.api.tokens.show_policies(self.slot_id, verbose=True)
+        self.assertIn("Destructive", output)
+        self.assertIn("Description", output)
+        self.assertIn("Default", output)
+
+    def test_change_policy_by_id(self):
+        """Test changing a policy by numeric ID."""
+        self.api.tokens.change_policy(
+            self.slot_id, "25", "5", audit=self.api.audit, force=True
+        )
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MAX_LOGIN_ATTEMPTS"), 5)
+
+    def test_change_policy_by_name(self):
+        """Test changing a policy by name."""
+        self.api.tokens.change_policy(
+            self.slot_id, "MAX_LOGIN_ATTEMPTS", "3", audit=self.api.audit, force=True
+        )
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MAX_LOGIN_ATTEMPTS"), 3)
+
+    def test_change_policy_min_pin_length(self):
+        """Test changing MIN_PIN_LENGTH."""
+        self.api.tokens.change_policy(
+            self.slot_id, "MIN_PIN_LENGTH", "8", audit=self.api.audit, force=True
+        )
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MIN_PIN_LENGTH"), 8)
+
+    def test_change_policy_invalid_value(self):
+        """Test that invalid policy value fails."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.change_policy(self.slot_id, "MIN_PIN_LENGTH", "2", force=True)
+
+    def test_change_non_modifiable_policy(self):
+        """Test that non-modifiable policies cannot be changed."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.change_policy(self.slot_id, "MAX_PIN_LENGTH", "16", force=True)
+
+    def test_change_policy_unknown(self):
+        """Test that unknown policy fails."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.change_policy(self.slot_id, "999", "1", force=True)
+
+    def test_destructive_policy_requires_force(self):
+        """Test that destructive policy change requires force."""
+        # ALLOW_PRIVATE_KEY_WRAPPING (id=1) is destructive off-to-on
+        # Default is 0 (Off), changing to 1 (On) is destructive
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.change_policy(self.slot_id, "1", "1")
+
+    def test_destructive_policy_with_force(self):
+        """Test that destructive policy change works with force."""
+        # Generate a key first
+        tmpl = make_aes_key_template("test_key", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.assertGreater(self.storage.count_objects(self.slot_id), 0)
+        # Disable cloning first (mutual exclusion), then enable wrapping (destructive)
+        self.api.tokens.change_policy(
+            self.slot_id, "0", "0", audit=self.api.audit, force=True
+        )
+        # Change wrapping to On (destructive) with force
+        self.api.tokens.change_policy(
+            self.slot_id, "1", "1", audit=self.api.audit, force=True
+        )
+        # Objects should be deleted
+        self.assertEqual(self.storage.count_objects(self.slot_id), 0)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_PRIVATE_KEY_WRAPPING"), 1)
+
+    def test_mutual_exclusion_cloning_wrapping(self):
+        """Test that cloning and wrapping cannot both be On."""
+        # Default: cloning=1, wrapping=0
+        # Try to enable wrapping while cloning is on
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.change_policy(self.slot_id, "1", "1", force=True)
+        # Disable cloning first, then enable wrapping
+        self.api.tokens.change_policy(self.slot_id, "0", "0", force=True)
+        self.api.tokens.change_policy(self.slot_id, "1", "1", force=True)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_PRIVATE_KEY_WRAPPING"), 1)
+
+    def test_policy_persistence(self):
+        """Test that policy changes persist across DB reopen."""
+        self.api.tokens.change_policy(
+            self.slot_id, "MAX_LOGIN_ATTEMPTS", "7", audit=self.api.audit, force=True
+        )
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        self.assertEqual(api2.tokens.get_policy_value(self.slot_id, "MAX_LOGIN_ATTEMPTS"), 7)
+        api2.C_Finalize()
+
+    def test_is_cloning_allowed(self):
+        """Test cloning policy check."""
+        self.assertTrue(self.api.tokens.is_cloning_allowed(self.slot_id))
+
+    def test_is_wrapping_allowed(self):
+        """Test wrapping policy check."""
+        self.assertFalse(self.api.tokens.is_wrapping_allowed(self.slot_id))
+
+    def test_policy_change_audited(self):
+        """Test that policy changes are recorded in audit log."""
+        self.api.tokens.change_policy(
+            self.slot_id, "MAX_LOGIN_ATTEMPTS", "5", audit=self.api.audit, force=True
+        )
+        logs = self.api.storage.get_audit_logs()
+        ops = [l["operation"] for l in logs]
+        self.assertIn("PartitionChangePolicy", ops)
+
+    # --- Policy Templates ---
+
+    def test_list_predefined_templates(self):
+        """Test listing predefined PPT templates."""
+        templates = self.api.tokens.list_policy_templates()
+        names = [t["name"] for t in templates]
+        self.assertIn("DEFAULT", names)
+        self.assertIn("FIPS_STRICT", names)
+        self.assertIn("HIGH_SECURITY", names)
+        self.assertIn("DEVELOPMENT", names)
+        self.assertIn("BACKUP_READY", names)
+
+    def test_get_predefined_template(self):
+        """Test getting a predefined template."""
+        template = self.api.tokens.get_policy_template("FIPS_STRICT")
+        self.assertIsNotNone(template)
+        self.assertTrue(template["predefined"])
+        self.assertIn("description", template)
+        self.assertIn("policies", template)
+
+    def test_create_custom_template(self):
+        """Test creating a custom PPT template."""
+        policies = {0: 1, 1: 0, 25: 5}
+        self.api.tokens.create_policy_template(
+            "MY_TEMPLATE", "My custom template", policies,
+            audit=self.api.audit, session_id=self.session_id
+        )
+        template = self.api.tokens.get_policy_template("MY_TEMPLATE")
+        self.assertIsNotNone(template)
+        self.assertFalse(template["predefined"])
+        self.assertEqual(template["policies"][25], 5)
+
+    def test_delete_custom_template(self):
+        """Test deleting a custom PPT template."""
+        self.api.tokens.create_policy_template(
+            "TO_DELETE", "Temp", {25: 3}, audit=self.api.audit
+        )
+        self.api.tokens.delete_policy_template("TO_DELETE", audit=self.api.audit)
+        self.assertIsNone(self.api.tokens.get_policy_template("TO_DELETE"))
+
+    def test_cannot_delete_predefined_template(self):
+        """Test that predefined templates cannot be deleted."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.delete_policy_template("FIPS_STRICT")
+
+    def test_apply_predefined_template(self):
+        """Test applying a predefined template to a partition."""
+        # Apply FIPS_STRICT template
+        self.api.tokens.apply_policy_template(
+            self.slot_id, "FIPS_STRICT",
+            audit=self.api.audit, force=True
+        )
+        # Check that some policies were changed
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_PRIVATE_KEY_WRAPPING"), 0)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_RAW_RSA_OPERATIONS"), 0)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_RESTRICTED_TO_V1"), 1)
+
+    def test_apply_template_destructive(self):
+        """Test that applying a destructive template clears objects."""
+        # Generate a key
+        tmpl = make_aes_key_template("destr_key", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.assertGreater(self.storage.count_objects(self.slot_id), 0)
+        # Apply DEVELOPMENT template (disables cloning which is destructive on-to-off)
+        self.api.tokens.apply_policy_template(
+            self.slot_id, "DEVELOPMENT",
+            audit=self.api.audit, force=True
+        )
+        # Objects should be deleted due to destructive policy change
+        self.assertEqual(self.storage.count_objects(self.slot_id), 0)
+
+    def test_apply_template_audited(self):
+        """Test that applying a template is audited."""
+        self.api.tokens.apply_policy_template(
+            self.slot_id, "FIPS_STRICT",
+            audit=self.api.audit, force=True
+        )
+        logs = self.api.storage.get_audit_logs()
+        ops = [l["operation"] for l in logs]
+        self.assertIn("ApplyPolicyTemplate", ops)
+
+    def test_custom_template_persists(self):
+        """Test that custom templates persist across DB reopen."""
+        self.api.tokens.create_policy_template(
+            "PERSIST_T", "Persistent template", {25: 8},
+            audit=self.api.audit
+        )
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        template = api2.tokens.get_policy_template("PERSIST_T")
+        self.assertIsNotNone(template)
+        self.assertEqual(template["policies"][25], 8)
+        api2.C_Finalize()
+
+    def test_template_validation_mutual_exclusion(self):
+        """Test that templates with mutual exclusion violations fail."""
+        # Policies 0 and 1 cannot both be 1
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.create_policy_template(
+                "INVALID", "Bad template", {0: 1, 1: 1},
+                audit=self.api.audit
+            )
 
 
 if __name__ == "__main__":

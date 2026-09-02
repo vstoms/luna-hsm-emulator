@@ -33,6 +33,7 @@ This emulator lets you **learn HSM operations** — partition management, key ge
 | **Role-Based Auth** | HSO, Partition SO, Crypto Officer (CO), Crypto User (CU) with PIN lockout policies |
 | **Firmware Upgrade** | Simulated firmware upgrade with pre-checks, staged progress, rollback, and history |
 | **Backup HSM** | Luna Backup HSM 7 emulation with STM recovery, cloning, backup/restore, and firmware management |
+| **Partition Policies** | Full 30-policy catalog matching Luna 7 capabilities, with destructive changes, mutual exclusion, and PPT templates |
 | **Partition Management** | Create, initialize, and delete named partitions with per-partition storage quotas |
 | **Encrypted Storage** | SQLite database with AES-256-GCM encrypted key material blobs at rest |
 | **Audit Logging** | Tamper-evident SHA-256 hash-chained audit log |
@@ -328,7 +329,7 @@ luna-hsm-emulator/
 ├── storage/
 │   └── db.py                    # SQLite persistence with AES-GCM encryption
 ├── tests/
-│   └── test_pkcs11.py           # 93 unit tests
+│   └── test_pkcs11.py           # 119 unit tests
 ├── requirements.txt
 └── README.md
 ```
@@ -369,9 +370,10 @@ The suite covers:
 | `TestKDF` | 3 | PBKDF2, HKDF, SP800-108 |
 | `TestFirmwareUpgrade` | 14 | Firmware info, list, pre-checks, upgrade, rollback, history, persistence, audit |
 | `TestBackupHSM` | 31 | STM recovery, init, login, backup, restore, firmware, factory reset, persistence, audit |
+| `TestPartitionPolicies` | 26 | Policy catalog, show/verbose, change by ID/name, destructive changes, mutual exclusion, templates, persistence, audit |
 
 ```
-Ran 93 tests in 3.824s
+Ran 119 tests in 4.000s
 
 OK
 ```
@@ -380,7 +382,7 @@ OK
 
 ## Training Exercises
 
-The emulator includes **14 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
+The emulator includes **15 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
 
 | # | Exercise | Skills Learned |
 |---|----------|---------------|
@@ -398,6 +400,7 @@ The emulator includes **14 hands-on training exercises** covering real-world HSM
 | 12 | Factory Reset | HSM lifecycle management |
 | 13 | Firmware Upgrade and Rollback | HSM firmware lifecycle, pre-checks, staged upgrade |
 | 14 | Backup HSM Operations | Luna Backup HSM 7, cloning, backup/restore, STM recovery |
+| 15 | Partition Capabilities and Policies | Full policy catalog, destructive changes, PPT templates |
 
 ---
 

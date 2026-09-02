@@ -203,6 +203,86 @@ class Storage:
         self._conn.commit()
 
     # ------------------------------------------------------------------
+    # Partition policies
+    # ------------------------------------------------------------------
+
+    def get_partition_policies(self, slot_id: int) -> dict:
+        """Return dict of policy_id -> value for a partition."""
+        import json
+        raw = self.get_meta(f"policies_slot_{slot_id}")
+        if raw:
+            try:
+                return {int(k): v for k, v in json.loads(raw).items()}
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {}
+
+    def set_partition_policies(self, slot_id: int, policies: dict):
+        """Persist partition policies as JSON in hsm_meta."""
+        import json
+        self.set_meta(f"policies_slot_{slot_id}", json.dumps(policies))
+
+    def get_partition_policy(self, slot_id: int, policy_id: int) -> Optional[int]:
+        policies = self.get_partition_policies(slot_id)
+        return policies.get(policy_id)
+
+    def set_partition_policy(self, slot_id: int, policy_id: int, value: int):
+        policies = self.get_partition_policies(slot_id)
+        policies[policy_id] = value
+        self.set_partition_policies(slot_id, policies)
+
+    # ------------------------------------------------------------------
+    # Partition policy templates (PPT)
+    # ------------------------------------------------------------------
+
+    def get_all_ppt_templates(self) -> dict:
+        """Return all stored PPT templates as {name: {policies, description}}."""
+        import json
+        raw = self.get_meta("ppt_templates")
+        if raw:
+            try:
+                templates = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+            # Convert string keys back to int for policies in each template
+            result = {}
+            for name, t in templates.items():
+                policies = {int(k): v for k, v in t.get("policies", {}).items()}
+                result[name] = {"description": t.get("description", ""), "policies": policies}
+            return result
+        return {}
+
+    def get_ppt_template(self, name: str) -> Optional[dict]:
+        import json
+        raw = self.get_meta("ppt_templates")
+        if raw:
+            try:
+                templates = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            if name in templates:
+                t = templates[name]
+                # Convert string keys back to int for policies
+                policies = {int(k): v for k, v in t.get("policies", {}).items()}
+                return {"description": t.get("description", ""), "policies": policies}
+        return None
+
+    def save_ppt_template(self, name: str, description: str, policies: dict):
+        import json
+        templates = self.get_all_ppt_templates()
+        templates[name] = {"description": description, "policies": policies}
+        self.set_meta("ppt_templates", json.dumps(templates))
+
+    def delete_ppt_template(self, name: str) -> bool:
+        import json
+        templates = self.get_all_ppt_templates()
+        if name in templates:
+            del templates[name]
+            self.set_meta("ppt_templates", json.dumps(templates))
+            return True
+        return False
+
+    # ------------------------------------------------------------------
     # Partition CRUD
     # ------------------------------------------------------------------
 

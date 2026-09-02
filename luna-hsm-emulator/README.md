@@ -558,6 +558,56 @@ backup disconnect
 
 ---
 
+### Exercise 15: Partition Capabilities and Policies
+
+**Objective**: Learn how to configure partition security policies, understand destructive changes, and use Partition Policy Templates (PPT) for consistent configuration.
+
+```bash
+# View all partition policies (compact mode)
+slot set -slot 1
+partition showpolicies
+
+# View all policies with full descriptions and destructiveness info
+partition showpolicies -verbose
+
+# Change a non-destructive policy (MAX_LOGIN_ATTEMPTS)
+partition changepolicy -policy 25 -value 5
+
+# Try to enable private key wrapping (destructive — requires confirmation)
+partition changepolicy -policy 1 -value 1
+# This will warn: DESTRUCTIVE! Type 'DESTROY' to confirm.
+
+# Mutual exclusion: cloning and wrapping cannot both be On
+# First disable cloning, then enable wrapping
+partition changepolicy -policy 0 -value 0 -force
+partition changepolicy -policy 1 -value 1 -force
+
+# List available policy templates
+partition policytemplate list
+
+# Show details of a specific template
+partition policytemplate show -name FIPS_STRICT
+
+# Apply a predefined template to the partition
+partition policytemplate apply -name FIPS_STRICT -force
+
+# Create a custom template
+partition policytemplate create -name MY_CONFIG -desc "My custom policy set" -policies "25=5,19=1,14=0"
+
+# Apply the custom template
+partition policytemplate apply -name MY_CONFIG -force
+
+# Delete the custom template
+partition policytemplate delete -name MY_CONFIG
+
+# Verify policies after changes
+partition showpolicies -verbose
+```
+
+**What you learned**: The Luna 7 has 30 partition policies that control security behaviors including key cloning, wrapping, masking, RSA blinding, raw RSA operations, PIN rules, and HA recovery. Some policy changes are destructive (delete all objects on the partition). Policies 0 (cloning) and 1 (wrapping) are mutually exclusive. Partition Policy Templates (PPT) allow consistent policy sets across partitions — predefined templates cover FIPS, High Security, Development, and Backup Ready configurations.
+
+---
+
 ## Architecture
 
 ```
@@ -571,8 +621,9 @@ luna-hsm-emulator/
 │   └── constants.py         # CKR_, CKA_, CKM_, CKO_ constants
 ├── hsm/
 │   ├── __init__.py
-│   ├── token.py             # Token/partition management
+│   ├── token.py             # Token/partition management, policies
 │   ├── backup.py            # Luna Backup HSM 7 emulation
+│   ├── policies.py           # Partition capabilities and policies catalog
 │   ├── session.py           # Session management
 │   ├── auth.py              # Role-based authentication
 │   ├── keystore.py          # Key storage and retrieval
@@ -591,7 +642,7 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # 93 unit tests for PKCS#11 operations
+│   └── test_pkcs11.py       # 119 unit tests for PKCS#11 operations
 ├── requirements.txt
 └── README.md
 ```
