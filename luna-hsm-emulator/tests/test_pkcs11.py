@@ -37,6 +37,7 @@ from pkcs11.objects import (
     make_aes_key_template, make_rsa_keypair_templates,
     make_ec_keypair_templates,
 )
+from hsm.backup import BackupHSM, BACKUP_HSM_MODEL, BACKUP_HSM_DEFAULT_FW
 
 
 class TestStorage(unittest.TestCase):
@@ -843,6 +844,366 @@ class TestRoleCommands(unittest.TestCase):
         """Test that resetpw fails for SO role."""
         with self.assertRaises(PKCS11Error):
             self.api.tokens.reset_pin(self.slot_id, "SO", "newpin123")
+
+
+class TestBackupHSM(unittest.TestCase):
+    """Test Luna Backup HSM 7 operations."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.session_id = self.api.C_OpenSession(self.slot_id)
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_backup_hsm(self):
+        """Helper: connect, recover STM, init, and login to backup HSM."""
+        self.api.backup.connect()
+        self.api.backup.stm_recover("test_random_string", audit=self.api.audit)
+        self.api.backup.initialize("bkupso123", audit=self.api.audit)
+        self.api.backup.login("bkupso123", audit=self.api.audit)
+
+    def test_backup_connect(self):
+        """Test connecting a backup HSM."""
+        result = self.api.backup.connect()
+        self.assertTrue(result["serial"])
+        self.assertIn("model", result)
+
+    def test_backup_connect_already_connected(self):
+        """Test that connecting twice returns already_connected."""
+        self.api.backup.connect()
+        result = self.api.backup.connect()
+        self.assertTrue(result["already_connected"])
+
+    def test_backup_disconnect(self):
+        """Test disconnecting the backup HSM."""
+        self.api.backup.connect()
+        self.assertTrue(self.api.backup.is_connected())
+        self.api.backup.disconnect()
+        self.assertFalse(self.api.backup.is_connected())
+
+    def test_stm_recover(self):
+        """Test recovering from Secure Transport Mode."""
+        self.api.backup.connect()
+        result = self.api.backup.stm_recover("my_random_string", audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["stm_state"], "initialized")
+
+    def test_stm_recover_already_recovered(self):
+        """Test that STM recover fails when not in STM."""
+        self.api.backup.connect()
+        self.api.backup.stm_recover("test_string", audit=self.api.audit)
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.stm_recover("test_string2", audit=self.api.audit)
+
+    def test_stm_show(self):
+        """Test showing STM status."""
+        self.api.backup.connect()
+        info = self.api.backup.stm_show()
+        self.assertEqual(info["stm_state"], "secure_transport")
+        self.assertIn("description", info)
+
+    def test_backup_initialize(self):
+        """Test initializing the backup HSM."""
+        self.api.backup.connect()
+        self.api.backup.stm_recover("test_string", audit=self.api.audit)
+        result = self.api.backup.initialize("bkupso123", audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["stm_state"], "active")
+
+    def test_backup_init_requires_stm_recover(self):
+        """Test that init fails without STM recovery."""
+        self.api.backup.connect()
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.initialize("bkupso123", audit=self.api.audit)
+
+    def test_backup_login(self):
+        """Test logging in to the backup HSM."""
+        self._setup_backup_hsm()
+        self.assertTrue(self.api.backup.is_logged_in())
+
+    def test_backup_login_wrong_pin(self):
+        """Test that login with wrong PIN fails."""
+        self.api.backup.connect()
+        self.api.backup.stm_recover("test_string", audit=self.api.audit)
+        self.api.backup.initialize("correct_pin", audit=self.api.audit)
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.login("wrong_pin", audit=self.api.audit)
+
+    def test_backup_login_not_initialized(self):
+        """Test that login fails when not initialized."""
+        self.api.backup.connect()
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.login("somepin", audit=self.api.audit)
+
+    def test_backup_requires_login(self):
+        """Test that backup operations require login."""
+        self.api.backup.connect()
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.backup_objects(self.slot_id, "domain1")
+
+    def test_backup_objects(self):
+        """Test backing up objects to the backup HSM."""
+        self._setup_backup_hsm()
+        # Generate an extractable AES key
+        tmpl = make_aes_key_template("backup_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        # Back it up
+        result = self.api.backup.backup_objects(
+            self.slot_id, "my_domain", audit=self.api.audit
+        )
+        self.assertIn("backup_key", result["backed_up"])
+        self.assertEqual(result["domain"], "my_domain")
+
+    def test_backup_skips_non_extractable(self):
+        """Test that non-extractable objects are skipped during backup."""
+        self._setup_backup_hsm()
+        # Generate a non-extractable AES key (default)
+        tmpl = make_aes_key_template("secret_key", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        # Generate an extractable key
+        tmpl2 = make_aes_key_template("extractable_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl2)
+        # Back up
+        result = self.api.backup.backup_objects(
+            self.slot_id, "my_domain", audit=self.api.audit
+        )
+        self.assertIn("extractable_key", result["backed_up"])
+        self.assertIn("secret_key", result["skipped_non_extractable"])
+
+    def test_backup_specific_labels(self):
+        """Test backing up specific objects by label."""
+        self._setup_backup_hsm()
+        tmpl1 = make_aes_key_template("key_one", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl1)
+        tmpl2 = make_aes_key_template("key_two", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl2)
+        result = self.api.backup.backup_objects(
+            self.slot_id, "domain1", labels=["key_one"], audit=self.api.audit
+        )
+        self.assertEqual(len(result["backed_up"]), 1)
+        self.assertIn("key_one", result["backed_up"])
+
+    def test_backup_no_clonable_objects(self):
+        """Test that backup fails when no clonable objects exist."""
+        self._setup_backup_hsm()
+        # Generate only non-extractable keys
+        tmpl = make_aes_key_template("secret_key", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.backup_objects(self.slot_id, "domain1")
+
+    def test_restore_objects(self):
+        """Test restoring objects from backup HSM to a partition."""
+        self._setup_backup_hsm()
+        # Generate and backup an extractable key
+        tmpl = make_aes_key_template("restore_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "restore_domain", audit=self.api.audit
+        )
+        # Delete the key from the source partition
+        obj, _ = self.api.keystore.retrieve_by_label(self.slot_id, "restore_key")
+        self.api.keystore.delete(obj.handle)
+        self.assertEqual(self.storage.count_objects(self.slot_id), 0)
+        # Restore from backup
+        result = self.api.backup.restore_objects(
+            self.slot_id, "restore_domain", audit=self.api.audit
+        )
+        self.assertIn("restore_key", result["restored"])
+        self.assertEqual(self.storage.count_objects(self.slot_id), 1)
+
+    def test_restore_wrong_domain(self):
+        """Test that restore fails with wrong domain."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("rkey", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "domain_a", audit=self.api.audit
+        )
+        with self.assertRaises(PKCS11Error):
+            self.api.backup.restore_objects(
+                self.slot_id, "domain_b", audit=self.api.audit
+            )
+
+    def test_restore_specific_labels(self):
+        """Test restoring specific objects by label."""
+        self._setup_backup_hsm()
+        for lbl in ["rkey1", "rkey2", "rkey3"]:
+            tmpl = make_aes_key_template(lbl, 256, extractable=True)
+            self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "domain_x", audit=self.api.audit
+        )
+        # Delete all keys
+        for lbl in ["rkey1", "rkey2", "rkey3"]:
+            obj, _ = self.api.keystore.retrieve_by_label(self.slot_id, lbl)
+            self.api.keystore.delete(obj.handle)
+        # Restore only rkey2
+        result = self.api.backup.restore_objects(
+            self.slot_id, "domain_x", labels=["rkey2"], audit=self.api.audit
+        )
+        self.assertEqual(len(result["restored"]), 1)
+        self.assertIn("rkey2", result["restored"])
+
+    def test_backup_update_existing(self):
+        """Test that backing up an existing object updates it."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("update_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "domain_u", audit=self.api.audit
+        )
+        # Backup again — should update, not duplicate
+        self.api.backup.backup_objects(
+            self.slot_id, "domain_u", audit=self.api.audit
+        )
+        partitions = self.api.backup._get_backup_partitions()
+        bp = [p for p in partitions if p.domain == "domain_u"][0]
+        self.assertEqual(len(bp.objects), 1)
+
+    def test_list_backups(self):
+        """Test listing backup partitions."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("list_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "list_domain", audit=self.api.audit
+        )
+        output = self.api.backup.list_backups()
+        self.assertIn("list_domain", output)
+        self.assertIn("list_key", output)
+
+    def test_list_backup_partitions(self):
+        """Test listing backup partitions as data."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("pkey", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "d1", audit=self.api.audit
+        )
+        parts = self.api.backup.list_backup_partitions()
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["domain"], "d1")
+        self.assertEqual(parts[0]["object_count"], 1)
+
+    def test_backup_status(self):
+        """Test getting backup HSM status."""
+        self._setup_backup_hsm()
+        status = self.api.backup.get_status()
+        self.assertTrue(status["connected"])
+        self.assertTrue(status["logged_in"])
+        self.assertEqual(status["stm_state"], "active")
+
+    def test_backup_show_info(self):
+        """Test formatted backup HSM info."""
+        self._setup_backup_hsm()
+        output = self.api.backup.show_info()
+        self.assertIn(BACKUP_HSM_MODEL, output)
+        self.assertIn("Serial:", output)
+
+    def test_backup_firmware_show(self):
+        """Test showing backup HSM firmware info."""
+        self._setup_backup_hsm()
+        info = self.api.backup.get_firmware_info()
+        self.assertEqual(info["current_version"], BACKUP_HSM_DEFAULT_FW)
+
+    def test_backup_firmware_upgrade(self):
+        """Test upgrading backup HSM firmware."""
+        self._setup_backup_hsm()
+        result = self.api.backup.upgrade_firmware("7.14.0", audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["new_version"], "7.14.0")
+        # Verify persisted
+        self.assertEqual(self.api.backup._get_firmware_version(), "7.14.0")
+
+    def test_backup_firmware_rollback(self):
+        """Test rolling back backup HSM firmware."""
+        self._setup_backup_hsm()
+        self.api.backup.upgrade_firmware("7.14.0", audit=self.api.audit)
+        # Create a backup partition with data
+        tmpl = make_aes_key_template("rbkey", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "rb_domain", audit=self.api.audit
+        )
+        # Rollback — should erase all backup partitions
+        result = self.api.backup.rollback_firmware(audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["new_version"], BACKUP_HSM_DEFAULT_FW)
+        self.assertIn("warning", result)
+        # Verify backup partitions were erased
+        self.assertEqual(len(self.api.backup._get_backup_partitions()), 0)
+
+    def test_backup_factory_reset(self):
+        """Test factory reset of backup HSM."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("frkey", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "fr_domain", audit=self.api.audit
+        )
+        self.api.backup.factory_reset(audit=self.api.audit)
+        status = self.api.backup.get_status()
+        self.assertEqual(status["stm_state"], "secure_transport")
+        self.assertEqual(status["partition_count"], 0)
+
+    def test_backup_persists_across_reopen(self):
+        """Test that backup data persists after DB close/reopen."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("persist_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "persist_domain", audit=self.api.audit
+        )
+        serial = self.api.backup._serial
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        api2.backup.connect()
+        self.assertEqual(api2.backup._serial, serial)
+        api2.backup.login("bkupso123", audit=api2.audit)
+        parts = api2.backup.list_backup_partitions()
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["domain"], "persist_domain")
+        api2.C_Finalize()
+
+    def test_backup_audited(self):
+        """Test that backup operations are recorded in audit log."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("audited_key", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "audit_domain", audit=self.api.audit
+        )
+        logs = self.api.storage.get_audit_logs()
+        ops = [l["operation"] for l in logs]
+        self.assertIn("BackupObjects", ops)
+
+    def test_restore_audited(self):
+        """Test that restore operations are recorded in audit log."""
+        self._setup_backup_hsm()
+        tmpl = make_aes_key_template("audited_rkey", 256, extractable=True)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.backup.backup_objects(
+            self.slot_id, "audit_rdomain", audit=self.api.audit
+        )
+        obj, _ = self.api.keystore.retrieve_by_label(self.slot_id, "audited_rkey")
+        self.api.keystore.delete(obj.handle)
+        self.api.backup.restore_objects(
+            self.slot_id, "audit_rdomain", audit=self.api.audit
+        )
+        logs = self.api.storage.get_audit_logs()
+        ops = [l["operation"] for l in logs]
+        self.assertIn("RestoreObjects", ops)
 
 
 if __name__ == "__main__":

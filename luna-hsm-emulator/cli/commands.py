@@ -1181,8 +1181,353 @@ class CommandHandler:
             print("  Available: show, list, upgrade, rollback, history")
 
     # ------------------------------------------------------------------
-    # Help
+    # Backup HSM commands
     # ------------------------------------------------------------------
+
+    def cmd_backup(self, args: list):
+        """Handle 'backup' commands for the Luna Backup HSM 7."""
+        if not args:
+            print("  Usage: backup connect | disconnect | show | init | login | logout |")
+            print("         backup list | backup create-partition | backup objects |")
+            print("         backup backup -slot <id> -domain <dom> |")
+            print("         backup restore -slot <id> -domain <dom> |")
+            print("         backup stm show | backup stm recover -string <s> |")
+            print("         backup firmware show | backup firmware upgrade -version <v> |")
+            print("         backup firmware rollback | backup factoryreset")
+            return
+        sub = args[0]
+        rest = self._parse_flags(args[1:])
+
+        if sub == "connect":
+            result = self.api.backup.connect()
+            if result.get("already_connected"):
+                print(f"  Backup HSM already connected. Serial: {result['serial']}")
+            else:
+                print(f"  Luna Backup HSM 7 connected.")
+                print(f"  Serial:     {result['serial']}")
+                print(f"  Firmware:   {result['firmware']}")
+                print(f"  STM State:  {result['stm_state']}")
+                self._print_explain([
+                    "The Luna Backup HSM 7 is a USB-connected HSM used to store",
+                    "backup copies of cryptographic objects from Luna Network",
+                    "HSM 7 application partitions. It appears as a slot in LunaCM.",
+                    "",
+                    "When first shipped, the backup HSM is in Secure Transport Mode",
+                    "(STM). You must recover from STM and initialize it before use.",
+                ])
+
+        elif sub == "disconnect":
+            self.api.backup.disconnect()
+            print("  Backup HSM disconnected.")
+            self._print_explain([
+                "Disconnecting the backup HSM simulates unplugging the USB device.",
+                "All backup data remains persisted in the database.",
+            ])
+
+        elif sub == "show":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            print(self.api.backup.show_info())
+            self._print_explain([
+                "Backup HSM status shows the connection state, firmware version,",
+                "Secure Transport Mode state, login status, and storage usage.",
+            ])
+
+        elif sub == "stm":
+            self._backup_stm(args[1:])
+
+        elif sub == "init":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            print("  [PED Simulation] Set SO PIN for the backup HSM:")
+            so_pin = getpass.getpass("  SO PIN: ")
+            confirm = getpass.getpass("  Confirm SO PIN: ")
+            if so_pin != confirm:
+                print("  Error: PINs do not match.")
+                return
+            try:
+                result = self.api.backup.initialize(
+                    so_pin, audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Backup HSM initialized. State: {result['stm_state']}")
+                self._print_explain([
+                    "Initializing the backup HSM sets the SO PIN and transitions",
+                    "it from Secure Transport Mode to active state.",
+                    "On a real Luna 7, this is done with 'token backup init'.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "login":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            print("  [PED Simulation] Enter SO PIN for the backup HSM:")
+            so_pin = getpass.getpass("  SO PIN: ")
+            try:
+                result = self.api.backup.login(
+                    so_pin, audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Logged in to backup HSM. Serial: {result['serial']}")
+                self._print_explain([
+                    "Logging in to the backup HSM as SO is required before any",
+                    "backup or restore operation. On a real Luna 7, this is",
+                    "done with 'token backup login -serial <serial>'.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Login failed: {e}")
+
+        elif sub == "logout":
+            self.api.backup.logout(audit=self.api.audit, session_id=self.session_id or 0)
+            print("  Logged out of backup HSM.")
+
+        elif sub == "list":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            try:
+                print(self.api.backup.list_backups())
+                self._print_explain([
+                    "Backup partitions are organized by cloning domain. Each",
+                    "domain corresponds to a set of HSMs that share the same",
+                    "cloning secret. Objects can only be cloned between",
+                    "partitions that share the same domain.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "create-partition":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            domain = self._get_arg(rest, "-domain")
+            label = self._get_arg(rest, "-label") or ""
+            if not domain:
+                print("  Usage: backup create-partition -domain <domain> [-label <label>]")
+                return
+            try:
+                result = self.api.backup.create_backup_partition(
+                    domain, label, audit=self.api.audit,
+                    session_id=self.session_id or 0
+                )
+                print(f"  Backup partition created. ID: {result['partition_id']}, Domain: {result['domain']}")
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "backup":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            slot = self._get_arg(rest, "-slot")
+            domain = self._get_arg(rest, "-domain")
+            labels_str = self._get_arg(rest, "-labels")
+            if not slot or not domain:
+                print("  Usage: backup backup -slot <src_slot> -domain <domain> [-labels lbl1,lbl2]")
+                return
+            labels = labels_str.split(",") if labels_str else None
+            try:
+                result = self.api.backup.backup_objects(
+                    int(slot), domain, labels=labels,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Backup complete.")
+                print(f"  Backed up: {len(result['backed_up'])} object(s)")
+                for lbl in result["backed_up"]:
+                    print(f"    - {lbl}")
+                if result["skipped_non_extractable"]:
+                    print(f"  Skipped (non-extractable): {len(result['skipped_non_extractable'])}")
+                    for lbl in result["skipped_non_extractable"]:
+                        print(f"    - {lbl}")
+                print(f"  Domain: {result['domain']}")
+                print(f"  Backup Partition ID: {result['partition_id']}")
+                self._print_explain([
+                    "Backup clones objects from the source partition to the backup HSM.",
+                    "Only objects with CKA_EXTRACTABLE=TRUE can be backed up.",
+                    "The cloning domain must match between source and backup.",
+                    "",
+                    "On a real Luna 7, this uses the cloning protocol which",
+                    "securely transfers encrypted key material over a secure",
+                    "channel between the HSM and the backup device.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Backup failed: {e}")
+
+        elif sub == "restore":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            slot = self._get_arg(rest, "-slot")
+            domain = self._get_arg(rest, "-domain")
+            labels_str = self._get_arg(rest, "-labels")
+            if not slot or not domain:
+                print("  Usage: backup restore -slot <dest_slot> -domain <domain> [-labels lbl1,lbl2]")
+                return
+            labels = labels_str.split(",") if labels_str else None
+            confirm = input(f"  Restore objects to slot {slot}? (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Cancelled.")
+                return
+            try:
+                result = self.api.backup.restore_objects(
+                    int(slot), domain, labels=labels,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Restore complete.")
+                print(f"  Restored: {len(result['restored'])} object(s)")
+                for lbl in result["restored"]:
+                    print(f"    - {lbl}")
+                print(f"  Domain: {result['domain']}")
+                print(f"  From Backup Partition ID: {result['partition_id']}")
+                self._print_explain([
+                    "Restore clones objects from the backup HSM back to a",
+                    "destination partition. The cloning domain must match.",
+                    "",
+                    "On a real Luna 7, restored objects are injected into the",
+                    "destination partition's key store with the same attributes",
+                    "they had when backed up, including sensitivity and",
+                    "extractability flags.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Restore failed: {e}")
+
+        elif sub == "firmware":
+            self._backup_firmware(args[1:])
+
+        elif sub == "factoryreset":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected. Use 'backup connect' first.")
+                return
+            confirm = input("  WARNING: This will erase ALL backup partitions and reset the backup HSM.\n  Type 'BACKUPRESET' to confirm: ")
+            if confirm == "BACKUPRESET":
+                self.api.backup.factory_reset(
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print("  Backup HSM reset to factory defaults.")
+            else:
+                print("  Cancelled.")
+
+        else:
+            print(f"  Unknown backup subcommand: {sub}")
+            print("  Available: connect, disconnect, show, init, login, logout, list,")
+            print("              create-partition, backup, restore, stm, firmware, factoryreset")
+
+    def _backup_stm(self, args: list):
+        """Handle 'backup stm' subcommands."""
+        if not args:
+            print("  Usage: backup stm show | backup stm recover -string <random_user_string>")
+            return
+        sub = args[0]
+        rest = self._parse_flags(args[1:])
+
+        if sub == "show":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected.")
+                return
+            info = self.api.backup.stm_show()
+            print(f"  Serial:     {info['serial']}")
+            print(f"  STM State:   {info['stm_state']}")
+            print(f"  Description: {info['description']}")
+            self._print_explain([
+                "Secure Transport Mode (STM) provides a logical check on the",
+                "firmware and critical security parameters so the authorized",
+                "recipient can determine if the HSM was tampered with in transit.",
+                "",
+                "The backup HSM ships in STM and must be recovered before use.",
+            ])
+
+        elif sub == "recover":
+            rus = self._get_arg(rest, "-string")
+            if not rus:
+                print("  Usage: backup stm recover -string <random_user_string>")
+                return
+            try:
+                result = self.api.backup.stm_recover(
+                    rus, audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  STM recovered. State: {result['stm_state']}")
+                self._print_explain([
+                    "Recovering from Secure Transport Mode verifies that the",
+                    "backup HSM has not been tampered with during shipping.",
+                    "The Random User String is set during manufacturing and",
+                    "verified during the recovery process.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        else:
+            print(f"  Unknown stm subcommand: {sub}")
+
+    def _backup_firmware(self, args: list):
+        """Handle 'backup firmware' subcommands."""
+        if not args:
+            print("  Usage: backup firmware show | backup firmware upgrade -version <v> | backup firmware rollback")
+            return
+        sub = args[0]
+        rest = self._parse_flags(args[1:])
+
+        if sub == "show":
+            if not self.api.backup.is_connected():
+                print("  No backup HSM connected.")
+                return
+            try:
+                info = self.api.backup.get_firmware_info()
+                print(f"  Current Firmware:  {info['current_version']}")
+                print(f"  Latest Firmware:   {info['latest_version']}")
+                print(f"  Update Available:  {'Yes' if info['update_available'] else 'No'}")
+                print(f"  Model:             {info['model']}")
+                print(f"  Serial:            {info['serial']}")
+                self._print_explain([
+                    "The Luna Backup HSM 7 has its own firmware, separate from",
+                    "the Luna Network HSM 7 appliance firmware. Updates require",
+                    "a signed firmware update file (.fuf) from Thales.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "upgrade":
+            target = self._get_arg(rest, "-version")
+            if not target:
+                print("  Usage: backup firmware upgrade -version <version>")
+                return
+            confirm = input(f"  Upgrade backup HSM firmware to {target}? (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Cancelled.")
+                return
+            try:
+                result = self.api.backup.upgrade_firmware(
+                    target, audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Firmware upgraded: {result['previous_version']} -> {result['new_version']}")
+                self._print_explain([
+                    "The previous firmware version is stored in reserve on the",
+                    "backup HSM for potential rollback. On a real Luna 7, the",
+                    "firmware update is applied with 'hsm updatefw -fuf <file>".replace('"', '') + " -authcode <file>'.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+
+        elif sub == "rollback":
+            confirm = input("  WARNING: Rollback will ERASE all backup partitions (zeroize). Continue? (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Cancelled.")
+                return
+            try:
+                result = self.api.backup.rollback_firmware(
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Firmware rolled back: {result['previous_version']} -> {result['new_version']}")
+                print(f"  WARNING: {result['warning']}")
+                self._print_explain([
+                    "Firmware rollback on the backup HSM is destructive — it",
+                    "zeroizes the HSM and erases all backups. This is because",
+                    "earlier firmware may have older mechanisms and security",
+                    "vulnerabilities. On a real Luna 7: 'hsm rollbackfw'.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        else:
+            print(f"  Unknown firmware subcommand: {sub}")
 
     def cmd_help(self, args: list = None):
         """Show help."""
@@ -1244,6 +1589,24 @@ class CommandHandler:
     hsm firmware upgrade -version <v>  Upgrade firmware to specified version
     hsm firmware rollback              Roll back to previous firmware
     hsm firmware history               Show firmware upgrade history
+
+  Backup HSM (Luna Backup HSM 7):
+    backup connect                     Connect a Luna Backup HSM 7
+    backup disconnect                  Disconnect the backup HSM
+    backup show                        Show backup HSM status
+    backup init                        Initialize backup HSM (set SO PIN)
+    backup login                       Log in to backup HSM as SO
+    backup logout                      Log out of backup HSM
+    backup list                        List backup partitions and objects
+    backup create-partition -domain <d>  Create a backup partition
+    backup backup -slot <id> -domain <d>  Clone objects to backup HSM
+    backup restore -slot <id> -domain <d>  Restore objects from backup HSM
+    backup stm show                    Show Secure Transport Mode status
+    backup stm recover -string <s>     Recover from Secure Transport Mode
+    backup firmware show               Show backup HSM firmware info
+    backup firmware upgrade -version <v>  Upgrade backup HSM firmware
+    backup firmware rollback           Roll back backup HSM firmware (destructive)
+    backup factoryreset                Reset backup HSM to factory defaults
 
   Other:
     help                               Show this help

@@ -69,6 +69,7 @@ from hsm.token import TokenManager
 from hsm.auth import AuthManager, ROLE_CO, ROLE_CU, ROLE_SO, ROLE_HSO
 from hsm.keystore import KeyStore
 from hsm.audit import AuditLogger
+from hsm.backup import BackupHSM
 from storage.db import Storage
 
 import crypto.symmetric as sym
@@ -87,6 +88,7 @@ class PKCS11API:
         self.auth = AuthManager(storage)
         self.keystore = KeyStore(storage)
         self.audit = AuditLogger(storage)
+        self.backup = BackupHSM(storage)
         self._initialized = False
 
     # ==================================================================

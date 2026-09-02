@@ -56,6 +56,7 @@ class LunaCMShell(cmd.Cmd):
             "crypto": self.handler.cmd_crypto,
             "audit": self.handler.cmd_audit,
             "hsm": self.handler.cmd_hsm,
+            "backup": self.handler.cmd_backup,
             "help": self.handler.cmd_help,
         }
 
@@ -115,6 +116,9 @@ class LunaCMShell(cmd.Cmd):
     def do_hsm(self, arg):
         self._run(f"hsm {arg}" if arg else "hsm")
 
+    def do_backup(self, arg):
+        self._run(f"backup {arg}" if arg else "backup")
+
     # ------------------------------------------------------------------
     # Tab completion
     # ------------------------------------------------------------------
@@ -133,6 +137,8 @@ class LunaCMShell(cmd.Cmd):
             "crypto": ["encrypt", "decrypt", "sign", "verify", "digest"],
             "audit": ["log"],
             "hsm": ["show", "factoryreset", "export", "import", "firmware"],
+            "backup": ["connect", "disconnect", "show", "init", "login", "logout", "list",
+                       "create-partition", "backup", "restore", "stm", "firmware", "factoryreset"],
         }
         subs = subcommands.get(cmd_name, [])
         if len(parts) == 2 or (len(parts) == 1 and not text):
@@ -194,6 +200,7 @@ def run_command(api: PKCS11API, command_line: str):
         "crypto": handler.cmd_crypto,
         "audit": handler.cmd_audit,
         "hsm": handler.cmd_hsm,
+        "backup": handler.cmd_backup,
         "help": handler.cmd_help,
     }
     h = dispatch.get(cmd_name)

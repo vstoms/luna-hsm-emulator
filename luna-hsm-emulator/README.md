@@ -494,6 +494,70 @@ hsm firmware upgrade -version 7.13.0
 
 ---
 
+### Exercise 14: Backup HSM Operations
+
+**Objective**: Learn how to use a Luna Backup HSM 7 to back up and restore cryptographic objects via the cloning protocol.
+
+```bash
+# Connect a Luna Backup HSM 7 (simulated USB connection)
+backup connect --explain
+
+# Check Secure Transport Mode status
+backup stm show
+
+# Recover from Secure Transport Mode
+backup stm recover -string my_random_string --explain
+
+# Initialize the backup HSM (set SO PIN)
+backup init
+
+# Log in to the backup HSM as SO
+backup login
+
+# Show backup HSM status
+backup show
+
+# Generate an extractable key on your partition
+slot set -slot 1
+key generate -kt aes -ks 256 -label backup_test_key --explain
+# Note: default keys are non-extractable. For backup testing, generate with
+# extractable=true by modifying the template, or use the API directly.
+
+# Back up objects from slot 1 to the backup HSM
+backup backup -slot 1 -domain my_domain --explain
+
+# List what's on the backup HSM
+backup list
+
+# Delete the key from the source partition
+key delete -label backup_test_key
+
+# Restore from backup
+backup restore -slot 1 -domain my_domain --explain
+
+# Verify the key is back
+key list
+
+# Show backup HSM firmware info
+backup firmware show
+
+# Upgrade backup HSM firmware
+backup firmware upgrade -version 7.14.0
+
+# Roll back backup HSM firmware (destructive — erases all backups!)
+backup firmware rollback
+
+# Factory reset the backup HSM
+backup factoryreset
+
+# Disconnect the backup HSM
+backup disconnect
+```
+
+**What you learned**: The Luna Backup HSM 7 lifecycle — connecting, recovering from Secure Transport Mode, initializing with an SO PIN, backing up objects via the cloning protocol (which requires CKA_EXTRACTABLE=TRUE and a shared cloning domain), restoring objects back to a partition, firmware management, and the destructive nature of firmware rollback (zeroizes all backup data).
+
+---
+
 ## Architecture
 
 ```
@@ -508,6 +572,7 @@ luna-hsm-emulator/
 ├── hsm/
 │   ├── __init__.py
 │   ├── token.py             # Token/partition management
+│   ├── backup.py            # Luna Backup HSM 7 emulation
 │   ├── session.py           # Session management
 │   ├── auth.py              # Role-based authentication
 │   ├── keystore.py          # Key storage and retrieval
@@ -526,7 +591,7 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # 44 unit tests for PKCS#11 operations
+│   └── test_pkcs11.py       # 93 unit tests for PKCS#11 operations
 ├── requirements.txt
 └── README.md
 ```
