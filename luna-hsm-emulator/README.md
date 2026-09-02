@@ -608,6 +608,106 @@ partition showpolicies -verbose
 
 ---
 
+### Exercise 16: LunaSH Appliance Management
+
+**Objective**: Learn how to manage the Luna Network HSM 7 appliance using LunaSH, the server-side command shell accessed via SSH.
+
+```bash
+# Start LunaSH (server-side appliance shell)
+python hsm_emulator.py --lunash
+
+# Login to the appliance as admin
+login
+# Username: admin
+# Password: (set on first login)
+
+# Check system status
+status cpu
+status mem
+status disk
+status date
+
+# Show HSM info
+hsm show
+
+# Login as HSM Security Officer (separate from appliance login)
+hsm login
+# SO PIN: ********
+
+# List partitions
+partition list
+
+# Create a new partition
+partition create -name partition2 -label "Backup Partition"
+
+# List appliance users
+user list
+
+# Add a new user
+user add -name auditor1 -role audit
+
+# Register an HSM client
+client register -name client1 -ip 192.168.1.50
+
+# Assign a partition to the client
+client assignPartition -name client1 -partition 1
+
+# List clients
+client list
+
+# Show network configuration
+network show
+
+# Set hostname
+network hostname my-luna7
+
+# Configure a static interface
+network interface static eth0 -ip 10.0.0.5 -netmask 255.255.255.0 -gateway 10.0.0.1
+
+# Show NTLS status
+ntls show
+
+# List services
+service list
+
+# Start the STC service
+service start stc
+
+# Set timezone
+sysconf timezone set America/New_York
+
+# Set login banner
+sysconf banner add "Authorized access only"
+
+# Show syslog configuration
+syslog show
+
+# Add a remote syslog server
+syslog remotehost add 10.0.0.100
+
+# List available packages
+package list
+
+# Verify a package
+package verify luna-firmware-7.13.0.pkg
+
+# Show audit summary
+audit show
+
+# View recent audit entries
+audit log tail
+
+# Change your own password
+my password set
+
+# Logout
+logout
+```
+
+**What you learned**: LunaSH is the server-side appliance shell (accessed via SSH) that manages the Luna Network HSM 7 appliance. It is distinct from lunacm (the client-side PKCS#11 configuration manager). LunaSH manages appliance users with role-based access control (admin, operator, monitor, audit), network configuration, NTLS connections, HSM client registration and partition assignment, system services, syslog, and package management. The HSM SO login is separate from the appliance SSH login — you must authenticate to both. Command shortnames are supported (e.g., `hs` for `hsm`, `par` for `partition`).
+
+---
+
 ## Architecture
 
 ```
@@ -624,6 +724,7 @@ luna-hsm-emulator/
 │   ├── token.py             # Token/partition management, policies
 │   ├── backup.py            # Luna Backup HSM 7 emulation
 │   ├── policies.py           # Partition capabilities and policies catalog
+│   ├── appliance.py          # Luna Network HSM 7 appliance emulation
 │   ├── session.py           # Session management
 │   ├── auth.py              # Role-based authentication
 │   ├── keystore.py          # Key storage and retrieval
@@ -631,7 +732,9 @@ luna-hsm-emulator/
 ├── cli/
 │   ├── __init__.py
 │   ├── lunacm.py            # Interactive lunacm shell
-│   └── commands.py          # Command handlers
+│   ├── lunash.py            # Interactive LunaSH appliance shell
+│   ├── commands.py          # lunacm command handlers
+│   └── lunash_commands.py    # LunaSH command handlers
 ├── crypto/
 │   ├── __init__.py
 │   ├── symmetric.py         # AES, 3DES operations
@@ -642,7 +745,7 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # 119 unit tests for PKCS#11 operations
+│   └── test_pkcs11.py       # 169 unit tests for PKCS#11 operations
 ├── requirements.txt
 └── README.md
 ```

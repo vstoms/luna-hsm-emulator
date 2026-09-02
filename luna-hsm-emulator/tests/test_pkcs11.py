@@ -38,6 +38,7 @@ from pkcs11.objects import (
     make_ec_keypair_templates,
 )
 from hsm.backup import BackupHSM, BACKUP_HSM_MODEL, BACKUP_HSM_DEFAULT_FW
+from hsm.appliance import Appliance, ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR, ROLE_AUDIT
 
 
 class TestStorage(unittest.TestCase):
@@ -1452,6 +1453,470 @@ class TestPartitionPolicies(unittest.TestCase):
                 "INVALID", "Bad template", {0: 1, 1: 1},
                 audit=self.api.audit
             )
+
+
+class TestLunaSH(unittest.TestCase):
+    """Test LunaSH appliance shell operations."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.api.tokens.init_token(self.slot_id, "sopin123", "Test")
+        self.appliance = Appliance(self.storage)
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # --- Appliance login ---
+
+    def test_appliance_login_first_time(self):
+        """Test first-time appliance login sets password."""
+        result = self.appliance.login("admin", "admin123")
+        self.assertTrue(result["success"])
+        self.assertTrue(result.get("first_login"))
+        self.assertTrue(self.appliance.is_logged_in())
+
+    def test_appliance_login_subsequent(self):
+        """Test subsequent login with set password."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.logout()
+        result = self.appliance.login("admin", "admin123")
+        self.assertTrue(result["success"])
+        self.assertFalse(result.get("first_login", False))
+
+    def test_appliance_login_wrong_password(self):
+        """Test login with wrong password fails."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.logout()
+        result = self.appliance.login("admin", "wrongpass")
+        self.assertFalse(result["success"])
+        self.assertIn("password", result["error"].lower())
+
+    def test_appliance_login_unknown_user(self):
+        """Test login with unknown user fails."""
+        result = self.appliance.login("nobody", "pass")
+        self.assertFalse(result["success"])
+        self.assertIn("not found", result["error"].lower())
+
+    def test_appliance_logout(self):
+        """Test logout clears session."""
+        self.appliance.login("admin", "admin123")
+        self.assertTrue(self.appliance.is_logged_in())
+        self.appliance.logout()
+        self.assertFalse(self.appliance.is_logged_in())
+
+    # --- HSM SO login ---
+
+    def test_hsm_login(self):
+        """Test HSM SO login."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.hsm_login("sopin123")
+        self.assertTrue(result["success"])
+        self.assertTrue(self.appliance.is_hsm_logged_in())
+
+    def test_hsm_login_wrong_pin(self):
+        """Test HSM SO login with wrong PIN."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.hsm_login("wrongpin")
+        self.assertFalse(result["success"])
+
+    def test_hsm_logout(self):
+        """Test HSM SO logout."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.hsm_login("sopin123")
+        self.appliance.hsm_logout()
+        self.assertFalse(self.appliance.is_hsm_logged_in())
+
+    # --- User management ---
+
+    def test_list_default_users(self):
+        """Test that default users exist."""
+        users = self.appliance.list_users()
+        usernames = [u["username"] for u in users]
+        self.assertIn("admin", usernames)
+        self.assertIn("operator", usernames)
+        self.assertIn("monitor", usernames)
+        self.assertIn("audit", usernames)
+
+    def test_add_user(self):
+        """Test adding a new user."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.add_user("testuser", "monitor", "testpass")
+        self.assertTrue(result["success"])
+        users = self.appliance.list_users()
+        self.assertIn("testuser", [u["username"] for u in users])
+
+    def test_add_user_duplicate(self):
+        """Test adding a duplicate user fails."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.add_user("admin", "admin", "pass")
+        self.assertFalse(result["success"])
+
+    def test_add_user_requires_admin(self):
+        """Test that non-admin cannot add users."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("monuser", "monitor", "pass")
+        self.appliance.logout()
+        self.appliance.login("monuser", "pass")
+        result = self.appliance.add_user("newuser", "admin", "pass")
+        self.assertFalse(result["success"])
+
+    def test_delete_user(self):
+        """Test deleting a user."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("tempuser", "monitor", "pass")
+        result = self.appliance.delete_user("tempuser")
+        self.assertTrue(result["success"])
+        users = self.appliance.list_users()
+        self.assertNotIn("tempuser", [u["username"] for u in users])
+
+    def test_delete_user_requires_admin(self):
+        """Test that non-admin cannot delete users."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("opuser", "operator", "pass")
+        self.appliance.add_user("deluser", "monitor", "pass")
+        self.appliance.logout()
+        self.appliance.login("opuser", "pass")
+        result = self.appliance.delete_user("deluser")
+        self.assertFalse(result["success"])
+
+    def test_cannot_delete_admin(self):
+        """Test that the admin user cannot be deleted."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.delete_user("admin")
+        self.assertFalse(result["success"])
+
+    def test_disable_enable_user(self):
+        """Test disabling and enabling a user."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("disuser", "operator", "pass")
+        result = self.appliance.disable_user("disuser")
+        self.assertTrue(result["success"])
+        users = self.appliance.list_users()
+        dis = [u for u in users if u["username"] == "disuser"][0]
+        self.assertFalse(dis["enabled"])
+        result = self.appliance.enable_user("disuser")
+        self.assertTrue(result["success"])
+        users = self.appliance.list_users()
+        dis = [u for u in users if u["username"] == "disuser"][0]
+        self.assertTrue(dis["enabled"])
+
+    def test_cannot_disable_admin(self):
+        """Test that admin cannot be disabled."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.disable_user("admin")
+        self.assertFalse(result["success"])
+
+    # --- Client management ---
+
+    def test_register_client(self):
+        """Test registering a client."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.register_client("client1", "192.168.1.50")
+        self.assertTrue(result["success"])
+        clients = self.appliance.list_clients()
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0]["name"], "client1")
+
+    def test_register_duplicate_client(self):
+        """Test registering a duplicate client fails."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.register_client("client1")
+        result = self.appliance.register_client("client1")
+        self.assertFalse(result["success"])
+
+    def test_delete_client(self):
+        """Test deleting a client."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.register_client("tempclient")
+        result = self.appliance.delete_client("tempclient")
+        self.assertTrue(result["success"])
+        self.assertEqual(len(self.appliance.list_clients()), 0)
+
+    def test_assign_revoke_partition(self):
+        """Test assigning and revoking a partition to a client."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.register_client("client1")
+        result = self.appliance.assign_partition("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        client = self.appliance.show_client("client1")
+        self.assertIn(self.slot_id, client["assigned_partitions"])
+        result = self.appliance.revoke_partition("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        client = self.appliance.show_client("client1")
+        self.assertNotIn(self.slot_id, client["assigned_partitions"])
+
+    # --- Network ---
+
+    def test_set_hostname(self):
+        """Test setting hostname."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_hostname("my-luna7")
+        self.assertTrue(result["success"])
+        net = self.appliance.get_network_info()
+        self.assertEqual(net["hostname"], "my-luna7")
+
+    def test_set_interface_static(self):
+        """Test configuring a static interface."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_interface_static("eth0", "10.0.0.5", "255.255.255.0", "10.0.0.1")
+        self.assertTrue(result["success"])
+        net = self.appliance.get_network_info()
+        self.assertEqual(net["interfaces"]["eth0"]["ip"], "10.0.0.5")
+
+    def test_add_delete_dns_nameserver(self):
+        """Test adding and deleting DNS nameservers."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_dns_nameserver("1.1.1.1")
+        net = self.appliance.get_network_info()
+        self.assertIn("1.1.1.1", net["dns_nameservers"])
+        self.appliance.delete_dns_nameserver("1.1.1.1")
+        net = self.appliance.get_network_info()
+        self.assertNotIn("1.1.1.1", net["dns_nameservers"])
+
+    def test_add_delete_route(self):
+        """Test adding and deleting routes."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_route("10.10.0.0/24", "192.168.1.254")
+        routes = self.appliance.show_routes()
+        self.assertTrue(any(r["destination"] == "10.10.0.0/24" for r in routes))
+        self.appliance.delete_route("10.10.0.0/24")
+        routes = self.appliance.show_routes()
+        self.assertFalse(any(r["destination"] == "10.10.0.0/24" for r in routes))
+
+    # --- Services ---
+
+    def test_list_services(self):
+        """Test listing services."""
+        services = self.appliance.list_services()
+        names = [s["name"] for s in services]
+        self.assertIn("ntls", names)
+        self.assertIn("ssh", names)
+
+    def test_start_stop_service(self):
+        """Test starting and stopping a service."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.stop_service("ntls")
+        self.assertTrue(result["success"])
+        status = self.appliance.service_status("ntls")
+        self.assertEqual(status["status"], "stopped")
+        result = self.appliance.start_service("ntls")
+        self.assertTrue(result["success"])
+        status = self.appliance.service_status("ntls")
+        self.assertEqual(status["status"], "running")
+
+    def test_start_unknown_service(self):
+        """Test starting an unknown service fails."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.start_service("nonexistent")
+        self.assertFalse(result["success"])
+
+    # --- System config ---
+
+    def test_set_timezone(self):
+        """Test setting timezone."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_timezone("America/New_York")
+        self.assertTrue(result["success"])
+        config = self.appliance.get_sysconf()
+        self.assertEqual(config["timezone"], "America/New_York")
+
+    def test_set_banner(self):
+        """Test setting and clearing banner."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.set_banner("Authorized access only")
+        config = self.appliance.get_sysconf()
+        self.assertEqual(config["banner"], "Authorized access only")
+        self.appliance.clear_banner()
+        config = self.appliance.get_sysconf()
+        self.assertEqual(config["banner"], "")
+
+    def test_force_so_login(self):
+        """Test enabling/disabling force SO login."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.force_so_login_enable()
+        config = self.appliance.get_sysconf()
+        self.assertTrue(config["force_so_login"])
+        self.appliance.force_so_login_disable()
+        config = self.appliance.get_sysconf()
+        self.assertFalse(config["force_so_login"])
+
+    def test_set_ssh_port(self):
+        """Test setting SSH port."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_ssh_port(2222)
+        self.assertTrue(result["success"])
+        config = self.appliance.get_sysconf()
+        self.assertEqual(config["ssh_port"], 2222)
+
+    # --- System status ---
+
+    def test_get_status(self):
+        """Test getting overall appliance status."""
+        self.appliance.login("admin", "admin123")
+        status = self.appliance.get_status()
+        self.assertEqual(status["current_user"], "admin")
+        self.assertGreater(status["uptime"], 0)
+        self.assertGreater(status["services_total"], 0)
+
+    def test_get_cpu_status(self):
+        """Test getting CPU status."""
+        cpu = self.appliance.get_cpu_status()
+        self.assertIn("cpu_usage", cpu)
+        self.assertIn("cores", cpu)
+
+    def test_get_mem_status(self):
+        """Test getting memory status."""
+        mem = self.appliance.get_mem_status()
+        self.assertIn("total", mem)
+        self.assertIn("used", mem)
+
+    def test_get_disk_status(self):
+        """Test getting disk status."""
+        disk = self.appliance.get_disk_status()
+        self.assertIn("total", disk)
+        self.assertIn("free", disk)
+
+    # --- Syslog ---
+
+    def test_set_syslog_severity(self):
+        """Test setting syslog severity."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_syslog_severity("debug")
+        self.assertTrue(result["success"])
+        config = self.appliance.get_syslog_config()
+        self.assertEqual(config["severity"], "debug")
+
+    def test_set_invalid_severity(self):
+        """Test setting invalid severity fails."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_syslog_severity("invalid")
+        self.assertFalse(result["success"])
+
+    def test_add_delete_syslog_remote_host(self):
+        """Test adding and deleting remote syslog hosts."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_syslog_remote_host("10.0.0.100")
+        config = self.appliance.get_syslog_config()
+        self.assertIn("10.0.0.100", config["remote_hosts"])
+        self.appliance.delete_syslog_remote_host("10.0.0.100")
+        config = self.appliance.get_syslog_config()
+        self.assertNotIn("10.0.0.100", config["remote_hosts"])
+
+    # --- My ---
+
+    def test_my_info(self):
+        """Test getting current user info."""
+        self.appliance.login("admin", "admin123")
+        info = self.appliance.get_my_info()
+        self.assertEqual(info["username"], "admin")
+        self.assertEqual(info["role"], "admin")
+
+    def test_my_password_change(self):
+        """Test changing current user's password."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_my_password("admin123", "newpass456")
+        self.assertTrue(result["success"])
+        self.appliance.logout()
+        result = self.appliance.login("admin", "newpass456")
+        self.assertTrue(result["success"])
+
+    def test_my_password_wrong_old(self):
+        """Test changing password with wrong old password."""
+        self.appliance.login("admin", "admin123")
+        result = self.appliance.set_my_password("wrong", "newpass")
+        self.assertFalse(result["success"])
+
+    # --- NTLS ---
+
+    def test_ntls_info(self):
+        """Test getting NTLS info."""
+        info = self.appliance.get_ntls_info()
+        self.assertEqual(info["status"], "running")
+        self.assertIn("connections", info)
+
+    # --- Package ---
+
+    def test_list_packages(self):
+        """Test listing packages."""
+        packages = self.appliance.list_packages()
+        self.assertGreater(len(packages), 0)
+
+    def test_verify_package(self):
+        """Test verifying a package."""
+        result = self.appliance.verify_package("test.pkg")
+        self.assertTrue(result["success"])
+
+    # --- Appliance persistence ---
+
+    def test_users_persist(self):
+        """Test that users persist across DB reopen."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("persistuser", "monitor", "pass")
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        users = appliance2.list_users()
+        self.assertIn("persistuser", [u["username"] for u in users])
+        api2.C_Finalize()
+
+    def test_clients_persist(self):
+        """Test that clients persist across DB reopen."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.register_client("persistclient", "10.0.0.5")
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        clients = appliance2.list_clients()
+        self.assertIn("persistclient", [c["name"] for c in clients])
+        api2.C_Finalize()
+
+    def test_network_persists(self):
+        """Test that network config persists across DB reopen."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.set_hostname("persisted-host")
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        net = appliance2.get_network_info()
+        self.assertEqual(net["hostname"], "persisted-host")
+        api2.C_Finalize()
+
+    # --- Role-based access ---
+
+    def test_monitor_cannot_add_user(self):
+        """Test that monitor role cannot add users."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("monuser", "monitor", "pass")
+        self.appliance.logout()
+        self.appliance.login("monuser", "pass")
+        result = self.appliance.add_user("another", "admin", "pass")
+        self.assertFalse(result["success"])
+
+    def test_operator_cannot_add_user(self):
+        """Test that operator role cannot add users (admin only)."""
+        self.appliance.login("admin", "admin123")
+        self.appliance.add_user("opuser", "operator", "pass")
+        self.appliance.logout()
+        self.appliance.login("opuser", "pass")
+        # Operator can list users
+        users = self.appliance.list_users()
+        self.assertGreater(len(users), 0)
+        # But cannot add users (admin only)
+        result = self.appliance.add_user("unauthorized", "admin", "pass")
+        self.assertFalse(result["success"])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ It must NOT be used in production environments.
 
 Usage:
   Interactive mode:   python hsm_emulator.py
+  LunaSH mode:        python hsm_emulator.py --lunash
   Single command:     python hsm_emulator.py -c "slot list"
   Initialize HSM:     python hsm_emulator.py --init
   Show help:          python hsm_emulator.py --help
@@ -15,7 +16,8 @@ The emulator provides:
   - Full PKCS#11 v2.40 API surface
   - Luna 7 partition management and authentication model
   - Real cryptographic operations via pyca/cryptography (OpenSSL)
-  - Interactive lunacm CLI shell
+  - Interactive lunacm CLI shell (client-side)
+  - Interactive LunaSH CLI shell (server-side appliance management)
   - Encrypted SQLite persistent storage
   - Hash-chained audit logging
   - Educational --explain mode for PKCS#11 operations
@@ -38,6 +40,8 @@ if SCRIPT_DIR not in sys.path:
 from pkcs11.api import PKCS11API
 from storage.db import Storage
 from cli.lunacm import run_shell, run_command
+from cli.lunash import run_lunash, run_lunash_command
+from hsm.appliance import Appliance
 from pkcs11.constants import CKR_OK
 
 
@@ -77,6 +81,10 @@ Examples:
   python hsm_emulator.py --init             # Initialize new HSM instance
   python hsm_emulator.py --db /tmp/test.db  # Use custom database path
 """,
+    )
+    parser.add_argument(
+        "--lunash", action="store_true",
+        help="Start the LunaSH appliance shell (server-side management)",
     )
     parser.add_argument(
         "-c", "--command", type=str, default=None,
@@ -150,7 +158,17 @@ Examples:
         return
 
     # Run
-    if args.command:
+    if args.lunash and args.command:
+        # LunaSH single command mode
+        appliance = Appliance(storage)
+        run_lunash_command(appliance, api, args.command)
+        api.C_Finalize()
+    elif args.lunash:
+        # LunaSH interactive mode
+        appliance = Appliance(storage)
+        run_lunash(appliance, api)
+        api.C_Finalize()
+    elif args.command:
         run_command(api, args.command)
         api.C_Finalize()
     else:
