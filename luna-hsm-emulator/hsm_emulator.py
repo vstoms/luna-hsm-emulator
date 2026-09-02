@@ -47,7 +47,7 @@ from pkcs11.constants import CKR_OK
 
 BANNER = """
   ╔══════════════════════════════════════════════════════════════════╗
-  ║         Thales Luna 7 Network HSM Emulator                      ║
+  ║         Thales Luna 7 Network HSM Emulator                       ║
   ║         Firmware 7.13.0  |  PKCS#11 v2.40  |  Training Use       ║
   ║                                                                  ║
   ║  WARNING: Software emulator for educational purposes ONLY.       ║
