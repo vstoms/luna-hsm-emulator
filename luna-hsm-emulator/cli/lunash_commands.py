@@ -60,6 +60,15 @@ class LunaSHCommands:
             return False
         return True
 
+    def _print_explain(self, lines: list):
+        """Print explanatory text prefixed with a marker."""
+        print("  [INFO] " + lines[0])
+        for line in lines[1:]:
+            if line:
+                print("         " + line)
+            else:
+                print()
+
     # ------------------------------------------------------------------
     # Login / Logout
     # ------------------------------------------------------------------
@@ -902,7 +911,7 @@ class LunaSHCommands:
     def cmd_ntls(self, args: list):
         """Handle 'ntls' commands — full NTLS connection management."""
         if not args:
-            print("  Usage: ntls show | certificate show | certificate regenerate |")
+            print("  Usage: ntls show | bind | unbind | certificate show | certificate regenerate |")
             print("         connection list | connection create | connection delete |")
             print("         connection connect | connection disconnect | connection restore |")
             print("         ipcheck enable|disable|show | threads set|show |")
@@ -923,10 +932,15 @@ class LunaSHCommands:
             print(f"  Total Connections: {info['connections']}")
             print(f"  Connected:         {info['connected']}")
             print(f"  Assigned (pending): {summary['ntls_assigned']}")
+            print(f"  Broken:            {summary.get('ntls_broken', 0)}")
+            print(f"  Disconnected:      {summary.get('ntls_disconnected', 0)}")
             print(f"  Certificate:       {info['certificate']}")
             print(f"  Cert Fingerprint:  {info['cert_fingerprint']}")
-            print(f"  Cert Type:         {info['cert_type']}")
-            print(f"  Cert Expiry:       {info['cert_expiry']}")
+            print(f"  Cert Type:          {info['cert_type']}")
+            print(f"  Cert Key Type:      {info.get('cert_key_type', 'N/A')}")
+            print(f"  Cert Expiry:        {info['cert_expiry']}")
+            if info.get('cert_san'):
+                print(f"  Cert SAN:           {info['cert_san']}")
             print(f"  IP Check:          {'Enabled' if info['ip_check'] else 'Disabled'}")
             print(f"  Threads:           {info['threads']}")
             self._print_explain([
@@ -935,6 +949,35 @@ class LunaSHCommands:
                 "Clients are identified by IP address and authenticated via",
                 "certificates (self-signed or CA-signed).",
             ])
+
+        elif sub == "bind":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            if not rest:
+                print("  Usage: ntls bind <eth0|eth1|eth2|eth3|bond0|bond1|all>")
+                return
+            result = self.appliance.connections.bind_ntls_interface(rest[0])
+            if result["success"]:
+                print(f"  NTLS bound to: {', '.join(result['bound_interfaces'])}")
+                self._print_explain([
+                    "Binding NTLS to an interface makes the NTLS service listen on",
+                    "that interface for incoming client connections. Use 'all' to",
+                    "bind to every available interface.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "unbind":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            if not rest:
+                print("  Usage: ntls unbind <eth0|eth1|eth2|eth3|bond0|bond1>")
+                return
+            result = self.appliance.connections.unbind_ntls_interface(rest[0])
+            if result["success"]:
+                print(f"  NTLS unbound from {rest[0]}. Now bound to: {', '.join(result['bound_interfaces'])}")
+            else:
+                print(f"  Error: {result['error']}")
 
         elif sub == "certificate":
             if not rest:
@@ -953,13 +996,20 @@ class LunaSHCommands:
             elif rest[0] == "regenerate":
                 if not self._check_role(ROLE_ADMIN):
                     return
-                cert = self.appliance.connections.regenerate_ntls_cert()
+                result = self.appliance.renew_ntls_certificate()
+                cert = result
                 print(f"  NTLS certificate regenerated.")
                 print(f"    New Fingerprint: {cert.get('fingerprint', 'N/A')}")
+                print(f"    Expiry:          {cert.get('expiry', 'N/A')}")
+                invalidated = result.get("invalidated_connections", [])
+                if invalidated:
+                    print(f"  {len(invalidated)} connection(s) invalidated.")
+                print(f"  NTLS service restarted.")
                 self._print_explain([
                     "Regenerating the NTLS server certificate creates a new",
                     "self-signed certificate. All existing NTLS connections",
-                    "must be re-established with the new certificate.",
+                    "are broken and must be re-established with the new certificate.",
+                    "The NTLS service is restarted to load the new certificate.",
                 ])
             else:
                 print(f"  Unknown certificate subcommand: {rest[0]}")
@@ -1037,10 +1087,10 @@ class LunaSHCommands:
             if not conns:
                 print("  No NTLS connections.")
                 return
-            print(f"  {'Client':<25} {'Slot':<6} {'State':<15} {'Cert Type':<15} {'Created'}")
-            print("  " + "-" * 90)
+            print(f"  {'Client':<25} {'Slot':<6} {'State':<15} {'IP':<16} {'Hostname':<20} {'Cert Type':<15} {'Created'}")
+            print("  " + "-" * 120)
             for c in conns:
-                print(f"  {c['client_name']:<25} {c['slot_id']:<6} {c['state']:<15} {c['cert_type']:<15} {time.strftime('%Y-%m-%d %H:%M', time.localtime(c['created_at']))}")
+                print(f"  {c['client_name']:<25} {c['slot_id']:<6} {c['state']:<15} {c.get('client_ip', ''):<16} {c.get('client_hostname', ''):<20} {c['cert_type']:<15} {time.strftime('%Y-%m-%d %H:%M', time.localtime(c['created_at']))}")
 
         elif sub == "create":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
@@ -1048,16 +1098,23 @@ class LunaSHCommands:
             client = self._get_arg(rest, "-client")
             slot = self._get_arg(rest, "-slot")
             cert_type = self._get_arg(rest, "-cert") or "self-signed"
+            client_ip = self._get_arg(rest, "-ip") or ""
+            client_hostname = self._get_arg(rest, "-hostname") or ""
             if not client or not slot:
-                print("  Usage: ntls connection create -client <name> -slot <id> [-cert self-signed|ca-signed]")
+                print("  Usage: ntls connection create -client <name> -slot <id> [-cert self-signed|ca-signed] [-ip <ip>] [-hostname <hostname>]")
                 return
             result = self.appliance.connections.create_ntls_connection(
-                client, int(slot), cert_type=cert_type
+                client, int(slot), cert_type=cert_type,
+                client_ip=client_ip, client_hostname=client_hostname,
             )
             if result["success"]:
                 print(f"  NTLS connection created: client='{client}', slot={slot}")
                 print(f"  Certificate type: {cert_type}")
                 print(f"  Certificate fingerprint: {result.get('cert_fingerprint', 'N/A')}")
+                if client_ip:
+                    print(f"  Client IP: {client_ip}")
+                if client_hostname:
+                    print(f"  Client Hostname: {client_hostname}")
                 self._print_explain([
                     "Creating an NTLS connection simulates the process of:",
                     "1. Client generates a certificate (self-signed or CA-signed)",
@@ -1156,6 +1213,10 @@ class LunaSHCommands:
             print(f"  Cert Serial:      {conn['cert_serial']}")
             print(f"  Cert Fingerprint: {conn['cert_fingerprint']}")
             print(f"  Cert Expiry:      {conn['cert_expiry']}")
+            if conn.get('client_ip'):
+                print(f"  Client IP:        {conn['client_ip']}")
+            if conn.get('client_hostname'):
+                print(f"  Client Hostname:  {conn['client_hostname']}")
             print(f"  Created:          {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(conn['created_at']))}")
             if conn['connected_at']:
                 print(f"  Connected:        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(conn['connected_at']))}")
@@ -1600,26 +1661,61 @@ class LunaSHCommands:
                 return
             force = "-force" in rest
             csr = "-csr" in rest
+            hostname = self._get_arg(rest, "-hostname")
+            key_type = self._get_arg(rest, "-keytype") or "RSA"
+            key_size = int(self._get_arg(rest, "-keysize") or 2048)
+            curve = self._get_arg(rest, "-curve")
+            days = int(self._get_arg(rest, "-days") or 365)
+            country = self._get_arg(rest, "-country") or "US"
+            state_val = self._get_arg(rest, "-state")
+            location = self._get_arg(rest, "-location")
+            organization = self._get_arg(rest, "-organization") or "Thales"
+            orgunit = self._get_arg(rest, "-orgunit")
+            email = self._get_arg(rest, "-email")
+            san = self._get_arg(rest, "-san")
+
             if not force:
                 confirm = input("  Regenerate the NTLS server certificate? Existing NTLS connections will be broken. (yes/no): ")
                 if confirm.lower() != "yes":
                     print("  Cancelled.")
                     return
-            cert = self.appliance.connections.regenerate_ntls_cert()
+
+            result = self.appliance.renew_ntls_certificate(
+                hostname=hostname, key_type=key_type, key_size=key_size,
+                curve=curve, days=days, country=country, state=state_val,
+                location=location, organization=organization, orgunit=orgunit,
+                email=email, san=san, csr=csr,
+            )
+            cert = result
             print(f"  NTLS server certificate regenerated.")
             print(f"    Subject:     {cert.get('subject', 'N/A')}")
             print(f"    Serial:      {cert.get('serial', 'N/A')}")
             print(f"    Fingerprint: {cert.get('fingerprint', 'N/A')}")
             print(f"    Type:        {cert.get('type', 'N/A')}")
+            print(f"    Key Type:    {cert.get('key_type', 'N/A')}")
             print(f"    Expiry:      {cert.get('expiry', 'N/A')}")
+            if cert.get('san'):
+                print(f"    SAN:         {cert['san']}")
+
+            invalidated = result.get("invalidated_connections", [])
+            if invalidated:
+                print(f"\n  {len(invalidated)} NTLS connection(s) invalidated:")
+                for inv in invalidated:
+                    print(f"    client='{inv['client_name']}' slot={inv['slot_id']}: {inv['old_state']} -> {inv['new_state']}")
+                print("  All clients must re-register their certificates and re-establish trust.")
+
+            print(f"\n  NTLS service restarted to apply new certificate.")
+
             if csr:
-                print("  CSR option specified. Generate a CSR and have it signed by your CA.")
-                print("  On a real Luna 7, the -csr option outputs a CSR file for external CA signing.")
+                print("\n  CSR generated. Copy the CSR to your Certificate Authority for signing,")
+                print("  then install the CA-signed certificate using 'ntls certificate install'.")
+
             self._print_explain([
-                "Regenerating the NTLS server certificate creates a new self-signed",
-                "certificate and replaces the old one. All existing NTLS connections",
-                "must be re-established with the new certificate. On a real Luna 7,",
-                "the private and public keys are stored on the appliance file system.",
+                "sysconf regenCert generates a new NTLS server certificate on the",
+                "appliance file system. All existing NTLS client trust relationships",
+                "are invalidated — clients must re-register their certificates and",
+                "re-establish the trust link. The NTLS service is automatically",
+                "restarted to load the new certificate.",
             ])
 
         elif sub == "timezone":
@@ -2750,7 +2846,10 @@ class LunaSHCommands:
     sysconf banner add <text> | clear | show  Manage login banner
     sysconf forceSOLogin enable|disable   Enable/disable forced SO login
     sysconf ssh port <port> | show         Configure SSH
-    sysconf regenCert [-csr] [-force]      Regenerate NTLS server certificate
+    sysconf regenCert [-csr] [-force] [-hostname <h>]   Regenerate NTLS server certificate
+      [-keytype RSA|EC] [-keysize <n>] [-curve <name>] [-days <n>]
+      [-country <c>] [-state <s>] [-location <l>] [-organization <o>]
+      [-orgunit <u>] [-email <e>] [-san <san>]
     sysconf appliance reboot | poweroff    Reboot/poweroff appliance
 
   Services:

@@ -508,18 +508,57 @@ class Appliance:
     def get_ntls_info(self) -> dict:
         cert = self.connections.get_ntls_server_cert()
         summary = self.connections.get_connection_summary()
+        bound = self.connections.get_ntls_bound_interfaces()
         return {
             "status": "running",
-            "bound_interfaces": "eth0",
+            "bound_interfaces": ", ".join(bound) if bound else "none",
             "connections": summary["ntls_total"],
             "connected": summary["ntls_connected"],
+            "broken": summary.get("ntls_broken", 0),
             "certificate": cert.get("subject", "NTLS Server Certificate"),
             "cert_fingerprint": cert.get("fingerprint", ""),
             "cert_expiry": cert.get("expiry", ""),
             "cert_type": cert.get("type", CERT_SELF_SIGNED),
+            "cert_key_type": cert.get("key_type", "RSA-2048"),
+            "cert_san": cert.get("san", ""),
             "ip_check": True,
             "threads": 8,
         }
+
+    def renew_ntls_certificate(self, hostname: str = None,
+                                 key_type: str = "RSA",
+                                 key_size: int = 2048,
+                                 curve: str = None,
+                                 days: int = 365,
+                                 country: str = "US",
+                                 state: str = "",
+                                 location: str = "",
+                                 organization: str = "Thales",
+                                 orgunit: str = "",
+                                 email: str = "",
+                                 san: str = "",
+                                 csr: bool = False) -> dict:
+        """Renew the NTLS server certificate and restart dependent services.
+
+        On a real Luna 7, after regenerating the cert with sysconf regenCert,
+        the NTLS service must be restarted for the new certificate to take
+        effect. All existing client trust relationships are invalidated.
+        """
+        result = self.connections.regenerate_ntls_cert(
+            hostname=hostname, key_type=key_type, key_size=key_size,
+            curve=curve, days=days, country=country, state=state,
+            location=location, organization=organization, orgunit=orgunit,
+            email=email, san=san, csr=csr,
+        )
+
+        # Restart the NTLS service to pick up the new certificate
+        services = self._get_services()
+        if "ntls" in services:
+            services["ntls"]["status"] = "running"
+            self._save_services(services)
+
+        result["service_restarted"] = True
+        return result
 
     # ------------------------------------------------------------------
     # HSM Clients

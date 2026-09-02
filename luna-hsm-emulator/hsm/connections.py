@@ -74,6 +74,8 @@ class NTLSConnection:
     cert_serial: str = ""
     cert_fingerprint: str = ""
     cert_expiry: str = ""
+    client_ip: str = ""
+    client_hostname: str = ""
     state: str = STATE_ASSIGNED
     created_at: float = field(default_factory=time.time)
     connected_at: float = 0.0
@@ -90,6 +92,8 @@ class NTLSConnection:
             "cert_serial": self.cert_serial,
             "cert_fingerprint": self.cert_fingerprint,
             "cert_expiry": self.cert_expiry,
+            "client_ip": self.client_ip,
+            "client_hostname": self.client_hostname,
             "state": self.state,
             "created_at": self.created_at,
             "connected_at": self.connected_at,
@@ -104,6 +108,8 @@ class NTLSConnection:
         c.cert_serial = d.get("cert_serial", "")
         c.cert_fingerprint = d.get("cert_fingerprint", "")
         c.cert_expiry = d.get("cert_expiry", "")
+        c.client_ip = d.get("client_ip", "")
+        c.client_hostname = d.get("client_hostname", "")
         c.state = d.get("state", STATE_ASSIGNED)
         c.created_at = d.get("created_at", time.time())
         c.connected_at = d.get("connected_at", 0.0)
@@ -216,6 +222,8 @@ class ConnectionManager:
             self.storage.set_meta("stc_next_identity_id", "1")
         if not self.storage.get_meta("ntls_server_cert"):
             self._generate_ntls_server_cert()
+        if not self.storage.get_meta("ntls_bound_interfaces"):
+            self.storage.set_meta("ntls_bound_interfaces", json.dumps(["eth0"]))
         if not self.storage.get_meta("stc_config"):
             self.storage.set_meta("stc_config", json.dumps({
                 "enabled": False,
@@ -229,18 +237,62 @@ class ConnectionManager:
     # NTLS Server Certificate
     # ------------------------------------------------------------------
 
-    def _generate_ntls_server_cert(self):
+    # Valid NTLS bindable interfaces
+    VALID_INTERFACES = ["eth0", "eth1", "eth2", "eth3", "bond0", "bond1", "all"]
+
+    def _generate_ntls_server_cert(self, hostname: str = "luna7-appliance",
+                                     key_type: str = "RSA",
+                                     key_size: int = 2048,
+                                     curve: str = None,
+                                     days: int = 365,
+                                     country: str = "US",
+                                     state: str = "",
+                                     location: str = "",
+                                     organization: str = "Thales",
+                                     orgunit: str = "",
+                                     email: str = "",
+                                     san: str = ""):
         """Generate the NTLS server self-signed certificate."""
         serial = secrets.token_hex(8).upper()
         fingerprint = hashlib.sha256(secrets.token_bytes(32)).hexdigest()[:40].upper()
+
+        # Build subject string from DN components
+        subject_parts = [f"CN={hostname}"]
+        if orgunit:
+            subject_parts.append(f"OU={orgunit}")
+        if organization:
+            subject_parts.append(f"O={organization}")
+        if location:
+            subject_parts.append(f"L={location}")
+        if state:
+            subject_parts.append(f"ST={state}")
+        if country:
+            subject_parts.append(f"C={country}")
+        if email:
+            subject_parts.append(f"emailAddress={email}")
+        subject = ",".join(subject_parts)
+
+        # Calculate expiry date
+        from datetime import datetime, timedelta
+        expiry_date = datetime.now() + timedelta(days=days)
+        expiry_str = expiry_date.strftime("%Y-%m-%d")
+
+        # Determine key type label
+        if key_type.upper() == "EC" and curve:
+            key_label = f"EC-{curve}"
+        else:
+            key_label = f"{key_type}-{key_size}"
+
         cert = {
-            "subject": f"CN=luna7-appliance,O=Thales,C=US",
-            "issuer": f"CN=luna7-appliance,O=Thales,C=US",  # self-signed
+            "subject": subject,
+            "issuer": subject,  # self-signed
             "serial": serial,
             "fingerprint": fingerprint,
             "type": CERT_SELF_SIGNED,
-            "expiry": "2027-01-01",
-            "key_type": "RSA-2048",
+            "expiry": expiry_str,
+            "key_type": key_label,
+            "san": san if san else "",
+            "created_at": time.time(),
         }
         self.storage.set_meta("ntls_server_cert", json.dumps(cert))
 
@@ -254,10 +306,104 @@ class ConnectionManager:
                 pass
         return {}
 
-    def regenerate_ntls_cert(self) -> dict:
-        """Regenerate the NTLS server certificate."""
-        self._generate_ntls_server_cert()
-        return self.get_ntls_server_cert()
+    def regenerate_ntls_cert(self, hostname: str = None,
+                               key_type: str = "RSA",
+                               key_size: int = 2048,
+                               curve: str = None,
+                               days: int = 365,
+                               country: str = "US",
+                               state: str = "",
+                               location: str = "",
+                               organization: str = "Thales",
+                               orgunit: str = "",
+                               email: str = "",
+                               san: str = "",
+                               csr: bool = False) -> dict:
+        """Regenerate the NTLS server certificate.
+
+        On a real Luna 7, this command:
+        1. Generates a new private/public key pair on the appliance file system
+        2. Creates a self-signed certificate (or CSR if -csr is specified)
+        3. Invalidates all existing NTLS connections (client trust must be re-established)
+        4. Requires restarting the NTLS service to take effect
+
+        Returns the new certificate info and a list of invalidated connections.
+        """
+        # Use current hostname from appliance if not specified
+        if not hostname:
+            hostname = self.storage.get_meta("appliance_hostname") or "luna7-appliance"
+
+        # Generate the new cert
+        self._generate_ntls_server_cert(
+            hostname=hostname, key_type=key_type, key_size=key_size,
+            curve=curve, days=days, country=country, state=state,
+            location=location, organization=organization, orgunit=orgunit,
+            email=email, san=san,
+        )
+
+        # Invalidate all existing NTLS connections — the old cert's trust is broken
+        conns = self._get_ntls_connections()
+        invalidated = []
+        for c in conns:
+            if c.state in (STATE_CONNECTED, STATE_ASSIGNED):
+                old_state = c.state
+                c.state = STATE_BROKEN
+                c.connected_at = 0.0
+                c.last_activity = time.time()
+                invalidated.append({
+                    "client_name": c.client_name,
+                    "slot_id": c.slot_id,
+                    "old_state": old_state,
+                    "new_state": STATE_BROKEN,
+                })
+        if invalidated:
+            self._save_ntls_connections(conns)
+
+        result = self.get_ntls_server_cert()
+        result["invalidated_connections"] = invalidated
+        result["csr_generated"] = csr
+
+        if csr:
+            result["csr_subject"] = result.get("subject", "")
+            result["csr_message"] = (
+                "A CSR has been generated. Copy the CSR to your Certificate "
+                "Authority for signing, then install the CA-signed certificate "
+                "using 'ntls certificate install'."
+            )
+
+        return result
+
+    def get_ntls_bound_interfaces(self) -> list:
+        """Return the list of interfaces NTLS is bound to."""
+        raw = self.storage.get_meta("ntls_bound_interfaces") or "[\"eth0\"]"
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return ["eth0"]
+
+    def bind_ntls_interface(self, iface: str) -> dict:
+        """Bind NTLS to a network interface."""
+        if iface not in self.VALID_INTERFACES:
+            return {"success": False,
+                    "error": f"Invalid interface. Valid: {', '.join(self.VALID_INTERFACES)}"}
+        current = self.get_ntls_bound_interfaces()
+        if iface == "all":
+            current = ["eth0", "eth1", "eth2", "eth3", "bond0", "bond1"]
+        elif iface not in current:
+            current.append(iface)
+        self.storage.set_meta("ntls_bound_interfaces", json.dumps(current))
+        return {"success": True, "bound_interfaces": current}
+
+    def unbind_ntls_interface(self, iface: str) -> dict:
+        """Unbind NTLS from a network interface."""
+        current = self.get_ntls_bound_interfaces()
+        if iface not in current:
+            return {"success": False, "error": f"NTLS is not bound to {iface}"}
+        current = [i for i in current if i != iface]
+        if not current:
+            return {"success": False, "error": "Cannot unbind the last interface — NTLS requires at least one"}
+        self.storage.set_meta("ntls_bound_interfaces", json.dumps(current))
+        return {"success": True, "bound_interfaces": current}
 
     # ------------------------------------------------------------------
     # NTLS Connections
@@ -280,7 +426,9 @@ class ConnectionManager:
                                 cert_issuer: str = "",
                                 cert_serial: str = "",
                                 cert_fingerprint: str = "",
-                                cert_expiry: str = "") -> dict:
+                                cert_expiry: str = "",
+                                client_ip: str = "",
+                                client_hostname: str = "") -> dict:
         """Create an NTLS connection between a client and a partition.
 
         On a real Luna 7, this involves:
@@ -318,6 +466,7 @@ class ConnectionManager:
             cert_type=cert_type, cert_subject=cert_subject,
             cert_issuer=cert_issuer, cert_serial=cert_serial,
             cert_fingerprint=cert_fingerprint, cert_expiry=cert_expiry,
+            client_ip=client_ip, client_hostname=client_hostname,
         )
         conns.append(conn)
         self._save_ntls_connections(conns)
@@ -328,6 +477,8 @@ class ConnectionManager:
             "slot_id": slot_id,
             "cert_type": cert_type,
             "cert_fingerprint": cert_fingerprint,
+            "client_ip": client_ip,
+            "client_hostname": client_hostname,
             "state": conn.state,
         }
 
@@ -798,6 +949,8 @@ class ConnectionManager:
             "ntls_total": len(ntls),
             "ntls_connected": sum(1 for c in ntls if c.state == STATE_CONNECTED),
             "ntls_assigned": sum(1 for c in ntls if c.state == STATE_ASSIGNED),
+            "ntls_broken": sum(1 for c in ntls if c.state == STATE_BROKEN),
+            "ntls_disconnected": sum(1 for c in ntls if c.state == STATE_DISCONNECTED),
             "stc_total": len(stc),
             "stc_connected": sum(1 for c in stc if c.state == STATE_CONNECTED),
             "stc_registered": sum(1 for c in stc if c.state == STATE_REGISTERED),

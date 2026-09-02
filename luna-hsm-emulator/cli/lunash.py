@@ -55,7 +55,7 @@ SUBCOMMANDS = {
     "user": ["list", "add", "delete", "enable", "disable", "password"],
     "client": ["list", "register", "delete", "show", "assignPartition", "revokePartition"],
     "network": ["show", "hostname", "interface", "dns", "route", "ping"],
-    "ntls": ["show", "certificate", "connection", "ipcheck", "threads", "timer", "tcp_keepalive"],
+    "ntls": ["show", "bind", "unbind", "certificate", "connection", "ipcheck", "threads", "timer", "tcp_keepalive"],
     "stc": ["enable", "disable", "show", "status", "identity", "connection", "cipher", "hmac", "rekeyThreshold", "activationTimeOut", "convert", "admin"],
     "sysconf": ["timezone", "banner", "forceSOLogin", "ssh", "regenCert", "appliance"],
     "service": ["list", "start", "stop", "restart", "status"],
