@@ -182,7 +182,7 @@ Use these with `-mech` flag:
 
 ## Training Exercises
 
-These exercises cover common HSM workflows, from basic key generation to advanced key wrapping and audit verification.
+These exercises cover common HSM workflows, from basic key generation to advanced key wrapping, firmware upgrades, and audit verification.
 
 ### Exercise 1: Initialize and Explore the HSM
 
@@ -453,6 +453,47 @@ partition list
 
 ---
 
+### Exercise 13: Firmware Upgrade and Rollback
+
+**Objective**: Learn the HSM firmware upgrade lifecycle, including pre-checks, staged upgrade, rollback, and history tracking.
+
+```bash
+# View current firmware info
+hsm firmware show
+
+# List all available firmware versions
+hsm firmware list
+
+# Upgrade to a newer firmware version
+hsm firmware upgrade -version 7.14.0 --explain
+# Pre-checks will run, then you'll be asked to confirm
+
+# Verify the new firmware is active
+hsm show
+
+# View the upgrade history
+hsm firmware history
+
+# Roll back to the previous firmware
+hsm firmware rollback
+# Confirm the rollback
+
+# Verify rollback succeeded
+hsm firmware show
+
+# Try upgrading to a nonexistent version
+hsm firmware upgrade -version 99.99.99
+# Pre-check will fail: version not found
+
+# Try upgrading to the same version (already installed)
+hsm firmware upgrade -version 7.13.0
+# Pre-check will fail: already installed
+```
+
+**What you learned**: How HSM firmware upgrades work — pre-checks (version exists, audit chain integrity, no active sessions), staged upgrade process (backup, download, signature verification, flash, reboot, post-verify), rollback to previous versions, and the firmware history trail for compliance.
+
+---
+
 ## Architecture
 
 ```
@@ -485,7 +526,7 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # Unit tests for PKCS#11 operations
+│   └── test_pkcs11.py       # 44 unit tests for PKCS#11 operations
 ├── requirements.txt
 └── README.md
 ```

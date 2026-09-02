@@ -31,6 +31,7 @@ This emulator lets you **learn HSM operations** — partition management, key ge
 | **lunacm Shell** | Interactive CLI that mimics the real Luna Configuration Manager with tab-completion |
 | **Real Cryptography** | AES, RSA, ECC, DSA, SHA, HMAC, CMAC, PBKDF2, HKDF — powered by `pyca/cryptography` (OpenSSL) |
 | **Role-Based Auth** | HSO, Partition SO, Crypto Officer (CO), Crypto User (CU) with PIN lockout policies |
+| **Firmware Upgrade** | Simulated firmware upgrade with pre-checks, staged progress, rollback, and history |
 | **Partition Management** | Create, initialize, and delete named partitions with per-partition storage quotas |
 | **Encrypted Storage** | SQLite database with AES-256-GCM encrypted key material blobs at rest |
 | **Audit Logging** | Tamper-evident SHA-256 hash-chained audit log |
@@ -211,6 +212,11 @@ hsm show                           # Show HSM firmware/model info
 hsm factoryreset                   # Reset HSM to factory defaults
 hsm export -file <path>            # Export HSM state for backup
 hsm import -file <path>            # Import HSM state for restore
+hsm firmware show                  # Show current firmware details
+hsm firmware list                  # List all available firmware versions
+hsm firmware upgrade -version <v>  # Upgrade firmware to specified version
+hsm firmware rollback              # Roll back to previous firmware
+hsm firmware history               # Show firmware upgrade history
 ```
 
 > **Tip:** Append `--explain` to any command for educational PKCS#11 output showing the underlying function calls, attributes, mechanisms, and security implications.
@@ -321,7 +327,7 @@ luna-hsm-emulator/
 ├── storage/
 │   └── db.py                    # SQLite persistence with AES-GCM encryption
 ├── tests/
-│   └── test_pkcs11.py           # 30 unit tests
+│   └── test_pkcs11.py           # 44 unit tests
 ├── requirements.txt
 └── README.md
 ```
@@ -360,9 +366,10 @@ The suite covers:
 | `TestObjectManagement` | 4 | Find by template, find by label, destroy, copy |
 | `TestAuditLog` | 3 | Entry recording, hash chain integrity, clear |
 | `TestKDF` | 3 | PBKDF2, HKDF, SP800-108 |
+| `TestFirmwareUpgrade` | 14 | Firmware info, list, pre-checks, upgrade, rollback, history, persistence, audit |
 
 ```
-Ran 30 tests in 1.172s
+Ran 44 tests in 2.581s
 
 OK
 ```
@@ -371,7 +378,7 @@ OK
 
 ## Training Exercises
 
-The emulator includes **12 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
+The emulator includes **13 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
 
 | # | Exercise | Skills Learned |
 |---|----------|---------------|
@@ -387,6 +394,7 @@ The emulator includes **12 hands-on training exercises** covering real-world HSM
 | 10 | Multi-Partition Management | Multi-tenant isolation |
 | 11 | Export and Import HSM State | Backup and restore |
 | 12 | Factory Reset | HSM lifecycle management |
+| 13 | Firmware Upgrade and Rollback | HSM firmware lifecycle, pre-checks, staged upgrade |
 
 ---
 
@@ -415,7 +423,7 @@ The emulator includes **12 hands-on training exercises** covering real-world HSM
 
 ### `hsm/` — HSM Core Modules
 
-- **`token.py`** — Partition (slot/token) management, HSM info, factory reset
+- **`token.py`** — Partition (slot/token) management, HSM info, factory reset, firmware upgrade/rollback
 - **`session.py`** — Multi-session support with R/W and R/O session types
 - **`auth.py`** — Four-role authentication with PIN lockout and PED simulation
 - **`keystore.py`** — Handle allocation, encrypted key material storage, quota enforcement

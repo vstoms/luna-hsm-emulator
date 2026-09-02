@@ -132,7 +132,7 @@ class LunaCMShell(cmd.Cmd):
             "key": ["generate", "list", "show", "delete", "wrap", "unwrap"],
             "crypto": ["encrypt", "decrypt", "sign", "verify", "digest"],
             "audit": ["log"],
-            "hsm": ["show", "factoryreset", "export", "import"],
+            "hsm": ["show", "factoryreset", "export", "import", "firmware"],
         }
         subs = subcommands.get(cmd_name, [])
         if len(parts) == 2 or (len(parts) == 1 and not text):

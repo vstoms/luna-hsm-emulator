@@ -772,17 +772,25 @@ class CommandHandler:
     def cmd_hsm(self, args: list):
         """Handle 'hsm' commands."""
         if not args:
-            print("  Usage: hsm show | hsm factoryreset | hsm export | hsm import")
+            print("  Usage: hsm show | hsm factoryreset | hsm export | hsm import | hsm firmware <subcommand>")
             return
         sub = args[0]
         if sub == "show":
             info = self.api.tokens.get_hsm_info()
+            fw_info = self.api.tokens.get_firmware_info()
             print(f"  Model:           {info['model']}")
             print(f"  Firmware:        {info['firmware']}")
+            if fw_info["update_available"]:
+                print(f"  Latest Firmware: {fw_info['latest_version']} (update available)")
+            else:
+                print(f"  Latest Firmware: {fw_info['latest_version']} (up to date)")
             print(f"  Serial:          {info['serial']}")
             print(f"  Partitions:      {info['partition_count']} / {info['max_partitions']}")
             print(f"  Crypto Provider: OpenSSL (via pyca/cryptography)")
             print(f"  PKCS#11 Version: v2.40")
+            print(f"  Upgrades Done:   {len(fw_info['history'])}")
+        elif sub == "firmware":
+            self._hsm_firmware(args[1:])
         elif sub == "factoryreset":
             confirm = input("  WARNING: This will delete ALL partitions, keys, and audit logs.\n  Type 'FACTORYRESET' to confirm: ")
             if confirm == "FACTORYRESET":
@@ -808,6 +816,153 @@ class CommandHandler:
             print(f"  HSM state imported from {infile}")
         else:
             print(f"  Unknown hsm subcommand: {sub}")
+
+    def _hsm_firmware(self, args: list):
+        """Handle 'hsm firmware' subcommands."""
+        if not args:
+            print("  Usage: hsm firmware show | hsm firmware list | hsm firmware upgrade -version <ver> | hsm firmware rollback | hsm firmware history")
+            return
+        sub = args[0]
+        rest = self._parse_flags(args[1:])
+
+        if sub == "show":
+            info = self.api.tokens.get_firmware_info()
+            print(f"  Current Firmware:  {info['current_version']}")
+            print(f"  Latest Firmware:   {info['latest_version']}")
+            print(f"  Update Available:  {'Yes' if info['update_available'] else 'No'}}")
+            print(f"  Available Versions: {info['available_count']}")
+            print(f"  Upgrades Performed: {len(info['history'])}")
+            self._print_explain([
+                "Real HSM firmware contains the cryptographic implementation,",
+                "secure boot loader, and access control logic. Updating firmware",
+                "on a real Luna 7 requires a signed firmware image from Thales,",
+                "a maintenance window, and often a PED-authenticated session.",
+            ])
+
+        elif sub == "list":
+            firmwares = self.api.tokens.list_available_firmwares()
+            current = self.api.tokens._get_firmware_version()
+            print(f"  {'Version':<12} {'Release Date':<14} {'Status':<12} {'Notes':<50}")
+            print("  " + "-" * 90)
+            for fw in firmwares:
+                if fw["installed"]:
+                    status = "* INSTALLED"
+                elif fw["upgradeable"]:
+                    status = "upgrade"
+                else:
+                    status = "older"
+                notes = fw["notes"][:50]
+                print(f"  {fw['version']:<12} {fw['date']:<14} {status:<12} {notes}")
+            print(f"\n  * = current firmware ({current})")
+            self._print_explain([
+                "Firmware versions are cryptographically signed by the vendor.",
+                "Only versions present in the catalog can be installed.",
+                "Downgrades are possible but may require special authorization.",
+            ])
+
+        elif sub == "upgrade":
+            target = self._get_arg(rest, "-version")
+            if not target:
+                print("  Usage: hsm firmware upgrade -version <version>")
+                print("  Use 'hsm firmware list' to see available versions.")
+                return
+
+            # Run pre-checks and display them
+            print(f"  Running pre-upgrade checks for firmware {target}...\n")
+            pre = self.api.tokens.check_firmware_upgrade(target)
+            for check_name, passed, detail in pre["checks"]:
+                status = "PASS" if passed else "FAIL"
+                print(f"    [{status}] {check_name}: {detail}")
+            if pre["warnings"]:
+                print()
+                for w in pre["warnings"]:
+                    print(f"    [WARN] {w}")
+            print()
+
+            if not pre["can_upgrade"]:
+                print(f"  Cannot upgrade: pre-checks failed.")
+                self._print_explain([
+                    "Pre-upgrade checks verify that the HSM is in a safe state",
+                    "for firmware modification. On a real Luna 7, this includes",
+                    "checking for active sessions, audit chain integrity, and",
+                    "that the firmware image is properly signed.",
+                ])
+                return
+
+            # Confirm
+            confirm = input(f"  Upgrade firmware from {pre['current_version']} to {target}? (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Upgrade cancelled.")
+                return
+
+            # Perform upgrade with staged progress
+            print(f"\n  Starting firmware upgrade: {pre['current_version']} -> {target}")
+            print("  " + "-" * 50)
+            result = self.api.tokens.perform_firmware_upgrade(target, audit=self.api.audit)
+            for stage_name, status in result["stages"]:
+                icon = "[OK]" if status == "OK" else "[FAIL]"
+                print(f"    {icon:<7} {stage_name}")
+            print("  " + "-" * 50)
+
+            if result["success"]:
+                print(f"\n  Firmware upgrade successful: {result['previous_version']} -> {result['new_version']}")
+                self._print_explain([
+                    "Firmware upgrade stages:",
+                    "  1. backup       - Snapshot current HSM state",
+                    "  2. download     - Fetch signed firmware image",
+                    "  3. verify_signature - Verify vendor signature",
+                    "  4. maintenance_mode - Suspend normal operations",
+                    "  5. flash        - Write firmware to secure storage",
+                    "  6. reboot       - Restart HSM with new firmware",
+                    "  7. post_verify  - Confirm new version is active",
+                    "",
+                    "Security Note: On a real Luna 7, the firmware image is",
+                    "signed by Thales and verified by the HSM's secure boot",
+                    "loader. The HSM will refuse to boot an unsigned or",
+                    "tampered firmware image.",
+                ])
+            else:
+                print(f"\n  Firmware upgrade FAILED: {result['error']}")
+                self._print_explain([
+                    "If a firmware upgrade fails during the flash stage on a",
+                    "real HSM, the device enters a fail-safe recovery mode.",
+                    "Use 'hsm firmware rollback' to revert to the previous version.",
+                ])
+
+        elif sub == "rollback":
+            history = self.api.tokens._get_firmware_history()
+            if not history:
+                print("  No firmware history available for rollback.")
+                return
+            last = history[-1]
+            print(f"  Last upgrade: {last['from_version']} -> {last['to_version']}")
+            confirm = input(f"  Roll back to {last['from_version']}? (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Rollback cancelled.")
+                return
+
+            result = self.api.tokens.rollback_firmware(audit=self.api.audit)
+            if result["success"]:
+                print(f"\n  Firmware rolled back: {result['previous_version']} -> {result['new_version']}")
+                self._print_explain([
+                    "Rollback restores the previous firmware version.",
+                    "On a real Luna 7, rollback is a privileged operation",
+                    "that requires HSO authentication and is audited.",
+                ])
+            else:
+                print(f"\n  Rollback failed: {result['error']}")
+
+        elif sub == "history":
+            print(self.api.tokens.show_firmware_history())
+            self._print_explain([
+                "Every firmware upgrade is recorded in the audit log and",
+                "in the firmware history table. This provides a complete",
+                "provenance trail for compliance and forensic purposes.",
+            ])
+
+        else:
+            print(f"  Unknown firmware subcommand: {sub}")
+            print("  Available: show, list, upgrade, rollback, history")
 
     # ------------------------------------------------------------------
     # Help
@@ -856,6 +1011,11 @@ class CommandHandler:
     hsm factoryreset                   Reset HSM to factory defaults
     hsm export -file <path>            Export HSM state
     hsm import -file <path>            Import HSM state
+    hsm firmware show                  Show current firmware info
+    hsm firmware list                  List all available firmware versions
+    hsm firmware upgrade -version <v>  Upgrade firmware to specified version
+    hsm firmware rollback              Roll back to previous firmware
+    hsm firmware history               Show firmware upgrade history
 
   Other:
     help                               Show this help

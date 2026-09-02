@@ -545,5 +545,141 @@ class TestKDF(unittest.TestCase):
         self.assertEqual(len(derived), 32)
 
 
+class TestFirmwareUpgrade(unittest.TestCase):
+    """Test HSM firmware upgrade, rollback, and history."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_default_firmware(self):
+        """Test that the default firmware version is set."""
+        info = self.api.tokens.get_hsm_info()
+        self.assertEqual(info["firmware"], "7.13.0")
+
+    def test_firmware_info(self):
+        """Test firmware info retrieval."""
+        info = self.api.tokens.get_firmware_info()
+        self.assertEqual(info["current_version"], "7.13.0")
+        self.assertTrue(info["update_available"])
+        self.assertGreater(info["available_count"], 1)
+        self.assertEqual(info["history"], [])
+
+    def test_list_available_firmwares(self):
+        """Test listing available firmware versions."""
+        firmwares = self.api.tokens.list_available_firmwares()
+        self.assertGreater(len(firmwares), 1)
+        installed = [f for f in firmwares if f["installed"]]
+        self.assertEqual(len(installed), 1)
+        self.assertEqual(installed[0]["version"], "7.13.0")
+
+    def test_upgrade_pre_check_nonexistent(self):
+        """Test that pre-check fails for nonexistent version."""
+        pre = self.api.tokens.check_firmware_upgrade("99.99.99")
+        self.assertFalse(pre["can_upgrade"])
+
+    def test_upgrade_pre_check_same_version(self):
+        """Test that pre-check fails when target equals current."""
+        pre = self.api.tokens.check_firmware_upgrade("7.13.0")
+        self.assertFalse(pre["can_upgrade"])
+
+    def test_upgrade_pre_check_valid(self):
+        """Test that pre-check passes for a valid upgrade target."""
+        pre = self.api.tokens.check_firmware_upgrade("7.14.0")
+        self.assertTrue(pre["can_upgrade"])
+        self.assertEqual(len(pre["checks"]), 6)
+
+    def test_perform_upgrade(self):
+        """Test a successful firmware upgrade."""
+        result = self.api.tokens.perform_firmware_upgrade("7.14.0", audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["previous_version"], "7.13.0")
+        self.assertEqual(result["new_version"], "7.14.0")
+        self.assertEqual(len(result["stages"]), 7)
+        # Verify version persisted
+        self.assertEqual(self.api.tokens._get_firmware_version(), "7.14.0")
+        # Verify history recorded
+        history = self.api.tokens._get_firmware_history()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["from_version"], "7.13.0")
+        self.assertEqual(history[0]["to_version"], "7.14.0")
+
+    def test_upgrade_persists_across_reopen(self):
+        """Test that firmware version persists after DB close/reopen."""
+        self.api.tokens.perform_firmware_upgrade("7.15.0", audit=self.api.audit)
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        self.assertEqual(api2.tokens._get_firmware_version(), "7.15.0")
+        history = api2.tokens._get_firmware_history()
+        self.assertEqual(len(history), 1)
+        api2.C_Finalize()
+
+    def test_rollback(self):
+        """Test firmware rollback after upgrade."""
+        # First upgrade
+        self.api.tokens.perform_firmware_upgrade("7.14.0", audit=self.api.audit)
+        self.assertEqual(self.api.tokens._get_firmware_version(), "7.14.0")
+        # Roll back
+        result = self.api.tokens.rollback_firmware(audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["previous_version"], "7.14.0")
+        self.assertEqual(result["new_version"], "7.13.0")
+        # Verify history has rollback marker
+        history = self.api.tokens._get_firmware_history()
+        self.assertGreaterEqual(len(history), 2)
+
+    def test_rollback_no_history(self):
+        """Test that rollback fails when there's no history."""
+        result = self.api.tokens.rollback_firmware()
+        self.assertFalse(result["success"])
+        self.assertIn("No firmware history", result["error"])
+
+    def test_downgrade(self):
+        """Test that downgrade (to older version) works with warnings."""
+        # First upgrade to 7.14.0
+        self.api.tokens.perform_firmware_upgrade("7.14.0", audit=self.api.audit)
+        # Now downgrade to 7.12.0
+        pre = self.api.tokens.check_firmware_upgrade("7.12.0")
+        self.assertTrue(pre["can_upgrade"])
+        self.assertTrue(any("Downgrading" in w for w in pre["warnings"]))
+        result = self.api.tokens.perform_firmware_upgrade("7.12.0", audit=self.api.audit)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["new_version"], "7.12.0")
+
+    def test_factory_reset_clears_firmware(self):
+        """Test that factory reset restores default firmware version."""
+        self.api.tokens.perform_firmware_upgrade("7.15.0", audit=self.api.audit)
+        self.api.tokens.factory_reset()
+        self.assertEqual(self.api.tokens._get_firmware_version(), "7.13.0")
+        self.assertEqual(self.api.tokens._get_firmware_history(), [])
+
+    def test_firmware_upgrade_audited(self):
+        """Test that firmware upgrade is recorded in audit log."""
+        self.api.tokens.perform_firmware_upgrade("7.14.0", audit=self.api.audit)
+        logs = self.api.storage.get_audit_logs()
+        ops = [l["operation"] for l in logs]
+        self.assertIn("FirmwareUpgrade", ops)
+
+    def test_show_firmware_history(self):
+        """Test formatted firmware history output."""
+        self.api.tokens.perform_firmware_upgrade("7.14.0", audit=self.api.audit)
+        self.api.tokens.perform_firmware_upgrade("7.15.0", audit=self.api.audit)
+        output = self.api.tokens.show_firmware_history()
+        self.assertIn("7.13.0", output)
+        self.assertIn("7.14.0", output)
+        self.assertIn("7.15.0", output)
+
+
 if __name__ == "__main__":
     unittest.main()
