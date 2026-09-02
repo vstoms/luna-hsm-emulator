@@ -77,10 +77,10 @@ python hsm_emulator.py
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║         Thales Luna 7 Network HSM Emulator — lunacm             ║
+  ║         Thales Luna 7 Network HSM Emulator — lunacm              ║
   ║         Firmware 7.13.0  |  PKCS#11 v2.40  |  Training Use       ║
   ║                                                                  ║
-  ║  WARNING: This is a software emulator for educational purposes    ║
+  ║  WARNING: This is a software emulator for educational purposes   ║
   ║           only. It must NOT be used in production environments.  ║
   ╚══════════════════════════════════════════════════════════════════╝
 
@@ -274,21 +274,21 @@ The emulator implements the Luna 7's four-role authentication hierarchy:
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                    HSM                           │
-│  ┌─────────────────────────────────────────────┐ │
-│  │  HSO (HSM Security Officer)                 │ │
-│  │  Full administrative access                  │ │
-│  └──────────────┬──────────────────────────────┘ │
-│                 │                                 │
-│  ┌──────────────▼──────────────────────────────┐ │
-│  │  Partition 1    Partition 2    Partition N  │ │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │ │
-│  │  │  SO      │  │  SO      │  │  SO      │  │ │
-│  │  │  CO      │  │  CO      │  │  CO      │  │ │
-│  │  │  CU      │  │  CU      │  │  CU      │  │ │
-│  │  │  Keys    │  │  Keys    │  │  Keys    │  │ │
-│  │  └──────────┘  └──────────┘  └──────────┘  │ │
-│  └─────────────────────────────────────────────┘ │
+│                    HSM                          │
+│  ┌─────────────────────────────────────────────┐│
+│  │  HSO (HSM Security Officer)                 ││
+│  │  Full administrative access                 ││
+│  └──────────────┬──────────────────────────────┘│
+│                 │                               │
+│  ┌──────────────▼──────────────────────────────┐│
+│  │  Partition 1    Partition 2    Partition N  ││
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐   ││
+│  │  │  SO      │  │  SO      │  │  SO      │   ││
+│  │  │  CO      │  │  CO      │  │  CO      │   ││
+│  │  │  CU      │  │  CU      │  │  CU      │   ││
+│  │  │  Keys    │  │  Keys    │  │  Keys    │   ││
+│  │  └──────────┘  └──────────┘  └──────────┘   ││
+│  └─────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────┘
 ```
 
