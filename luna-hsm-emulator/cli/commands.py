@@ -1181,7 +1181,7 @@ class CommandHandler:
             info = self.api.tokens.get_firmware_info()
             print(f"  Current Firmware:  {info['current_version']}")
             print(f"  Latest Firmware:   {info['latest_version']}")
-            print(f"  Update Available:  {'Yes' if info['update_available'] else 'No'}}")
+            print(f"  Update Available:  {'Yes' if info['update_available'] else 'No'}")
             print(f"  Available Versions: {info['available_count']}")
             print(f"  Upgrades Performed: {len(info['history'])}")
             self._print_explain([
