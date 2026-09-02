@@ -20,10 +20,10 @@ class LunaCMShell(cmd.Cmd):
 
     intro = """
   ╔══════════════════════════════════════════════════════════════════╗
-  ║         Thales Luna 7 Network HSM Emulator — lunacm             ║
+  ║         Thales Luna 7 Network HSM Emulator — lunacm              ║
   ║         Firmware 7.13.0  |  PKCS#11 v2.40  |  Training Use       ║
   ║                                                                  ║
-  ║  WARNING: This is a software emulator for educational purposes    ║
+  ║  WARNING: This is a software emulator for educational purposes   ║
   ║           only. It must NOT be used in production environments.  ║
   ╚══════════════════════════════════════════════════════════════════╝
 
