@@ -45,6 +45,7 @@ from hsm.connections import (
     STATE_ASSIGNED, STATE_CONNECTED, STATE_DISCONNECTED, STATE_REGISTERED,
     STC_CIPHERS, STC_HMACS, STC_DEFAULT_CIPHER, STC_DEFAULT_HMAC,
 )
+from hsm.deployment import DeploymentManager
 
 
 class TestStorage(unittest.TestCase):
@@ -2345,6 +2346,366 @@ class TestClientPartitionConnections(unittest.TestCase):
         info = self.appliance.get_ntls_info()
         self.assertEqual(info["connections"], 1)
         self.assertIn("cert_fingerprint", info)
+
+
+class TestDeploymentFeatures(unittest.TestCase):
+    """Test HA groups, NTP, network bonding, licenses, and support bundles."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot1 = self.api.tokens.create_partition("part1", "Partition 1")
+        self.slot2 = self.api.tokens.create_partition("part2", "Partition 2")
+        self.api.tokens.init_token(self.slot1, "sopin123", "Partition 1")
+        self.appliance = Appliance(self.storage)
+        self.appliance.login("admin", "admin123")
+        self.dm = self.appliance.deployment
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # --- HA groups ---
+
+    def test_create_ha_group(self):
+        result = self.dm.create_ha_group("ha1", self.slot1, "HA Group 1")
+        self.assertTrue(result["success"])
+        group = result["group"]
+        self.assertEqual(group["name"], "ha1")
+        self.assertEqual(len(group["members"]), 1)
+
+    def test_create_ha_group_duplicate(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.create_ha_group("ha1", self.slot2)
+        self.assertFalse(result["success"])
+
+    def test_create_ha_group_bad_slot(self):
+        result = self.dm.create_ha_group("ha1", 999)
+        self.assertFalse(result["success"])
+
+    def test_add_ha_member(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.add_ha_member("ha1", self.slot2)
+        self.assertTrue(result["success"])
+        group = self.dm.get_ha_group("ha1")
+        self.assertEqual(len(group["members"]), 2)
+
+    def test_add_ha_member_duplicate(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.add_ha_member("ha1", self.slot1)
+        self.assertFalse(result["success"])
+
+    def test_add_ha_member_bad_group(self):
+        result = self.dm.add_ha_member("nonexistent", self.slot1)
+        self.assertFalse(result["success"])
+
+    def test_remove_ha_member(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        self.dm.add_ha_member("ha1", self.slot2)
+        result = self.dm.remove_ha_member("ha1", self.slot2)
+        self.assertTrue(result["success"])
+        group = self.dm.get_ha_group("ha1")
+        self.assertEqual(len(group["members"]), 1)
+
+    def test_remove_last_member_fails(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.remove_ha_member("ha1", self.slot1)
+        self.assertFalse(result["success"])
+
+    def test_remove_nonexistent_member(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.remove_ha_member("ha1", 999)
+        self.assertFalse(result["success"])
+
+    def test_delete_ha_group(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.delete_ha_group("ha1")
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.dm.get_ha_group("ha1"))
+
+    def test_delete_ha_group_not_found(self):
+        result = self.dm.delete_ha_group("nonexistent")
+        self.assertFalse(result["success"])
+
+    def test_set_ha_retry(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.set_ha_retry("ha1", 100)
+        self.assertTrue(result["success"])
+        group = self.dm.get_ha_group("ha1")
+        self.assertEqual(group["retry_count"], 100)
+        self.assertFalse(group["infinite_polling"])
+
+    def test_set_ha_retry_infinite(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.set_ha_retry("ha1", -1)
+        self.assertTrue(result["success"])
+        group = self.dm.get_ha_group("ha1")
+        self.assertTrue(group["infinite_polling"])
+
+    def test_set_ha_retry_invalid(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.set_ha_retry("ha1", -2)
+        self.assertFalse(result["success"])
+
+    def test_set_ha_interval(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.set_ha_interval("ha1", 30)
+        self.assertTrue(result["success"])
+        group = self.dm.get_ha_group("ha1")
+        self.assertEqual(group["poll_interval"], 30)
+
+    def test_set_ha_interval_negative(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        result = self.dm.set_ha_interval("ha1", -1)
+        self.assertFalse(result["success"])
+
+    def test_synchronize_ha_group(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        self.dm.add_ha_member("ha1", self.slot2)
+        result = self.dm.synchronize_ha_group("ha1")
+        self.assertTrue(result["success"])
+        group = self.dm.get_ha_group("ha1")
+        for m in group["members"]:
+            self.assertEqual(m["objects"], result["objects"])
+            self.assertIsNotNone(m["last_sync"])
+
+    def test_synchronize_ha_not_found(self):
+        result = self.dm.synchronize_ha_group("nonexistent")
+        self.assertFalse(result["success"])
+
+    def test_ha_status(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        self.dm.add_ha_member("ha1", self.slot2)
+        result = self.dm.get_ha_status("ha1")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["members"], 2)
+        self.assertEqual(result["active_members"], 2)
+
+    def test_ha_list(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        self.dm.create_ha_group("ha2", self.slot2)
+        groups = self.dm.list_ha_groups()
+        self.assertEqual(len(groups), 2)
+
+    def test_ha_persists(self):
+        self.dm.create_ha_group("ha1", self.slot1)
+        self.dm.add_ha_member("ha1", self.slot2)
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        groups = appliance2.deployment.list_ha_groups()
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["members"]), 2)
+        api2.C_Finalize()
+
+    # --- NTP ---
+
+    def test_ntp_config_exists(self):
+        config = self.dm.get_ntp_config()
+        self.assertTrue(config["enabled"])
+        self.assertIn("pool.ntp.org", config["servers"])
+
+    def test_add_ntp_server(self):
+        result = self.dm.add_ntp_server("time.google.com")
+        self.assertTrue(result["success"])
+        config = self.dm.get_ntp_config()
+        self.assertIn("time.google.com", config["servers"])
+
+    def test_delete_ntp_server(self):
+        self.dm.add_ntp_server("time.google.com")
+        result = self.dm.delete_ntp_server("time.google.com")
+        self.assertTrue(result["success"])
+        config = self.dm.get_ntp_config()
+        self.assertNotIn("time.google.com", config["servers"])
+
+    def test_delete_last_ntp_server_fails(self):
+        config = self.dm.get_ntp_config()
+        for s in list(config["servers"]):
+            self.dm.delete_ntp_server(s)
+        result = self.dm.delete_ntp_server("pool.ntp.org")
+        self.assertFalse(result["success"])
+
+    def test_enable_disable_ntp(self):
+        self.dm.disable_ntp()
+        config = self.dm.get_ntp_config()
+        self.assertFalse(config["enabled"])
+        self.dm.enable_ntp()
+        config = self.dm.get_ntp_config()
+        self.assertTrue(config["enabled"])
+
+    def test_sync_ntp(self):
+        self.dm.enable_ntp()
+        result = self.dm.sync_ntp()
+        self.assertTrue(result["success"])
+        self.assertIn("last_sync", result)
+
+    def test_sync_ntp_disabled(self):
+        self.dm.disable_ntp()
+        result = self.dm.sync_ntp()
+        self.assertFalse(result["success"])
+
+    def test_ntp_persists(self):
+        self.dm.add_ntp_server("time.cloudflare.com")
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        config = appliance2.deployment.get_ntp_config()
+        self.assertIn("time.cloudflare.com", config["servers"])
+        api2.C_Finalize()
+
+    # --- Network bonding ---
+
+    def test_configure_bond(self):
+        result = self.dm.configure_bond("bond0", ["eth0", "eth1"], "10.0.0.5", "255.255.255.0", "10.0.0.1")
+        self.assertTrue(result["success"])
+        bonds = self.dm.get_network_bonds()
+        self.assertIn("bond0", bonds)
+
+    def test_configure_bond_invalid_name(self):
+        result = self.dm.configure_bond("bond2", ["eth0", "eth1"], "10.0.0.5", "255.255.255.0")
+        self.assertFalse(result["success"])
+
+    def test_configure_bond_single_member(self):
+        result = self.dm.configure_bond("bond0", ["eth0"], "10.0.0.5", "255.255.255.0")
+        self.assertFalse(result["success"])
+
+    def test_configure_bond_duplicate_members(self):
+        result = self.dm.configure_bond("bond0", ["eth0", "eth0"], "10.0.0.5", "255.255.255.0")
+        self.assertFalse(result["success"])
+
+    def test_configure_bond_invalid_member(self):
+        result = self.dm.configure_bond("bond0", ["eth0", "eth9"], "10.0.0.5", "255.255.255.0")
+        self.assertFalse(result["success"])
+
+    def test_configure_bond_overlapping_interface(self):
+        self.dm.configure_bond("bond0", ["eth0", "eth1"], "10.0.0.5", "255.255.255.0")
+        result = self.dm.configure_bond("bond1", ["eth0", "eth2"], "10.0.0.6", "255.255.255.0")
+        self.assertFalse(result["success"])
+
+    def test_enable_disable_bond(self):
+        self.dm.configure_bond("bond0", ["eth0", "eth1"], "10.0.0.5", "255.255.255.0")
+        result = self.dm.disable_bond("bond0")
+        self.assertTrue(result["success"])
+        bonds = self.dm.get_network_bonds()
+        self.assertEqual(bonds["bond0"]["status"], "down")
+        result = self.dm.enable_bond("bond0")
+        self.assertTrue(result["success"])
+        bonds = self.dm.get_network_bonds()
+        self.assertEqual(bonds["bond0"]["status"], "up")
+
+    def test_delete_bond(self):
+        self.dm.configure_bond("bond0", ["eth0", "eth1"], "10.0.0.5", "255.255.255.0")
+        result = self.dm.delete_bond("bond0")
+        self.assertTrue(result["success"])
+        bonds = self.dm.get_network_bonds()
+        self.assertNotIn("bond0", bonds)
+
+    def test_delete_bond_not_found(self):
+        result = self.dm.delete_bond("bond0")
+        self.assertFalse(result["success"])
+
+    def test_bond_persists(self):
+        self.dm.configure_bond("bond0", ["eth0", "eth1"], "10.0.0.5", "255.255.255.0")
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        bonds = appliance2.deployment.get_network_bonds()
+        self.assertIn("bond0", bonds)
+        api2.C_Finalize()
+
+    # --- Licenses ---
+
+    def test_list_licenses(self):
+        licenses = self.dm.list_licenses()
+        names = [l["name"] for l in licenses]
+        self.assertIn("ha", names)
+        self.assertIn("stc", names)
+        self.assertIn("key_backup", names)
+
+    def test_get_license_limit(self):
+        limit = self.dm.get_license_limit("max_partitions", 100)
+        self.assertEqual(limit, 10)
+
+    def test_get_license_limit_unlicensed(self):
+        self.dm.set_license_enabled("max_partitions", False)
+        limit = self.dm.get_license_limit("max_partitions", 100)
+        self.assertEqual(limit, 0)
+
+    def test_set_license_limit(self):
+        result = self.dm.set_license_limit("max_partitions", 20)
+        self.assertTrue(result["success"])
+        limit = self.dm.get_license_limit("max_partitions", 0)
+        self.assertEqual(limit, 20)
+
+    def test_set_license_limit_negative(self):
+        result = self.dm.set_license_limit("max_partitions", -1)
+        self.assertFalse(result["success"])
+
+    def test_set_license_limit_not_found(self):
+        result = self.dm.set_license_limit("nonexistent", 10)
+        self.assertFalse(result["success"])
+
+    def test_enable_disable_license(self):
+        self.dm.set_license_enabled("ha", False)
+        licenses = {l["name"]: l for l in self.dm.list_licenses()}
+        self.assertFalse(licenses["ha"]["enabled"])
+        self.dm.set_license_enabled("ha", True)
+        licenses = {l["name"]: l for l in self.dm.list_licenses()}
+        self.assertTrue(licenses["ha"]["enabled"])
+
+    def test_license_persists(self):
+        self.dm.set_license_limit("max_partitions", 50)
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        limit = appliance2.deployment.get_license_limit("max_partitions", 0)
+        self.assertEqual(limit, 50)
+        api2.C_Finalize()
+
+    # --- Support bundle ---
+
+    def test_build_support_bundle(self):
+        bundle = self.dm.build_support_bundle(self.appliance, self.api)
+        self.assertIn("Support Information", bundle)
+        self.assertIn("[Appliance]", bundle)
+        self.assertIn("[Network]", bundle)
+        self.assertIn("[NTP]", bundle)
+        self.assertIn("[HA]", bundle)
+        self.assertIn("[Licenses]", bundle)
+        self.assertIn("[Safety]", bundle)
+
+    def test_support_bundle_excludes_secrets(self):
+        bundle = self.dm.build_support_bundle(self.appliance, self.api)
+        lower = bundle.lower()
+        # Should not contain actual credential values
+        self.assertNotIn("sopin123", bundle)
+        self.assertNotIn("admin123", bundle)
+        self.assertNotIn("testpass", bundle)
+        self.assertNotIn("password_hash", lower)
+        self.assertNotIn("pin_hash", lower)
+        self.assertNotIn("pin_salt", lower)
+        self.assertNotIn("key_material", lower)
+        self.assertNotIn("private_key", lower)
+        # The safety notice mentions these words but that's informational
+        self.assertIn("[Safety]", bundle)
+
+    def test_support_bundle_history(self):
+        self.dm.build_support_bundle(self.appliance, self.api)
+        self.dm.build_support_bundle(self.appliance, self.api)
+        history = self.dm.get_support_bundle_history()
+        self.assertEqual(len(history), 2)
 
 
 if __name__ == "__main__":

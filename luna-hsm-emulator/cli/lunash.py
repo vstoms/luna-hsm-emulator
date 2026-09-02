@@ -39,13 +39,17 @@ COMMAND_SHORTCUTS = {
     "sysl": "syslog",
     "u": "user",
     "t": "token",
+    "ha": "ha",
+    "ntp": "ntp",
+    "bond": "bond",
+    "lic": "license",
 }
 
 # Subcommand completions per top-level command
 SUBCOMMANDS = {
     "status": ["cpu", "mem", "disk", "date", "time", "interface", "ps", "netstat", "sensors"],
     "hsm": ["login", "logout", "show", "init", "factoryReset", "zeroize", "firmware",
-            "showPolicies", "changePolicy", "stm", "ped", "selfTest", "time", "information"],
+            "showPolicies", "changePolicy", "stm", "ped", "selfTest", "time", "information", "supportInfo"],
     "partition": ["list", "create", "delete", "show", "init", "showPolicies",
                   "changePolicy", "clear", "activate", "deactivate", "rename", "resize"],
     "user": ["list", "add", "delete", "enable", "disable", "password"],
@@ -60,6 +64,10 @@ SUBCOMMANDS = {
     "package": ["list", "verify", "update", "listfile", "deletefile", "erase"],
     "token": ["backup"],
     "audit": ["login", "logout", "show", "log"],
+    "ha": ["list", "create", "delete", "show", "addmember", "removemember", "setretry", "setinterval", "synchronize", "status"],
+    "ntp": ["show", "add", "delete", "enable", "disable", "sync"],
+    "bond": ["show", "configure", "enable", "disable", "delete"],
+    "license": ["list", "show", "setlimit", "enable", "disable"],
 }
 
 
@@ -134,6 +142,10 @@ class LunaSHShell(cmd.Cmd):
             "package": self.handler.cmd_package,
             "token": self.handler.cmd_token,
             "audit": self.handler.cmd_audit,
+            "ha": self.handler.cmd_ha,
+            "ntp": self.handler.cmd_ntp,
+            "bond": self.handler.cmd_bond,
+            "license": self.handler.cmd_license,
             "help": self.handler.cmd_help,
         }
 
@@ -224,6 +236,18 @@ class LunaSHShell(cmd.Cmd):
     def do_audit(self, arg):
         self._run(f"audit {arg}" if arg else "audit")
 
+    def do_ha(self, arg):
+        self._run(f"ha {arg}" if arg else "ha")
+
+    def do_ntp(self, arg):
+        self._run(f"ntp {arg}" if arg else "ntp")
+
+    def do_bond(self, arg):
+        self._run(f"bond {arg}" if arg else "bond")
+
+    def do_license(self, arg):
+        self._run(f"license {arg}" if arg else "license")
+
     # ------------------------------------------------------------------
     # Tab completion
     # ------------------------------------------------------------------
@@ -301,6 +325,10 @@ def run_lunash_command(appliance: Appliance, api: PKCS11API, command_line: str):
         "package": handler.cmd_package,
         "token": handler.cmd_token,
         "audit": handler.cmd_audit,
+        "ha": handler.cmd_ha,
+        "ntp": handler.cmd_ntp,
+        "bond": handler.cmd_bond,
+        "license": handler.cmd_license,
         "help": handler.cmd_help,
     }
     h = dispatch.get(cmd_name)

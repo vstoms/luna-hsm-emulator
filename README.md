@@ -36,6 +36,10 @@ This emulator lets you **learn HSM operations** — partition management, key ge
 | **Partition Policies** | Full 30-policy catalog matching Luna 7 capabilities, with destructive changes, mutual exclusion, and PPT templates |
 | **LunaSH** | Server-side appliance shell with users, network, NTLS, clients, services, syslog, and RBAC |
 | **Client-Partition Connections** | NTLS and STC connection management with certificates, identities, lifecycle, and NTLS-to-STC conversion |
+| **High Availability** | HA groups with member management, retry/polling config, and synchronization |
+| **Network Deployment** | NTP server management, network interface bonding (bond0/bond1) |
+| **License Management** | License inventory, configurable limits, and enable/disable controls |
+| **Support Diagnostics** | Sanitized support-bundle generation excluding all credentials and key material |
 | **Partition Management** | Create, initialize, and delete named partitions with per-partition storage quotas |
 | **Encrypted Storage** | SQLite database with AES-256-GCM encrypted key material blobs at rest |
 | **Audit Logging** | Tamper-evident SHA-256 hash-chained audit log |
@@ -331,7 +335,7 @@ luna-hsm-emulator/
 ├── storage/
 │   └── db.py                    # SQLite persistence with AES-GCM encryption
 ├── tests/
-│   └── test_pkcs11.py           # 217 unit tests
+│   └── test_pkcs11.py           # 267 unit tests
 ├── requirements.txt
 └── README.md
 ```
@@ -375,9 +379,10 @@ The suite covers:
 | `TestPartitionPolicies` | 26 | Policy catalog, show/verbose, change by ID/name, destructive changes, mutual exclusion, templates, persistence, audit |
 | `TestLunaSH` | 50 | Appliance login, HSM SO login, user management, client management, network, services, sysconf, syslog, NTLS, packages, RBAC, persistence |
 | `TestClientPartitionConnections` | 48 | NTLS cert, connection lifecycle, STC identities, STC connections, STC config, NTLS-to-STC conversion, persistence |
+| `TestDeploymentFeatures` | 50 | HA groups, NTP, network bonding, licenses, support bundles, persistence |
 
 ```
-Ran 217 tests in 16.619s
+Ran 267 tests in 11.0s
 
 OK
 ```
@@ -386,7 +391,7 @@ OK
 
 ## Training Exercises
 
-The emulator includes **17 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
+The emulator includes **21 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
 
 | # | Exercise | Skills Learned |
 |---|----------|---------------|
@@ -407,6 +412,10 @@ The emulator includes **17 hands-on training exercises** covering real-world HSM
 | 15 | Partition Capabilities and Policies | Full policy catalog, destructive changes, PPT templates |
 | 16 | LunaSH Appliance Management | Server-side shell, users, network, clients, services, RBAC |
 | 17 | Client-Partition Connections | NTLS and STC channels, certificates, identities, conversion |
+| 18 | High Availability Groups | HA group creation, member management, retry/polling, synchronization |
+| 19 | NTP Configuration | NTP server management, enable/disable, synchronization |
+| 20 | Network Bonding | Interface bonding for redundancy, bond0/bond1 configuration |
+| 21 | Licenses and Support | License management, support-bundle generation |
 
 ---
 
@@ -444,6 +453,7 @@ The emulator includes **17 hands-on training exercises** covering real-world HSM
 - **`policies.py`** — Partition capabilities and policies catalog (30 policies, PPT templates)
 - **`backup.py`** — Luna Backup HSM 7 emulation (STM, backup/restore, firmware, factory reset)
 - **`connections.py`** — NTLS and STC client-partition connection management
+- **`deployment.py`** — HA groups, NTP, network bonding, licenses, and support-bundle generation
 
 ### `crypto/` — Cryptographic Operations
 
@@ -461,7 +471,7 @@ The emulator includes **17 hands-on training exercises** covering real-world HSM
 - **`lunacm.py`** — Interactive `cmd.Cmd`-based shell with tab-completion
 - **`lunash.py`** — Interactive LunaSH appliance shell with tab-completion and command shortnames
 - **`commands.py`** — All lunacm command handlers (slot, partition, role, key, crypto, audit, hsm, backup)
-- **`lunash_commands.py`** — All LunaSH command handlers (status, hsm, partition, user, client, network, ntls, stc, sysconf, service, syslog, my, package, token, audit)
+- **`lunash_commands.py`** — All LunaSH command handlers (status, hsm, partition, user, client, network, ntls, stc, ha, ntp, bond, license, sysconf, service, syslog, my, package, token, audit)
 
 ---
 

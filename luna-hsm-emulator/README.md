@@ -810,6 +810,158 @@ logout
 
 ---
 
+### Exercise 18: High Availability Groups
+
+**Objective**: Learn how to configure HA groups for automatic failover across multiple HSM partitions.
+
+```bash
+# Start LunaSH
+python hsm_emulator.py --lunash
+login
+
+# Create two partitions (requires HSM SO login)
+hsm login
+partition create -name part1 -label "HA Primary"
+partition create -name part2 -label "HA Secondary"
+
+# Create an HA group with the first partition
+ha create -name ha_group1 -slot 1 -label "Production HA"
+
+# Add the second partition as a member
+ha addmember -name ha_group1 -slot 2
+
+# List all HA groups
+ha list
+
+# Show details of the HA group
+ha show -name ha_group1
+
+# Configure retry count (use -1 for infinite polling)
+ha setretry -name ha_group1 -retry 100
+ha setretry -name ha_group1 -retry -1
+
+# Configure polling interval
+ha setinterval -name ha_group1 -interval 10
+
+# Synchronize all members (copies key material)
+ha synchronize -name ha_group1
+
+# Show HA group status
+ha status -name ha_group1
+
+# Remove a member
+ha removemember -name ha_group1 -slot 2
+
+# Delete the HA group
+ha delete -name ha_group1
+```
+
+**What you learned**: HA groups link partitions across multiple HSMs so that if one HSM becomes unavailable, clients automatically failover to another. All members must share the same cloning domain. You can configure retry count (including infinite polling with -1), polling interval, and synchronize key material across members. An HA group must retain at least one member at all times.
+
+---
+
+### Exercise 19: NTP Configuration
+
+**Objective**: Learn how to configure NTP for time synchronization on the appliance.
+
+```bash
+# Show current NTP configuration
+ntp show
+
+# Add an NTP server
+ntp add time.google.com
+
+# Add another server
+ntp add time.cloudflare.com
+
+# Show updated configuration
+ntp show
+
+# Force synchronization
+ntp sync
+
+# Delete an NTP server
+ntp delete time.google.com
+
+# Disable NTP
+ntp disable
+
+# Re-enable NTP
+ntp enable
+```
+
+**What you learned**: NTP ensures the appliance clock stays synchronized, which is critical for audit log integrity and certificate validity. You can add multiple NTP servers for redundancy, force synchronization, and enable/disable NTP as needed. At least one NTP server is required.
+
+---
+
+### Exercise 20: Network Interface Bonding
+
+**Objective**: Learn how to configure network interface bonding for redundancy.
+
+```bash
+# Show current bonds
+bond show
+
+# Configure bond0 with eth0 and eth1
+bond configure -name bond0 -members eth0,eth1 -ip 10.0.0.5 -netmask 255.255.255.0 -gateway 10.0.0.1
+
+# Show the configured bond
+bond show
+
+# Configure bond1 with eth2 and eth3
+bond configure -name bond1 -members eth2,eth3 -ip 10.0.1.5 -netmask 255.255.255.0
+
+# Disable a bond
+bond disable -name bond1
+
+# Re-enable a bond
+bond enable -name bond1
+
+# Delete a bond
+bond delete -name bond1
+```
+
+**What you learned**: Network bonding combines two physical interfaces into a single logical interface for redundancy. If one link fails, traffic continues through the other. The Luna 7 supports bond0 and bond1, each requiring two distinct interfaces from eth0 through eth3. An interface cannot belong to more than one bond simultaneously.
+
+---
+
+### Exercise 21: Licenses and Support Diagnostics
+
+**Objective**: Learn how to manage licenses and generate diagnostic support bundles.
+
+```bash
+# List all installed licenses
+license list
+
+# Show details of a specific license
+license show ha
+
+# Set a license limit
+license setlimit -name max_partitions -limit 20
+
+# Enable a license
+license enable -name ha
+
+# Disable a license
+license disable -name stc
+
+# Generate a sanitized support bundle
+hsm supportInfo
+
+# The bundle includes:
+# - Appliance status (hostname, uptime, partitions, clients, services)
+# - Network configuration (interfaces, bonds, DNS)
+# - NTP configuration
+# - Connection summary (NTLS/STC)
+# - HA group details
+# - License inventory
+# - Safety notice (credentials and key material are excluded)
+```
+
+**What you learned**: The Luna 7 uses software licenses to enable features like HA, STC, key backup, and maximum partition counts. You can view, enable, disable, and configure license limits. The support bundle (`hsm supportInfo`) generates a diagnostic report safe to share with support teams — it excludes all credentials, PINs, password hashes, private keys, encrypted key blobs, and secret values.
+
+---
+
 ## Architecture
 
 ```
@@ -828,6 +980,7 @@ luna-hsm-emulator/
 │   ├── policies.py           # Partition capabilities and policies catalog
 │   ├── appliance.py          # Luna Network HSM 7 appliance emulation
 │   ├── connections.py        # NTLS and STC client-partition connections
+│   ├── deployment.py         # HA groups, NTP, bonding, licenses, support bundles
 │   ├── session.py           # Session management
 │   ├── auth.py              # Role-based authentication
 │   ├── keystore.py          # Key storage and retrieval
@@ -848,7 +1001,7 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # 217 unit tests for PKCS#11 operations
+│   └── test_pkcs11.py       # 267 unit tests for PKCS#11 operations
 ├── requirements.txt
 └── README.md
 ```

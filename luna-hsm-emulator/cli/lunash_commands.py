@@ -318,6 +318,9 @@ class LunaSHCommands:
             else:
                 print(f"  Unknown information subcommand: {rest[0]}")
 
+        elif sub == "supportInfo":
+            self.cmd_support([])
+
         else:
             print(f"  Unknown hsm subcommand: {sub}")
 
@@ -2168,6 +2171,471 @@ class LunaSHCommands:
     # help
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # HA groups
+    # ------------------------------------------------------------------
+
+    def cmd_ha(self, args: list):
+        """Handle 'ha' commands — High Availability group management."""
+        if not args:
+            print("  Usage: ha list | create | delete | show | addmember | removemember |")
+            print("         setretry | setinterval | synchronize | status")
+            return
+        if not self._check_login():
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "list":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            groups = self.appliance.deployment.list_ha_groups()
+            if not groups:
+                print("  No HA groups configured.")
+                return
+            print(f"  {'Name':<20} {'State':<10} {'Members':<8} {'Retry':<8} {'Interval':<10} {'Polling'}")
+            print("  " + "-" * 75)
+            for g in groups:
+                polling = "Infinite" if g.get("infinite_polling") else "Finite"
+                print(f"  {g['name']:<20} {g['state']:<10} {len(g['members']):<8} {g['retry_count']:<8} {g['poll_interval']:<10} {polling}")
+
+        elif sub == "create":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            slot = self._get_arg(rest, "-slot")
+            label = self._get_arg(rest, "-label") or ""
+            if not name or not slot:
+                print("  Usage: ha create -name <group_name> -slot <slot_id> [-label <label>]")
+                return
+            result = self.appliance.deployment.create_ha_group(name, int(slot), label)
+            if result["success"]:
+                print(f"  HA group '{name}' created with initial member on slot {slot}.")
+                self._print_explain([
+                    "An HA group links partitions across multiple HSMs so that if one",
+                    "HSM becomes unavailable, clients automatically failover to another.",
+                    "All members must share the same cloning domain and key material.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "delete":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: ha delete -name <group_name>")
+                return
+            result = self.appliance.deployment.delete_ha_group(name)
+            if result["success"]:
+                print(f"  HA group '{name}' deleted.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: ha show -name <group_name>")
+                return
+            group = self.appliance.deployment.get_ha_group(name)
+            if group is None:
+                print(f"  HA group '{name}' not found.")
+                return
+            print(f"  Group Name:        {group['name']}")
+            print(f"  Label:             {group.get('label', '')}")
+            print(f"  State:             {group['state']}")
+            print(f"  Retry Count:       {group['retry_count']}{' (infinite)' if group['infinite_polling'] else ''}")
+            print(f"  Poll Interval:     {group['poll_interval']}s")
+            print(f"  Members:")
+            for m in group["members"]:
+                sync = m.get("last_sync") or "Never"
+                print(f"    Slot {m['slot_id']}: {m['partition']:<20} Serial: {m['serial']:<12} Status: {m['status']:<8} Objects: {m['objects']:<6} Last Sync: {sync}")
+
+        elif sub == "addmember":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            slot = self._get_arg(rest, "-slot")
+            serial = self._get_arg(rest, "-serial") or ""
+            if not name or not slot:
+                print("  Usage: ha addmember -name <group_name> -slot <slot_id> [-serial <serial>]")
+                return
+            result = self.appliance.deployment.add_ha_member(name, int(slot), serial)
+            if result["success"]:
+                print(f"  Member added to HA group '{name}': slot {slot}.")
+                if self.appliance.deployment.get_ha_group(name).get("synchronize_on_add"):
+                    self.appliance.deployment.synchronize_ha_group(name)
+                    print(f"  Group synchronized. All members now have {result['member']['objects']} object(s).")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "removemember":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            slot = self._get_arg(rest, "-slot")
+            if not name or not slot:
+                print("  Usage: ha removemember -name <group_name> -slot <slot_id>")
+                return
+            result = self.appliance.deployment.remove_ha_member(name, int(slot))
+            if result["success"]:
+                print(f"  Member removed from HA group '{name}': slot {slot}.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "setretry":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            retry = self._get_arg(rest, "-retry")
+            if not name or retry is None:
+                print("  Usage: ha setretry -name <group_name> -retry <count|-1 for infinite>")
+                return
+            result = self.appliance.deployment.set_ha_retry(name, int(retry))
+            if result["success"]:
+                polling = "infinite" if result["infinite_polling"] else "finite"
+                print(f"  Retry count set to {result['retry_count']} ({polling} polling).")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "setinterval":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            interval = self._get_arg(rest, "-interval")
+            if not name or interval is None:
+                print("  Usage: ha setinterval -name <group_name> -interval <seconds>")
+                return
+            result = self.appliance.deployment.set_ha_interval(name, int(interval))
+            if result["success"]:
+                print(f"  Polling interval set to {result['poll_interval']} seconds.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "synchronize":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: ha synchronize -name <group_name>")
+                return
+            result = self.appliance.deployment.synchronize_ha_group(name)
+            if result["success"]:
+                print(f"  HA group '{name}' synchronized.")
+                print(f"  Members: {result['members']}, Objects per member: {result['objects']}")
+                print(f"  Timestamp: {result['timestamp']}")
+                self._print_explain([
+                    "Synchronization copies key material from the source partition",
+                    "to all member partitions so they can serve identical requests.",
+                    "On a real Luna 7, this uses the cloning protocol over the",
+                    "partition's configured cloning domain.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "status":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: ha status -name <group_name>")
+                return
+            result = self.appliance.deployment.get_ha_status(name)
+            if result["success"]:
+                print(f"  HA Group:          {result['name']}")
+                print(f"  State:             {result['state']}")
+                print(f"  Members:           {result['members']} ({result['active_members']} active)")
+                print(f"  Retry Count:       {result['retry_count']}")
+                print(f"  Poll Interval:     {result['poll_interval']}s")
+                print(f"  Infinite Polling:  {'Yes' if result['infinite_polling'] else 'No'}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        else:
+            print(f"  Unknown ha subcommand: {sub}")
+
+    # ------------------------------------------------------------------
+    # NTP
+    # ------------------------------------------------------------------
+
+    def cmd_ntp(self, args: list):
+        """Handle 'ntp' commands — NTP server management."""
+        if not args:
+            print("  Usage: ntp show | add | delete | enable | disable | sync")
+            return
+        if not self._check_login():
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            config = self.appliance.deployment.get_ntp_config()
+            print(f"  NTP Enabled:       {'Yes' if config['enabled'] else 'No'}")
+            print(f"  Synchronized:      {'Yes' if config.get('synchronized') else 'No'}")
+            print(f"  Last Sync:         {config.get('last_sync', 'Never')}")
+            print(f"  Servers:")
+            for s in config.get("servers", []):
+                print(f"    {s}")
+
+        elif sub == "add":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            server = rest[0] if rest else None
+            if not server:
+                print("  Usage: ntp add <server>")
+                return
+            result = self.appliance.deployment.add_ntp_server(server)
+            if result["success"]:
+                print(f"  NTP server added: {server}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "delete":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            server = rest[0] if rest else None
+            if not server:
+                print("  Usage: ntp delete <server>")
+                return
+            result = self.appliance.deployment.delete_ntp_server(server)
+            if result["success"]:
+                print(f"  NTP server deleted: {server}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "enable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            self.appliance.deployment.enable_ntp()
+            print("  NTP enabled.")
+
+        elif sub == "disable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            self.appliance.deployment.disable_ntp()
+            print("  NTP disabled.")
+
+        elif sub == "sync":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            result = self.appliance.deployment.sync_ntp()
+            if result["success"]:
+                print(f"  NTP synchronized. Last sync: {result['last_sync']}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        else:
+            print(f"  Unknown ntp subcommand: {sub}")
+
+    # ------------------------------------------------------------------
+    # Network bonding
+    # ------------------------------------------------------------------
+
+    def cmd_bond(self, args: list):
+        """Handle 'bond' commands — network interface bonding."""
+        if not args:
+            print("  Usage: bond show | configure | enable | disable | delete")
+            return
+        if not self._check_login():
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            bonds = self.appliance.deployment.get_network_bonds()
+            if not bonds:
+                print("  No network bonds configured.")
+                return
+            for name, data in bonds.items():
+                print(f"  Bond {name}:")
+                print(f"    Members:   {', '.join(data['members'])}")
+                print(f"    IP:        {data['ip']}")
+                print(f"    Netmask:   {data['netmask']}")
+                print(f"    Gateway:   {data.get('gateway', 'N/A')}")
+                print(f"    Mode:      {data['mode']}")
+                print(f"    Status:    {data['status']}")
+                print()
+
+        elif sub == "configure":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            members_str = self._get_arg(rest, "-members")
+            ip = self._get_arg(rest, "-ip")
+            netmask = self._get_arg(rest, "-netmask")
+            gateway = self._get_arg(rest, "-gateway") or ""
+            if not name or not members_str or not ip or not netmask:
+                print("  Usage: bond configure -name <bond0|bond1> -members <eth0,eth1> -ip <ip> -netmask <mask> [-gateway <gw>]")
+                return
+            members = members_str.split(",")
+            result = self.appliance.deployment.configure_bond(name, members, ip, netmask, gateway)
+            if result["success"]:
+                print(f"  Bond '{name}' configured with members: {', '.join(members)}")
+                self._print_explain([
+                    "Network bonding combines two physical interfaces into a single",
+                    "logical interface for redundancy. If one link fails, traffic",
+                    "continues through the other. The Luna 7 supports bond0 and bond1.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "enable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: bond enable -name <bond_name>")
+                return
+            result = self.appliance.deployment.enable_bond(name)
+            if result["success"]:
+                print(f"  Bond '{name}' enabled.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "disable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: bond disable -name <bond_name>")
+                return
+            result = self.appliance.deployment.disable_bond(name)
+            if result["success"]:
+                print(f"  Bond '{name}' disabled.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "delete":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: bond delete -name <bond_name>")
+                return
+            result = self.appliance.deployment.delete_bond(name)
+            if result["success"]:
+                print(f"  Bond '{name}' deleted.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        else:
+            print(f"  Unknown bond subcommand: {sub}")
+
+    # ------------------------------------------------------------------
+    # Licenses
+    # ------------------------------------------------------------------
+
+    def cmd_license(self, args: list):
+        """Handle 'license' commands — license management."""
+        if not args:
+            print("  Usage: license list | show | setlimit | enable | disable")
+            return
+        if not self._check_login():
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "list":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            licenses = self.appliance.deployment.list_licenses()
+            print(f"  {'Name':<25} {'ID':<20} {'Description':<40} {'Enabled':<8} {'Limit'}")
+            print("  " + "-" * 100)
+            for lic in licenses:
+                limit = str(lic.get("limit", "-"))
+                print(f"  {lic['name']:<25} {lic.get('id', '-'):<20} {lic.get('description', '-'):<40} {'Yes' if lic.get('enabled') else 'No':<8} {limit}")
+
+        elif sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            name = rest[0] if rest else None
+            if not name:
+                print("  Usage: license show <name>")
+                return
+            licenses = self.appliance.deployment.list_licenses()
+            lic = next((l for l in licenses if l["name"] == name), None)
+            if lic is None:
+                print(f"  License '{name}' not found.")
+                return
+            print(f"  Name:        {lic['name']}")
+            print(f"  ID:          {lic.get('id', '-')}")
+            print(f"  Description: {lic.get('description', '-')}")
+            print(f"  Enabled:     {'Yes' if lic.get('enabled') else 'No'}")
+            if "limit" in lic:
+                print(f"  Limit:       {lic['limit']}")
+
+        elif sub == "setlimit":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            limit = self._get_arg(rest, "-limit")
+            if not name or limit is None:
+                print("  Usage: license setlimit -name <license_name> -limit <value>")
+                return
+            result = self.appliance.deployment.set_license_limit(name, int(limit))
+            if result["success"]:
+                print(f"  License '{name}' limit set to {limit}.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "enable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: license enable -name <license_name>")
+                return
+            result = self.appliance.deployment.set_license_enabled(name, True)
+            if result["success"]:
+                print(f"  License '{name}' enabled.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "disable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            name = self._get_arg(rest, "-name")
+            if not name:
+                print("  Usage: license disable -name <license_name>")
+                return
+            result = self.appliance.deployment.set_license_enabled(name, False)
+            if result["success"]:
+                print(f"  License '{name}' disabled.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        else:
+            print(f"  Unknown license subcommand: {sub}")
+
+    # ------------------------------------------------------------------
+    # Support information
+    # ------------------------------------------------------------------
+
+    def cmd_support(self, args: list):
+        """Handle 'hsm supportInfo' — generate a sanitized diagnostic bundle."""
+        if not self._check_login():
+            return
+        if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+            return
+        bundle = self.appliance.deployment.build_support_bundle(self.appliance, self.api)
+        print(bundle)
+        print()
+        self._print_explain([
+            "The support bundle contains diagnostic information for troubleshooting",
+            "and is safe to share with support teams. It excludes all credentials,",
+            "PINs, password hashes, private keys, encrypted key blobs, and secret values.",
+        ])
+
+    # ------------------------------------------------------------------
+    # Help
+    # ------------------------------------------------------------------
+
     def cmd_help(self, args: list):
         """Show LunaSH command reference."""
         print("""
@@ -2303,6 +2771,43 @@ class LunaSHCommands:
     audit log verify                       Verify audit chain
     audit log clear                        Clear audit logs
     audit log tail                         Show recent audit entries
+
+  High Availability:
+    ha list                                List all HA groups
+    ha create -name <n> -slot <id> [-label <l>]  Create an HA group
+    ha delete -name <n>                   Delete an HA group
+    ha show -name <n>                     Show HA group details and members
+    ha addmember -name <n> -slot <id>     Add a partition member to an HA group
+    ha removemember -name <n> -slot <id>  Remove a member from an HA group
+    ha setretry -name <n> -retry <count|-1>  Set retry count (-1 for infinite polling)
+    ha setinterval -name <n> -interval <s>  Set polling interval in seconds
+    ha synchronize -name <n>             Synchronize all members in an HA group
+    ha status -name <n>                   Show HA group status
+
+  NTP:
+    ntp show                               Show NTP configuration
+    ntp add <server>                       Add an NTP server
+    ntp delete <server>                    Delete an NTP server
+    ntp enable                             Enable NTP
+    ntp disable                            Disable NTP
+    ntp sync                               Force NTP synchronization
+
+  Network Bonding:
+    bond show                              Show all configured bonds
+    bond configure -name <bond0|bond1> -members <eth0,eth1> -ip <ip> -netmask <mask> [-gateway <gw>]
+    bond enable -name <bond_name>          Enable a bond
+    bond disable -name <bond_name>         Disable a bond
+    bond delete -name <bond_name>          Delete a bond
+
+  Licenses:
+    license list                           List all installed licenses
+    license show <name>                    Show details of a specific license
+    license setlimit -name <n> -limit <v>  Set a license limit
+    license enable -name <n>               Enable a license
+    license disable -name <n>              Disable a license
+
+  Support:
+    hsm supportInfo                        Generate a sanitized diagnostic support bundle
 """)
 
     # ------------------------------------------------------------------

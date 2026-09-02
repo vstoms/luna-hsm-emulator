@@ -23,6 +23,7 @@ import json
 from typing import Optional
 
 from hsm.connections import ConnectionManager, CERT_SELF_SIGNED
+from hsm.deployment import DeploymentManager
 
 
 # Appliance user roles
@@ -177,6 +178,7 @@ class Appliance:
         self._audit_logged_in = False  # Auditor login state
         self._boot_time = time.time()
         self.connections = ConnectionManager(storage)
+        self.deployment = DeploymentManager(storage)
         self._ensure_state()
 
     def _ensure_state(self):
