@@ -51,7 +51,8 @@ SUBCOMMANDS = {
     "user": ["list", "add", "delete", "enable", "disable", "password"],
     "client": ["list", "register", "delete", "show", "assignPartition", "revokePartition"],
     "network": ["show", "hostname", "interface", "dns", "route", "ping"],
-    "ntls": ["show", "bind", "certificate"],
+    "ntls": ["show", "certificate", "connection", "ipcheck", "threads", "timer", "tcp_keepalive"],
+    "stc": ["enable", "disable", "show", "status", "identity", "connection", "cipher", "hmac", "rekeyThreshold", "activationTimeOut", "convert", "admin"],
     "sysconf": ["timezone", "banner", "forceSOLogin", "ssh", "appliance"],
     "service": ["list", "start", "stop", "restart", "status"],
     "syslog": ["show", "severity", "rotate", "remotehost"],
@@ -125,6 +126,7 @@ class LunaSHShell(cmd.Cmd):
             "client": self.handler.cmd_client,
             "network": self.handler.cmd_network,
             "ntls": self.handler.cmd_ntls,
+            "stc": self.handler.cmd_stc,
             "sysconf": self.handler.cmd_sysconf,
             "service": self.handler.cmd_service,
             "syslog": self.handler.cmd_syslog,
@@ -197,6 +199,9 @@ class LunaSHShell(cmd.Cmd):
 
     def do_ntls(self, arg):
         self._run(f"ntls {arg}" if arg else "ntls")
+
+    def do_stc(self, arg):
+        self._run(f"stc {arg}" if arg else "stc")
 
     def do_sysconf(self, arg):
         self._run(f"sysconf {arg}" if arg else "sysconf")
@@ -288,6 +293,7 @@ def run_lunash_command(appliance: Appliance, api: PKCS11API, command_line: str):
         "client": handler.cmd_client,
         "network": handler.cmd_network,
         "ntls": handler.cmd_ntls,
+        "stc": handler.cmd_stc,
         "sysconf": handler.cmd_sysconf,
         "service": handler.cmd_service,
         "syslog": handler.cmd_syslog,

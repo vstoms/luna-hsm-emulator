@@ -19,7 +19,10 @@ import time
 import os
 import hashlib
 import secrets
+import json
 from typing import Optional
+
+from hsm.connections import ConnectionManager, CERT_SELF_SIGNED
 
 
 # Appliance user roles
@@ -173,6 +176,7 @@ class Appliance:
         self._hsm_logged_in = False  # HSM SO login state
         self._audit_logged_in = False  # Auditor login state
         self._boot_time = time.time()
+        self.connections = ConnectionManager(storage)
         self._ensure_state()
 
     def _ensure_state(self):
@@ -500,12 +504,17 @@ class Appliance:
     # ------------------------------------------------------------------
 
     def get_ntls_info(self) -> dict:
+        cert = self.connections.get_ntls_server_cert()
+        summary = self.connections.get_connection_summary()
         return {
             "status": "running",
             "bound_interfaces": "eth0",
-            "connections": len(self._get_clients()),
-            "certificate": "NTLS Server Certificate",
-            "cert_expiry": "2027-01-01",
+            "connections": summary["ntls_total"],
+            "connected": summary["ntls_connected"],
+            "certificate": cert.get("subject", "NTLS Server Certificate"),
+            "cert_fingerprint": cert.get("fingerprint", ""),
+            "cert_expiry": cert.get("expiry", ""),
+            "cert_type": cert.get("type", CERT_SELF_SIGNED),
             "ip_check": True,
             "threads": 8,
         }

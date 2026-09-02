@@ -708,6 +708,108 @@ logout
 
 ---
 
+### Exercise 17: Client-Partition Connections (NTLS and STC)
+
+**Objective**: Learn how to establish and manage client-partition connections using both NTLS and STC channels.
+
+```bash
+# Start LunaSH
+python hsm_emulator.py --lunash
+
+# Login
+login
+
+# Register a client and assign a partition
+client register -name client1 -ip 192.168.1.50
+client assignPartition -name client1 -partition 1
+
+# --- NTLS Connection ---
+
+# Show NTLS server certificate
+ntls certificate show
+
+# Create an NTLS connection (self-signed cert)
+ntls connection create -client client1 -slot 1 -cert self-signed
+
+# List NTLS connections
+ntls connection list
+
+# Establish the NTLS trust link
+ntls connection connect -client client1 -slot 1
+
+# Show connection details
+ntls connection show -client client1 -slot 1
+
+# Show NTLS status
+ntls show
+
+# Disconnect
+ntls connection disconnect -client client1 -slot 1
+
+# --- STC Connection ---
+
+# Enable STC on the appliance
+stc enable
+
+# Show STC configuration
+stc show
+
+# Create STC identities (client and partition)
+stc identity create -type client -name stc_client1
+stc identity create -type partition -name stc_part1
+
+# List STC identities
+stc identity list
+
+# Export the partition identity (.pid file)
+stc identity export -type partition -name stc_part1
+
+# Create an STC connection
+stc connection create -client stc_client1 -partition stc_part1 -slot 1
+
+# List STC connections
+stc connection list
+
+# Establish the STC secure tunnel
+stc connection connect -id 1
+
+# Configure STC settings
+stc cipher enable AES-128-GCM
+stc hmac enable
+stc rekeyThreshold set 500000
+stc activationTimeOut set 600
+
+# --- NTLS to STC Conversion ---
+
+# Disconnect the NTLS connection first
+ntls connection disconnect -client client1 -slot 1
+
+# Convert NTLS to STC (irreversible)
+stc convert -client client1 -slot 1
+
+# Verify: NTLS connection is gone, STC connection added
+ntls connection list
+stc connection list
+
+# --- Connection Summary ---
+
+# Show overall connection status
+ntls show
+stc show
+stc admin show
+
+# Restore a broken connection
+ntls connection restore -client client1 -slot 1
+stc connection restore -id 1
+
+# Logout
+logout
+```
+
+**What you learned**: The Luna 7 supports two types of client-partition connections. NTLS (Network Trust Link Service) is high-performance, certificate-based, and suited for traditional data centers. STC (Secure Trusted Channel) provides higher assurance with symmetric encryption, message authentication codes, and mutual identity-based authentication — preferred for cloud and virtual environments. NTLS connections can be converted to STC (one-way, irreversible). Both channels have a full lifecycle: create, connect, disconnect, restore. STC identities (client and partition) must be created and exported before establishing connections.
+
+---
+
 ## Architecture
 
 ```
@@ -725,6 +827,7 @@ luna-hsm-emulator/
 │   ├── backup.py            # Luna Backup HSM 7 emulation
 │   ├── policies.py           # Partition capabilities and policies catalog
 │   ├── appliance.py          # Luna Network HSM 7 appliance emulation
+│   ├── connections.py        # NTLS and STC client-partition connections
 │   ├── session.py           # Session management
 │   ├── auth.py              # Role-based authentication
 │   ├── keystore.py          # Key storage and retrieval
@@ -745,7 +848,7 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # 169 unit tests for PKCS#11 operations
+│   └── test_pkcs11.py       # 217 unit tests for PKCS#11 operations
 ├── requirements.txt
 └── README.md
 ```

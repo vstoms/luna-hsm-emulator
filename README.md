@@ -35,6 +35,7 @@ This emulator lets you **learn HSM operations** — partition management, key ge
 | **Backup HSM** | Luna Backup HSM 7 emulation with STM recovery, cloning, backup/restore, and firmware management |
 | **Partition Policies** | Full 30-policy catalog matching Luna 7 capabilities, with destructive changes, mutual exclusion, and PPT templates |
 | **LunaSH** | Server-side appliance shell with users, network, NTLS, clients, services, syslog, and RBAC |
+| **Client-Partition Connections** | NTLS and STC connection management with certificates, identities, lifecycle, and NTLS-to-STC conversion |
 | **Partition Management** | Create, initialize, and delete named partitions with per-partition storage quotas |
 | **Encrypted Storage** | SQLite database with AES-256-GCM encrypted key material blobs at rest |
 | **Audit Logging** | Tamper-evident SHA-256 hash-chained audit log |
@@ -77,10 +78,10 @@ python hsm_emulator.py
 
 ```
   ╔══════════════════════════════════════════════════════════════════╗
-  ║         Thales Luna 7 Network HSM Emulator — lunacm              ║
+  ║         Thales Luna 7 Network HSM Emulator — lunacm             ║
   ║         Firmware 7.13.0  |  PKCS#11 v2.40  |  Training Use       ║
   ║                                                                  ║
-  ║  WARNING: This is a software emulator for educational purposes   ║
+  ║  WARNING: This is a software emulator for educational purposes    ║
   ║           only. It must NOT be used in production environments.  ║
   ╚══════════════════════════════════════════════════════════════════╝
 
@@ -274,21 +275,21 @@ The emulator implements the Luna 7's four-role authentication hierarchy:
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                    HSM                          │
-│  ┌─────────────────────────────────────────────┐│
-│  │  HSO (HSM Security Officer)                 ││
-│  │  Full administrative access                 ││
-│  └──────────────┬──────────────────────────────┘│
-│                 │                               │
-│  ┌──────────────▼──────────────────────────────┐│
-│  │  Partition 1    Partition 2    Partition N  ││
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐   ││
-│  │  │  SO      │  │  SO      │  │  SO      │   ││
-│  │  │  CO      │  │  CO      │  │  CO      │   ││
-│  │  │  CU      │  │  CU      │  │  CU      │   ││
-│  │  │  Keys    │  │  Keys    │  │  Keys    │   ││
-│  │  └──────────┘  └──────────┘  └──────────┘   ││
-│  └─────────────────────────────────────────────┘│
+│                    HSM                           │
+│  ┌─────────────────────────────────────────────┐ │
+│  │  HSO (HSM Security Officer)                 │ │
+│  │  Full administrative access                  │ │
+│  └──────────────┬──────────────────────────────┘ │
+│                 │                                 │
+│  ┌──────────────▼──────────────────────────────┐ │
+│  │  Partition 1    Partition 2    Partition N  │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │ │
+│  │  │  SO      │  │  SO      │  │  SO      │  │ │
+│  │  │  CO      │  │  CO      │  │  CO      │  │ │
+│  │  │  CU      │  │  CU      │  │  CU      │  │ │
+│  │  │  Keys    │  │  Keys    │  │  Keys    │  │ │
+│  │  └──────────┘  └──────────┘  └──────────┘  │ │
+│  └─────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -330,7 +331,7 @@ luna-hsm-emulator/
 ├── storage/
 │   └── db.py                    # SQLite persistence with AES-GCM encryption
 ├── tests/
-│   └── test_pkcs11.py           # 169 unit tests
+│   └── test_pkcs11.py           # 217 unit tests
 ├── requirements.txt
 └── README.md
 ```
@@ -373,9 +374,10 @@ The suite covers:
 | `TestBackupHSM` | 31 | STM recovery, init, login, backup, restore, firmware, factory reset, persistence, audit |
 | `TestPartitionPolicies` | 26 | Policy catalog, show/verbose, change by ID/name, destructive changes, mutual exclusion, templates, persistence, audit |
 | `TestLunaSH` | 50 | Appliance login, HSM SO login, user management, client management, network, services, sysconf, syslog, NTLS, packages, RBAC, persistence |
+| `TestClientPartitionConnections` | 48 | NTLS cert, connection lifecycle, STC identities, STC connections, STC config, NTLS-to-STC conversion, persistence |
 
 ```
-Ran 169 tests in 7.131s
+Ran 217 tests in 16.619s
 
 OK
 ```
@@ -384,7 +386,7 @@ OK
 
 ## Training Exercises
 
-The emulator includes **16 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
+The emulator includes **17 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
 
 | # | Exercise | Skills Learned |
 |---|----------|---------------|
@@ -404,6 +406,7 @@ The emulator includes **16 hands-on training exercises** covering real-world HSM
 | 14 | Backup HSM Operations | Luna Backup HSM 7, cloning, backup/restore, STM recovery |
 | 15 | Partition Capabilities and Policies | Full policy catalog, destructive changes, PPT templates |
 | 16 | LunaSH Appliance Management | Server-side shell, users, network, clients, services, RBAC |
+| 17 | Client-Partition Connections | NTLS and STC channels, certificates, identities, conversion |
 
 ---
 
@@ -437,6 +440,10 @@ The emulator includes **16 hands-on training exercises** covering real-world HSM
 - **`auth.py`** — Four-role authentication with PIN lockout and PED simulation
 - **`keystore.py`** — Handle allocation, encrypted key material storage, quota enforcement
 - **`audit.py`** — Hash-chained audit logger with chain verification
+- **`appliance.py`** — Luna Network HSM 7 appliance emulation (users, network, NTLS, clients, services)
+- **`policies.py`** — Partition capabilities and policies catalog (30 policies, PPT templates)
+- **`backup.py`** — Luna Backup HSM 7 emulation (STM, backup/restore, firmware, factory reset)
+- **`connections.py`** — NTLS and STC client-partition connection management
 
 ### `crypto/` — Cryptographic Operations
 
@@ -454,7 +461,7 @@ The emulator includes **16 hands-on training exercises** covering real-world HSM
 - **`lunacm.py`** — Interactive `cmd.Cmd`-based shell with tab-completion
 - **`lunash.py`** — Interactive LunaSH appliance shell with tab-completion and command shortnames
 - **`commands.py`** — All lunacm command handlers (slot, partition, role, key, crypto, audit, hsm, backup)
-- **`lunash_commands.py`** — All LunaSH command handlers (status, hsm, partition, user, client, network, ntls, sysconf, service, syslog, my, package, token, audit)
+- **`lunash_commands.py`** — All LunaSH command handlers (status, hsm, partition, user, client, network, ntls, stc, sysconf, service, syslog, my, package, token, audit)
 
 ---
 

@@ -39,6 +39,12 @@ from pkcs11.objects import (
 )
 from hsm.backup import BackupHSM, BACKUP_HSM_MODEL, BACKUP_HSM_DEFAULT_FW
 from hsm.appliance import Appliance, ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR, ROLE_AUDIT
+from hsm.connections import (
+    ConnectionManager, CONN_NTLS, CONN_STC,
+    CERT_SELF_SIGNED, CERT_CA_SIGNED,
+    STATE_ASSIGNED, STATE_CONNECTED, STATE_DISCONNECTED, STATE_REGISTERED,
+    STC_CIPHERS, STC_HMACS, STC_DEFAULT_CIPHER, STC_DEFAULT_HMAC,
+)
 
 
 class TestStorage(unittest.TestCase):
@@ -1917,6 +1923,428 @@ class TestLunaSH(unittest.TestCase):
         # But cannot add users (admin only)
         result = self.appliance.add_user("unauthorized", "admin", "pass")
         self.assertFalse(result["success"])
+
+
+class TestClientPartitionConnections(unittest.TestCase):
+    """Test NTLS and STC client-partition connections."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.api.tokens.init_token(self.slot_id, "sopin123", "Test")
+        self.appliance = Appliance(self.storage)
+        self.appliance.login("admin", "admin123")
+        self.appliance.register_client("client1", "192.168.1.50")
+        self.appliance.assign_partition("client1", self.slot_id)
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # --- NTLS Server Certificate ---
+
+    def test_ntls_server_cert_exists(self):
+        """Test that the NTLS server certificate is auto-generated."""
+        cert = self.appliance.connections.get_ntls_server_cert()
+        self.assertIn("subject", cert)
+        self.assertIn("fingerprint", cert)
+        self.assertIn("serial", cert)
+
+    def test_ntls_cert_regenerate(self):
+        """Test regenerating the NTLS server certificate."""
+        old_cert = self.appliance.connections.get_ntls_server_cert()
+        new_cert = self.appliance.connections.regenerate_ntls_cert()
+        self.assertNotEqual(old_cert["fingerprint"], new_cert["fingerprint"])
+
+    # --- NTLS Connections ---
+
+    def test_create_ntls_connection(self):
+        """Test creating an NTLS connection."""
+        result = self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["cert_type"], CERT_SELF_SIGNED)
+
+    def test_create_ntls_connection_ca_signed(self):
+        """Test creating an NTLS connection with CA-signed cert."""
+        result = self.appliance.connections.create_ntls_connection(
+            "client1", self.slot_id, cert_type=CERT_CA_SIGNED
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["cert_type"], CERT_CA_SIGNED)
+
+    def test_create_ntls_duplicate_fails(self):
+        """Test that duplicate NTLS connection fails."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        result = self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.assertFalse(result["success"])
+
+    def test_list_ntls_connections(self):
+        """Test listing NTLS connections."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        conns = self.appliance.connections.list_ntls_connections()
+        self.assertEqual(len(conns), 1)
+        self.assertEqual(conns[0]["client_name"], "client1")
+
+    def test_get_ntls_connection(self):
+        """Test getting a specific NTLS connection."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        conn = self.appliance.connections.get_ntls_connection("client1", self.slot_id)
+        self.assertIsNotNone(conn)
+        self.assertEqual(conn["state"], STATE_ASSIGNED)
+
+    def test_connect_ntls(self):
+        """Test establishing an NTLS connection."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        result = self.appliance.connections.connect_ntls("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        conn = self.appliance.connections.get_ntls_connection("client1", self.slot_id)
+        self.assertEqual(conn["state"], STATE_CONNECTED)
+
+    def test_connect_ntls_already_connected(self):
+        """Test that connecting an already-connected NTLS fails."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.appliance.connections.connect_ntls("client1", self.slot_id)
+        result = self.appliance.connections.connect_ntls("client1", self.slot_id)
+        self.assertFalse(result["success"])
+
+    def test_disconnect_ntls(self):
+        """Test disconnecting an NTLS connection."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.appliance.connections.connect_ntls("client1", self.slot_id)
+        result = self.appliance.connections.disconnect_ntls("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        conn = self.appliance.connections.get_ntls_connection("client1", self.slot_id)
+        self.assertEqual(conn["state"], STATE_DISCONNECTED)
+
+    def test_delete_ntls_connection(self):
+        """Test deleting an NTLS connection."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        result = self.appliance.connections.delete_ntls_connection("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.appliance.connections.get_ntls_connection("client1", self.slot_id))
+
+    def test_restore_ntls_connection(self):
+        """Test restoring a broken NTLS connection."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.appliance.connections.connect_ntls("client1", self.slot_id)
+        self.appliance.connections.disconnect_ntls("client1", self.slot_id)
+        result = self.appliance.connections.restore_ntls_connection("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        conn = self.appliance.connections.get_ntls_connection("client1", self.slot_id)
+        self.assertEqual(conn["state"], STATE_ASSIGNED)
+
+    def test_connect_ntls_not_found(self):
+        """Test connecting a non-existent NTLS connection fails."""
+        result = self.appliance.connections.connect_ntls("nonexistent", self.slot_id)
+        self.assertFalse(result["success"])
+
+    # --- STC Identities ---
+
+    def test_create_stc_client_identity(self):
+        """Test creating an STC client identity."""
+        result = self.appliance.connections.create_stc_identity("stc_client1", "client")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["identity_type"], "client")
+
+    def test_create_stc_partition_identity(self):
+        """Test creating an STC partition identity."""
+        result = self.appliance.connections.create_stc_identity("stc_part1", "partition")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["identity_type"], "partition")
+
+    def test_create_stc_identity_duplicate(self):
+        """Test that duplicate STC identity fails."""
+        self.appliance.connections.create_stc_identity("stc_client1", "client")
+        result = self.appliance.connections.create_stc_identity("stc_client1", "client")
+        self.assertFalse(result["success"])
+
+    def test_create_stc_identity_invalid_type(self):
+        """Test that invalid identity type fails."""
+        result = self.appliance.connections.create_stc_identity("bad", "invalid")
+        self.assertFalse(result["success"])
+
+    def test_list_stc_identities(self):
+        """Test listing STC identities."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        identities = self.appliance.connections.list_stc_identities()
+        self.assertEqual(len(identities), 2)
+
+    def test_delete_stc_identity(self):
+        """Test deleting an STC identity."""
+        self.appliance.connections.create_stc_identity("temp_id", "client")
+        result = self.appliance.connections.delete_stc_identity("temp_id", "client")
+        self.assertTrue(result["success"])
+
+    def test_delete_stc_identity_with_active_connection(self):
+        """Test that deleting an identity with active connection fails."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        self.appliance.connections.connect_stc(1)
+        result = self.appliance.connections.delete_stc_identity("c1", "client")
+        self.assertFalse(result["success"])
+
+    def test_export_stc_identity(self):
+        """Test exporting an STC identity."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        result = self.appliance.connections.export_stc_identity("c1", "client")
+        self.assertTrue(result["success"])
+        self.assertIn("public_key", result)
+        self.assertIn(".clientID", result["file"])
+
+    def test_export_stc_partition_identity(self):
+        """Test exporting a partition identity produces .pid file."""
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        result = self.appliance.connections.export_stc_identity("p1", "partition")
+        self.assertTrue(result["success"])
+        self.assertIn(".pid", result["file"])
+
+    # --- STC Connections ---
+
+    def test_create_stc_connection(self):
+        """Test creating an STC connection."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        result = self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["cipher"], STC_DEFAULT_CIPHER)
+
+    def test_create_stc_connection_custom_cipher(self):
+        """Test creating an STC connection with custom cipher."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        result = self.appliance.connections.create_stc_connection(
+            "c1", "p1", self.slot_id, cipher="AES-128-GCM"
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["cipher"], "AES-128-GCM")
+
+    def test_create_stc_connection_invalid_cipher(self):
+        """Test that invalid cipher fails."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        result = self.appliance.connections.create_stc_connection(
+            "c1", "p1", self.slot_id, cipher="INVALID"
+        )
+        self.assertFalse(result["success"])
+
+    def test_create_stc_connection_missing_identity(self):
+        """Test that creating STC connection without identities fails."""
+        result = self.appliance.connections.create_stc_connection("nonexistent", "nonexistent", self.slot_id)
+        self.assertFalse(result["success"])
+
+    def test_create_stc_connection_duplicate(self):
+        """Test that duplicate STC connection fails."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        result = self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        self.assertFalse(result["success"])
+
+    def test_list_stc_connections(self):
+        """Test listing STC connections."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        conns = self.appliance.connections.list_stc_connections()
+        self.assertEqual(len(conns), 1)
+        self.assertEqual(conns[0]["client_name"], "c1")
+        self.assertEqual(conns[0]["partition_name"], "p1")
+
+    def test_connect_stc(self):
+        """Test establishing an STC connection."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        result = self.appliance.connections.connect_stc(1)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["state"], STATE_CONNECTED)
+
+    def test_disconnect_stc(self):
+        """Test disconnecting an STC connection."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        self.appliance.connections.connect_stc(1)
+        result = self.appliance.connections.disconnect_stc(1)
+        self.assertTrue(result["success"])
+
+    def test_delete_stc_connection(self):
+        """Test deleting an STC connection."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        result = self.appliance.connections.delete_stc_connection(1)
+        self.assertTrue(result["success"])
+        self.assertEqual(len(self.appliance.connections.list_stc_connections()), 0)
+
+    def test_restore_stc_connection(self):
+        """Test restoring a broken STC connection."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        self.appliance.connections.connect_stc(1)
+        self.appliance.connections.disconnect_stc(1)
+        result = self.appliance.connections.restore_stc_connection(1)
+        self.assertTrue(result["success"])
+
+    # --- STC Configuration ---
+
+    def test_enable_disable_stc(self):
+        """Test enabling and disabling STC."""
+        self.appliance.connections.enable_stc()
+        config = self.appliance.connections.get_stc_config()
+        self.assertTrue(config["enabled"])
+        self.appliance.connections.disable_stc()
+        config = self.appliance.connections.get_stc_config()
+        self.assertFalse(config["enabled"])
+
+    def test_set_stc_cipher(self):
+        """Test setting STC cipher."""
+        result = self.appliance.connections.set_stc_cipher("AES-128-GCM")
+        self.assertTrue(result["success"])
+        config = self.appliance.connections.get_stc_config()
+        self.assertEqual(config["cipher"], "AES-128-GCM")
+
+    def test_set_invalid_stc_cipher(self):
+        """Test that invalid cipher fails."""
+        result = self.appliance.connections.set_stc_cipher("INVALID")
+        self.assertFalse(result["success"])
+
+    def test_enable_disable_stc_hmac(self):
+        """Test enabling and disabling STC HMAC."""
+        self.appliance.connections.disable_stc_hmac()
+        config = self.appliance.connections.get_stc_config()
+        self.assertFalse(config.get("hmac_enabled", True))
+        self.appliance.connections.enable_stc_hmac()
+        config = self.appliance.connections.get_stc_config()
+        self.assertTrue(config.get("hmac_enabled"))
+
+    def test_set_stc_rekey_threshold(self):
+        """Test setting rekey threshold."""
+        result = self.appliance.connections.set_stc_rekey_threshold(500000)
+        self.assertTrue(result["success"])
+        config = self.appliance.connections.get_stc_config()
+        self.assertEqual(config["rekey_threshold"], 500000)
+
+    def test_set_stc_rekey_too_low(self):
+        """Test that too-low rekey threshold fails."""
+        result = self.appliance.connections.set_stc_rekey_threshold(100)
+        self.assertFalse(result["success"])
+
+    def test_set_stc_activation_timeout(self):
+        """Test setting activation timeout."""
+        result = self.appliance.connections.set_stc_activation_timeout(600)
+        self.assertTrue(result["success"])
+        config = self.appliance.connections.get_stc_config()
+        self.assertEqual(config["activation_timeout"], 600)
+
+    def test_set_stc_activation_timeout_invalid(self):
+        """Test that invalid activation timeout fails."""
+        result = self.appliance.connections.set_stc_activation_timeout(5)
+        self.assertFalse(result["success"])
+        result = self.appliance.connections.set_stc_activation_timeout(5000)
+        self.assertFalse(result["success"])
+
+    # --- NTLS to STC Conversion ---
+
+    def test_convert_ntls_to_stc(self):
+        """Test converting an NTLS connection to STC."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        result = self.appliance.connections.convert_ntls_to_stc("client1", self.slot_id)
+        self.assertTrue(result["success"])
+        # NTLS connection should be gone
+        self.assertIsNone(self.appliance.connections.get_ntls_connection("client1", self.slot_id))
+        # STC connection should exist
+        stc_conns = self.appliance.connections.list_stc_connections()
+        self.assertEqual(len(stc_conns), 1)
+
+    def test_convert_ntls_connected_fails(self):
+        """Test that converting a connected NTLS connection fails."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.appliance.connections.connect_ntls("client1", self.slot_id)
+        result = self.appliance.connections.convert_ntls_to_stc("client1", self.slot_id)
+        self.assertFalse(result["success"])
+
+    def test_convert_ntls_not_found(self):
+        """Test that converting a non-existent NTLS connection fails."""
+        result = self.appliance.connections.convert_ntls_to_stc("nonexistent", self.slot_id)
+        self.assertFalse(result["success"])
+
+    # --- Connection Summary ---
+
+    def test_connection_summary(self):
+        """Test getting connection summary."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.appliance.connections.connect_ntls("client1", self.slot_id)
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        summary = self.appliance.connections.get_connection_summary()
+        self.assertEqual(summary["ntls_total"], 1)
+        self.assertEqual(summary["ntls_connected"], 1)
+        self.assertEqual(summary["stc_total"], 1)
+        self.assertEqual(summary["stc_identities"], 2)
+
+    # --- Persistence ---
+
+    def test_ntls_connection_persists(self):
+        """Test that NTLS connections persist across DB reopen."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        conns = appliance2.connections.list_ntls_connections()
+        self.assertEqual(len(conns), 1)
+        self.assertEqual(conns[0]["client_name"], "client1")
+        api2.C_Finalize()
+
+    def test_stc_connection_persists(self):
+        """Test that STC connections persist across DB reopen."""
+        self.appliance.connections.create_stc_identity("c1", "client")
+        self.appliance.connections.create_stc_identity("p1", "partition")
+        self.appliance.connections.create_stc_connection("c1", "p1", self.slot_id)
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        conns = appliance2.connections.list_stc_connections()
+        self.assertEqual(len(conns), 1)
+        identities = appliance2.connections.list_stc_identities()
+        self.assertEqual(len(identities), 2)
+        api2.C_Finalize()
+
+    def test_stc_config_persists(self):
+        """Test that STC config persists across DB reopen."""
+        self.appliance.connections.enable_stc()
+        self.appliance.connections.set_stc_cipher("AES-128-GCM")
+        self.api.C_Finalize()
+        storage2 = Storage(db_path=self.db_path, master_password="testpass")
+        api2 = PKCS11API(storage2)
+        api2.C_Initialize()
+        appliance2 = Appliance(storage2)
+        config = appliance2.connections.get_stc_config()
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["cipher"], "AES-128-GCM")
+        api2.C_Finalize()
+
+    # --- NTLS info via appliance ---
+
+    def test_ntls_info_shows_connections(self):
+        """Test that NTLS info reflects connection count."""
+        self.appliance.connections.create_ntls_connection("client1", self.slot_id)
+        info = self.appliance.get_ntls_info()
+        self.assertEqual(info["connections"], 1)
+        self.assertIn("cert_fingerprint", info)
 
 
 if __name__ == "__main__":

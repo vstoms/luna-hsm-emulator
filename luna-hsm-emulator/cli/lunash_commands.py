@@ -897,43 +897,686 @@ class LunaSHCommands:
     # ------------------------------------------------------------------
 
     def cmd_ntls(self, args: list):
-        """Handle 'ntls' commands."""
+        """Handle 'ntls' commands — full NTLS connection management."""
         if not args:
-            print("  Usage: ntls show | bind | certificate show")
+            print("  Usage: ntls show | certificate show | certificate regenerate |")
+            print("         connection list | connection create | connection delete |")
+            print("         connection connect | connection disconnect | connection restore |")
+            print("         ipcheck enable|disable|show | threads set|show |")
+            print("         timer set|show | tcp_keepalive set|show")
             return
         if not self._check_login():
             return
         sub = args[0]
+        rest = args[1:]
 
         if sub == "show":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
                 return
             info = self.appliance.get_ntls_info()
+            summary = self.appliance.connections.get_connection_summary()
             print(f"  NTLS Status:       {info['status']}")
             print(f"  Bound Interfaces:  {info['bound_interfaces']}")
-            print(f"  Connections:       {info['connections']}")
+            print(f"  Total Connections: {info['connections']}")
+            print(f"  Connected:         {info['connected']}")
+            print(f"  Assigned (pending): {summary['ntls_assigned']}")
             print(f"  Certificate:       {info['certificate']}")
+            print(f"  Cert Fingerprint:  {info['cert_fingerprint']}")
+            print(f"  Cert Type:         {info['cert_type']}")
             print(f"  Cert Expiry:       {info['cert_expiry']}")
             print(f"  IP Check:          {'Enabled' if info['ip_check'] else 'Disabled'}")
             print(f"  Threads:           {info['threads']}")
-
-        elif sub == "bind":
-            if not self._check_role(ROLE_ADMIN):
-                return
-            iface = args[1] if len(args) > 1 else "eth0"
-            print(f"  NTLS bound to interface: {iface}")
+            self._print_explain([
+                "NTLS (Network Trust Link Service) is the high-performance",
+                "connection type for traditional data center environments.",
+                "Clients are identified by IP address and authenticated via",
+                "certificates (self-signed or CA-signed).",
+            ])
 
         elif sub == "certificate":
-            if args and args[1:] and args[1] == "show":
-                print("  NTLS Server Certificate:")
-                print("    Subject:  CN=luna7-appliance")
-                print("    Issuer:   CN=luna7-appliance")
-                print("    Expiry:   2027-01-01")
+            if not rest:
+                print("  Usage: ntls certificate show | regenerate")
+                return
+            if rest[0] == "show":
+                cert = self.appliance.connections.get_ntls_server_cert()
+                print(f"  NTLS Server Certificate:")
+                print(f"    Subject:     {cert.get('subject', 'N/A')}")
+                print(f"    Issuer:      {cert.get('issuer', 'N/A')}")
+                print(f"    Serial:      {cert.get('serial', 'N/A')}")
+                print(f"    Fingerprint: {cert.get('fingerprint', 'N/A')}")
+                print(f"    Type:        {cert.get('type', 'N/A')}")
+                print(f"    Expiry:      {cert.get('expiry', 'N/A')}")
+                print(f"    Key Type:    {cert.get('key_type', 'N/A')}")
+            elif rest[0] == "regenerate":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                cert = self.appliance.connections.regenerate_ntls_cert()
+                print(f"  NTLS certificate regenerated.")
+                print(f"    New Fingerprint: {cert.get('fingerprint', 'N/A')}")
+                self._print_explain([
+                    "Regenerating the NTLS server certificate creates a new",
+                    "self-signed certificate. All existing NTLS connections",
+                    "must be re-established with the new certificate.",
+                ])
             else:
-                print("  Usage: ntls certificate show")
+                print(f"  Unknown certificate subcommand: {rest[0]}")
+
+        elif sub == "connection":
+            self._ntls_connection(rest)
+
+        elif sub == "ipcheck":
+            if not rest:
+                print("  Usage: ntls ipcheck enable|disable|show")
+                return
+            if rest[0] == "show":
+                print("  IP Check: Enabled")
+            elif rest[0] == "enable":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                print("  IP Check enabled.")
+            elif rest[0] == "disable":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                print("  IP Check disabled.")
+
+        elif sub == "threads":
+            if not rest:
+                print("  Usage: ntls threads set <n> | show")
+                return
+            if rest[0] == "show":
+                print(f"  NTLS Threads: 8")
+            elif rest[0] == "set":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                n = rest[1] if len(rest) > 1 else None
+                if not n:
+                    print("  Usage: ntls threads set <n>")
+                    return
+                print(f"  NTLS threads set to: {n}")
+
+        elif sub == "timer":
+            if not rest:
+                print("  Usage: ntls timer set <seconds> | show")
+                return
+            if rest[0] == "show":
+                print("  NTLS Timer: 30 seconds")
+            elif rest[0] == "set":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                print(f"  NTLS timer set to: {rest[1]}")
+
+        elif sub == "tcp_keepalive":
+            if not rest:
+                print("  Usage: ntls tcp_keepalive set <seconds> | show")
+                return
+            if rest[0] == "show":
+                print("  TCP Keepalive: 60 seconds")
+            elif rest[0] == "set":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                print(f"  TCP Keepalive set to: {rest[1]}")
 
         else:
             print(f"  Unknown ntls subcommand: {sub}")
+
+    def _ntls_connection(self, args: list):
+        """Handle 'ntls connection' subcommands."""
+        if not args:
+            print("  Usage: ntls connection list | create | delete | connect | disconnect | restore | show")
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "list":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            conns = self.appliance.connections.list_ntls_connections()
+            if not conns:
+                print("  No NTLS connections.")
+                return
+            print(f"  {'Client':<25} {'Slot':<6} {'State':<15} {'Cert Type':<15} {'Created'}")
+            print("  " + "-" * 90)
+            for c in conns:
+                print(f"  {c['client_name']:<25} {c['slot_id']:<6} {c['state']:<15} {c['cert_type']:<15} {time.strftime('%Y-%m-%d %H:%M', time.localtime(c['created_at']))}")
+
+        elif sub == "create":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            cert_type = self._get_arg(rest, "-cert") or "self-signed"
+            if not client or not slot:
+                print("  Usage: ntls connection create -client <name> -slot <id> [-cert self-signed|ca-signed]")
+                return
+            result = self.appliance.connections.create_ntls_connection(
+                client, int(slot), cert_type=cert_type
+            )
+            if result["success"]:
+                print(f"  NTLS connection created: client='{client}', slot={slot}")
+                print(f"  Certificate type: {cert_type}")
+                print(f"  Certificate fingerprint: {result.get('cert_fingerprint', 'N/A')}")
+                self._print_explain([
+                    "Creating an NTLS connection simulates the process of:",
+                    "1. Client generates a certificate (self-signed or CA-signed)",
+                    "2. Client certificate is registered on the appliance",
+                    "3. Partition is assigned to the client",
+                    "",
+                    "The connection is in 'assigned' state — use 'ntls connection connect'",
+                    "to simulate establishing the trust link.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "delete":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            if not client or not slot:
+                print("  Usage: ntls connection delete -client <name> -slot <id>")
+                return
+            result = self.appliance.connections.delete_ntls_connection(client, int(slot))
+            if result["success"]:
+                print(f"  NTLS connection deleted: client='{client}', slot={slot}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "connect":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            if not client or not slot:
+                print("  Usage: ntls connection connect -client <name> -slot <id>")
+                return
+            result = self.appliance.connections.connect_ntls(client, int(slot))
+            if result["success"]:
+                print(f"  NTLS connection established: client='{client}', slot={slot}")
+                self._print_explain([
+                    "The NTLS trust link is now active. The client can perform",
+                    "cryptographic operations on the assigned partition.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "disconnect":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            if not client or not slot:
+                print("  Usage: ntls connection disconnect -client <name> -slot <id>")
+                return
+            result = self.appliance.connections.disconnect_ntls(client, int(slot))
+            if result["success"]:
+                print(f"  NTLS connection disconnected: client='{client}', slot={slot}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "restore":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            if not client or not slot:
+                print("  Usage: ntls connection restore -client <name> -slot <id>")
+                return
+            result = self.appliance.connections.restore_ntls_connection(client, int(slot))
+            if result["success"]:
+                print(f"  {result['message']}")
+                self._print_explain([
+                    "Restoring a broken NTLS connection resets it to the",
+                    "'assigned' state. Use 'ntls connection connect' to",
+                    "re-establish the trust link.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            if not client or not slot:
+                print("  Usage: ntls connection show -client <name> -slot <id>")
+                return
+            conn = self.appliance.connections.get_ntls_connection(client, int(slot))
+            if conn is None:
+                print(f"  NTLS connection not found.")
+                return
+            print(f"  Client:          {conn['client_name']}")
+            print(f"  Slot:             {conn['slot_id']}")
+            print(f"  State:            {conn['state']}")
+            print(f"  Cert Type:        {conn['cert_type']}")
+            print(f"  Cert Subject:     {conn['cert_subject']}")
+            print(f"  Cert Issuer:      {conn['cert_issuer']}")
+            print(f"  Cert Serial:      {conn['cert_serial']}")
+            print(f"  Cert Fingerprint: {conn['cert_fingerprint']}")
+            print(f"  Cert Expiry:      {conn['cert_expiry']}")
+            print(f"  Created:          {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(conn['created_at']))}")
+            if conn['connected_at']:
+                print(f"  Connected:        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(conn['connected_at']))}")
+
+        else:
+            print(f"  Unknown connection subcommand: {sub}")
+
+    # ------------------------------------------------------------------
+    # STC (Secure Trusted Channel)
+    # ------------------------------------------------------------------
+
+    def cmd_stc(self, args: list):
+        """Handle 'stc' commands — full STC connection management."""
+        if not args:
+            print("  Usage: stc enable | disable | show | status |")
+            print("         identity create | identity delete | identity list | identity show | identity export |")
+            print("         connection create | connection delete | connection list |")
+            print("         connection connect | connection disconnect | connection restore |")
+            print("         cipher show | cipher enable <name> | cipher disable <name> |")
+            print("         hmac show | hmac enable | hmac disable |")
+            print("         rekeyThreshold set <n> | rekeyThreshold show |")
+            print("         activationTimeOut set <n> | activationTimeOut show |")
+            print("         convert -client <name> -slot <id> |")
+            print("         admin show")
+            return
+        if not self._check_login():
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            config = self.appliance.connections.get_stc_config()
+            summary = self.appliance.connections.get_connection_summary()
+            print(f"  STC Enabled:        {'Yes' if config.get('enabled') else 'No'}")
+            print(f"  Cipher:             {config.get('cipher', 'AES-256-GCM')}")
+            print(f"  HMAC:               {config.get('hmac', 'HMAC-SHA256')}")
+            print(f"  HMAC Enabled:       {'Yes' if config.get('hmac_enabled', True) else 'No'}")
+            print(f"  Rekey Threshold:    {config.get('rekey_threshold', 1000000)}")
+            print(f"  Activation Timeout: {config.get('activation_timeout', 300)}s")
+            print(f"  Identities:         {summary['stc_identities']}")
+            print(f"  Connections:        {summary['stc_total']}")
+            print(f"  Connected:          {summary['stc_connected']}")
+            self._print_explain([
+                "STC (Secure Trusted Channel) provides higher-assurance",
+                "session protection beyond TLS. All data is encrypted with",
+                "symmetric encryption, and message authentication codes",
+                "prevent tampering. STC is preferred for cloud and virtual",
+                "environments where VMs are frequently cloned or moved.",
+            ])
+
+        elif sub == "status":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            status = self.appliance.connections.get_stc_admin_status()
+            print(f"  STC Admin Channel:")
+            print(f"    Enabled:          {'Yes' if status['enabled'] else 'No'}")
+            print(f"    Cipher:           {status['cipher']}")
+            print(f"    HMAC:             {status['hmac']}")
+            print(f"    HMAC Enabled:     {'Yes' if status['hmac_enabled'] else 'No'}")
+            print(f"    Rekey Threshold:  {status['rekey_threshold']}")
+            print(f"    Activation Timeout: {status['activation_timeout']}s")
+            print(f"    Identities:       {status['identities']}")
+            print(f"    Connections:      {status['connections']}")
+
+        elif sub == "enable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            result = self.appliance.connections.enable_stc()
+            print(f"  STC enabled.")
+            # Also start the stc service
+            self.appliance.start_service("stc")
+
+        elif sub == "disable":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            result = self.appliance.connections.disable_stc()
+            print(f"  STC disabled.")
+            self.appliance.stop_service("stc")
+
+        elif sub == "identity":
+            self._stc_identity(rest)
+
+        elif sub == "connection":
+            self._stc_connection(rest)
+
+        elif sub == "cipher":
+            if not rest:
+                print("  Usage: stc cipher show | enable <name> | disable <name>")
+                return
+            if rest[0] == "show":
+                from hsm.connections import STC_CIPHERS
+                config = self.appliance.connections.get_stc_config()
+                print(f"  Current cipher: {config.get('cipher', 'AES-256-GCM')}")
+                print(f"  Available: {', '.join(STC_CIPHERS)}")
+            elif rest[0] == "enable":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                cipher = rest[1] if len(rest) > 1 else None
+                if not cipher:
+                    print("  Usage: stc cipher enable <name>")
+                    return
+                result = self.appliance.connections.set_stc_cipher(cipher)
+                if result["success"]:
+                    print(f"  STC cipher set to: {cipher}")
+                else:
+                    print(f"  Error: {result['error']}")
+            elif rest[0] == "disable":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                print("  Use 'stc cipher enable <name>' to set a different cipher.")
+
+        elif sub == "hmac":
+            if not rest:
+                print("  Usage: stc hmac show | enable | disable")
+                return
+            if rest[0] == "show":
+                config = self.appliance.connections.get_stc_config()
+                print(f"  HMAC: {config.get('hmac', 'HMAC-SHA256')}")
+                print(f"  HMAC Enabled: {'Yes' if config.get('hmac_enabled', True) else 'No'}")
+            elif rest[0] == "enable":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                self.appliance.connections.enable_stc_hmac()
+                print("  STC HMAC enabled.")
+            elif rest[0] == "disable":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                self.appliance.connections.disable_stc_hmac()
+                print("  STC HMAC disabled.")
+
+        elif sub in ("rekeyThreshold", "rekeythreshold"):
+            if not rest:
+                print("  Usage: stc rekeyThreshold set <n> | show")
+                return
+            if rest[0] == "show":
+                config = self.appliance.connections.get_stc_config()
+                print(f"  Rekey Threshold: {config.get('rekey_threshold', 1000000)}")
+            elif rest[0] == "set":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                n = int(rest[1]) if len(rest) > 1 else None
+                if not n:
+                    print("  Usage: stc rekeyThreshold set <n>")
+                    return
+                result = self.appliance.connections.set_stc_rekey_threshold(n)
+                if result["success"]:
+                    print(f"  Rekey threshold set to: {n}")
+                else:
+                    print(f"  Error: {result['error']}")
+
+        elif sub in ("activationTimeOut", "activationtimeout"):
+            if not rest:
+                print("  Usage: stc activationTimeOut set <n> | show")
+                return
+            if rest[0] == "show":
+                config = self.appliance.connections.get_stc_config()
+                print(f"  Activation Timeout: {config.get('activation_timeout', 300)}s")
+            elif rest[0] == "set":
+                if not self._check_role(ROLE_ADMIN):
+                    return
+                n = int(rest[1]) if len(rest) > 1 else None
+                if not n:
+                    print("  Usage: stc activationTimeOut set <n>")
+                    return
+                result = self.appliance.connections.set_stc_activation_timeout(n)
+                if result["success"]:
+                    print(f"  Activation timeout set to: {n}s")
+                else:
+                    print(f"  Error: {result['error']}")
+
+        elif sub == "convert":
+            if not self._check_role(ROLE_ADMIN):
+                return
+            client = self._get_arg(rest, "-client")
+            slot = self._get_arg(rest, "-slot")
+            if not client or not slot:
+                print("  Usage: stc convert -client <name> -slot <id>")
+                return
+            confirm = input(f"  Convert NTLS connection for '{client}' on slot {slot} to STC? This is irreversible. (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Cancelled.")
+                return
+            result = self.appliance.connections.convert_ntls_to_stc(client, int(slot))
+            if result["success"]:
+                print(f"  {result['message']}")
+                print(f"  STC Connection ID: {result['stc_connection_id']}")
+                print(f"  Client Identity: {result['client_identity']}")
+                print(f"  Partition Identity: {result['partition_identity']}")
+                self._print_explain([
+                    "Converting from NTLS to STC is a one-way operation.",
+                    "STC partitions cannot be converted back to NTLS without",
+                    "zeroizing the partition. STC provides higher assurance",
+                    "with symmetric encryption and message authentication.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "admin":
+            if not rest or rest[0] != "show":
+                print("  Usage: stc admin show")
+                return
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            status = self.appliance.connections.get_stc_admin_status()
+            print(f"  STC Admin Channel Status:")
+            print(f"    Enabled:          {'Yes' if status['enabled'] else 'No'}")
+            print(f"    Cipher:           {status['cipher']}")
+            print(f"    HMAC:             {status['hmac']}")
+            print(f"    Identities:       {status['identities']}")
+            print(f"    Connections:      {status['connections']}")
+
+        else:
+            print(f"  Unknown stc subcommand: {sub}")
+
+    def _stc_identity(self, args: list):
+        """Handle 'stc identity' subcommands."""
+        if not args:
+            print("  Usage: stc identity create | delete | list | show | export")
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "create":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            id_type = self._get_arg(rest, "-type")  # "client" or "partition"
+            name = self._get_arg(rest, "-name")
+            if not id_type or not name:
+                print("  Usage: stc identity create -type <client|partition> -name <name>")
+                return
+            result = self.appliance.connections.create_stc_identity(name, id_type)
+            if result["success"]:
+                print(f"  STC {id_type} identity '{name}' created.")
+                print(f"  Identity ID: {result['identity_id']}")
+                self._print_explain([
+                    f"STC identities have a public/private key pair. The public",
+                    f"key must be exported and registered on the other end",
+                    f"({'client' if id_type == 'partition' else 'appliance'}) to",
+                    "establish mutual authentication.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "delete":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            id_type = self._get_arg(rest, "-type")
+            name = self._get_arg(rest, "-name")
+            if not id_type or not name:
+                print("  Usage: stc identity delete -type <client|partition> -name <name>")
+                return
+            result = self.appliance.connections.delete_stc_identity(name, id_type)
+            if result["success"]:
+                print(f"  STC {id_type} identity '{name}' deleted.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "list":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            identities = self.appliance.connections.list_stc_identities()
+            if not identities:
+                print("  No STC identities.")
+                return
+            print(f"  {'ID':<5} {'Name':<25} {'Type':<12} {'Initialized':<12} {'Created'}")
+            print("  " + "-" * 75)
+            for i in identities:
+                print(f"  {i['identity_id']:<5} {i['name']:<25} {i['identity_type']:<12} {'Yes' if i['initialized'] else 'No':<12} {time.strftime('%Y-%m-%d %H:%M', time.localtime(i['created_at']))}")
+
+        elif sub == "show":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            id_type = self._get_arg(rest, "-type")
+            name = self._get_arg(rest, "-name")
+            if not id_type or not name:
+                print("  Usage: stc identity show -type <client|partition> -name <name>")
+                return
+            identity = self.appliance.connections.get_stc_identity_by_name(name, id_type)
+            if identity is None:
+                print(f"  STC {id_type} identity '{name}' not found.")
+                return
+            print(f"  Identity ID:    {identity.identity_id}")
+            print(f"  Name:           {identity.name}")
+            print(f"  Type:           {identity.identity_type}")
+            print(f"  Initialized:    {'Yes' if identity.initialized else 'No'}")
+            print(f"  Public Key:     {identity.public_key[:32]}...")
+            print(f"  Created:        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(identity.created_at))}")
+
+        elif sub == "export":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            id_type = self._get_arg(rest, "-type")
+            name = self._get_arg(rest, "-name")
+            if not id_type or not name:
+                print("  Usage: stc identity export -type <client|partition> -name <name>")
+                return
+            result = self.appliance.connections.export_stc_identity(name, id_type)
+            if result["success"]:
+                print(f"  STC {id_type} identity '{name}' exported.")
+                print(f"  Public Key: {result['public_key']}")
+                print(f"  File: {result['file']}")
+                self._print_explain([
+                    f"The exported {'partition identity (.pid)' if id_type == 'partition' else 'client identity (.clientID)'}",
+                    "file must be transferred to the other end and registered",
+                    "to establish mutual authentication for STC.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        else:
+            print(f"  Unknown identity subcommand: {sub}")
+
+    def _stc_connection(self, args: list):
+        """Handle 'stc connection' subcommands."""
+        if not args:
+            print("  Usage: stc connection create | delete | list | connect | disconnect | restore")
+            return
+        sub = args[0]
+        rest = args[1:]
+
+        if sub == "list":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
+                return
+            conns = self.appliance.connections.list_stc_connections()
+            if not conns:
+                print("  No STC connections.")
+                return
+            print(f"  {'ID':<5} {'Client':<25} {'Partition':<25} {'Slot':<6} {'State':<15} {'Cipher'}")
+            print("  " + "-" * 95)
+            for c in conns:
+                print(f"  {c['connection_id']:<5} {c.get('client_name', 'N/A'):<25} {c.get('partition_name', 'N/A'):<25} {c['slot_id']:<6} {c['state']:<15} {c['cipher']}")
+
+        elif sub == "create":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            client = self._get_arg(rest, "-client")
+            partition = self._get_arg(rest, "-partition")
+            slot = self._get_arg(rest, "-slot")
+            cipher = self._get_arg(rest, "-cipher")
+            hmac = self._get_arg(rest, "-hmac")
+            if not client or not partition or not slot:
+                print("  Usage: stc connection create -client <id_name> -partition <id_name> -slot <id> [-cipher <name>] [-hmac <name>]")
+                return
+            result = self.appliance.connections.create_stc_connection(
+                client, partition, int(slot),
+                cipher=cipher, hmac=hmac
+            )
+            if result["success"]:
+                print(f"  STC connection created. ID: {result['connection_id']}")
+                print(f"  Client identity: {result['client_identity']}")
+                print(f"  Partition identity: {result['partition_identity']}")
+                print(f"  Cipher: {result['cipher']}")
+                print(f"  HMAC: {result['hmac']}")
+                self._print_explain([
+                    "The STC connection is in 'registered' state. Use",
+                    "'stc connection connect' to establish the secure tunnel.",
+                    "Mutual authentication will verify both identities before",
+                    "establishing the encrypted session.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "delete":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            conn_id = self._get_arg(rest, "-id")
+            if not conn_id:
+                print("  Usage: stc connection delete -id <connection_id>")
+                return
+            result = self.appliance.connections.delete_stc_connection(int(conn_id))
+            if result["success"]:
+                print(f"  STC connection {conn_id} deleted.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "connect":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            conn_id = self._get_arg(rest, "-id")
+            if not conn_id:
+                print("  Usage: stc connection connect -id <connection_id>")
+                return
+            result = self.appliance.connections.connect_stc(int(conn_id))
+            if result["success"]:
+                print(f"  STC connection {conn_id} established.")
+                print(f"  Cipher: {result.get('cipher', 'N/A')}")
+                self._print_explain([
+                    "The STC secure tunnel is now active. All communication",
+                    "is encrypted with symmetric encryption and protected",
+                    "with message authentication codes.",
+                ])
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "disconnect":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            conn_id = self._get_arg(rest, "-id")
+            if not conn_id:
+                print("  Usage: stc connection disconnect -id <connection_id>")
+                return
+            result = self.appliance.connections.disconnect_stc(int(conn_id))
+            if result["success"]:
+                print(f"  STC connection {conn_id} disconnected.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "restore":
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
+            conn_id = self._get_arg(rest, "-id")
+            if not conn_id:
+                print("  Usage: stc connection restore -id <connection_id>")
+                return
+            result = self.appliance.connections.restore_stc_connection(int(conn_id))
+            if result["success"]:
+                print(f"  {result['message']}")
+            else:
+                print(f"  Error: {result['error']}")
+
+        else:
+            print(f"  Unknown connection subcommand: {sub}")
 
     # ------------------------------------------------------------------
     # sysconf
