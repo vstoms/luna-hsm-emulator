@@ -681,5 +681,169 @@ class TestFirmwareUpgrade(unittest.TestCase):
         self.assertIn("7.15.0", output)
 
 
+class TestPartitionCommands(unittest.TestCase):
+    """Test the new LunaCM partition commands."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.session_id = self.api.C_OpenSession(self.slot_id)
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_partition_init(self):
+        """Test partition init (initialize with SO PIN)."""
+        self.api.tokens.init_partition(
+            self.slot_id, "sopin123", "NewLabel",
+            audit=self.api.audit, session_id=self.session_id
+        )
+        p = self.storage.get_partition(self.slot_id)
+        self.assertTrue(p["initialized"])
+        self.assertEqual(p["label"], "NewLabel")
+
+    def test_partition_init_already_initialized(self):
+        """Test that init fails on already-initialized partition."""
+        self.api.tokens.init_partition(self.slot_id, "sopin123", audit=self.api.audit)
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.init_partition(self.slot_id, "sopin456")
+
+    def test_partition_changelabel(self):
+        """Test changing partition label."""
+        self.api.tokens.init_partition(self.slot_id, "sopin123", "OldLabel", audit=self.api.audit)
+        self.api.tokens.change_partition_label(self.slot_id, "NewLabel", audit=self.api.audit)
+        p = self.storage.get_partition(self.slot_id)
+        self.assertEqual(p["label"], "NewLabel")
+
+    def test_partition_clear(self):
+        """Test clearing all objects from a partition."""
+        tmpl = make_aes_key_template("k1", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        tmpl2 = make_aes_key_template("k2", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl2)
+        count = self.api.tokens.clear_partition(self.slot_id, audit=self.api.audit)
+        self.assertEqual(count, 2)
+        self.assertEqual(self.storage.count_objects(self.slot_id), 0)
+
+    def test_partition_contents(self):
+        """Test showing partition contents."""
+        tmpl = make_aes_key_template("contents_key", 256)
+        self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        output = self.api.tokens.show_partition_contents(self.slot_id)
+        self.assertIn("contents_key", output)
+        self.assertIn("CKO_SECRET_KEY", output)
+
+    def test_partition_contents_empty(self):
+        """Test showing empty partition contents."""
+        output = self.api.tokens.show_partition_contents(self.slot_id)
+        self.assertIn("empty", output)
+
+    def test_partition_showmechanism(self):
+        """Test showing available mechanisms."""
+        output = self.api.tokens.show_mechanisms(self.slot_id)
+        self.assertIn("CKM_AES_GCM", output)
+        self.assertIn("CKM_SHA256_RSA_PKCS", output)
+        self.assertIn("enc", output)
+        self.assertIn("sign", output)
+
+    def test_partition_showpolicies(self):
+        """Test showing partition policies."""
+        output = self.api.tokens.show_policies(self.slot_id)
+        self.assertIn("ALLOW_KEY_CLONE", output)
+        self.assertIn("MAX_LOGIN_ATTEMPTS", output)
+
+    def test_partition_changepolicy(self):
+        """Test changing a partition policy."""
+        self.api.tokens.change_policy(self.slot_id, "MAX_LOGIN_ATTEMPTS", "5",
+                                        audit=self.api.audit)
+        p = self.storage.get_partition(self.slot_id)
+        self.assertEqual(p["max_login_attempts"], 5)
+
+    def test_partition_changepolicy_invalid(self):
+        """Test that changing an invalid policy fails."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.change_policy(self.slot_id, "NONEXISTENT_POLICY", "1")
+
+
+class TestRoleCommands(unittest.TestCase):
+    """Test the new LunaCM role commands."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.storage = Storage(db_path=self.db_path, master_password="testpass")
+        self.api = PKCS11API(self.storage)
+        self.api.C_Initialize()
+        self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.api.tokens.init_token(self.slot_id, "sopin123", "Test")
+        self.session_id = self.api.C_OpenSession(self.slot_id)
+
+    def tearDown(self):
+        self.api.C_Finalize()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_role_list(self):
+        """Test listing roles on a partition."""
+        output = self.api.tokens.list_roles(self.slot_id)
+        self.assertIn("SO", output)
+        self.assertIn("CO", output)
+        self.assertIn("CU", output)
+        self.assertIn("Security Officer", output)
+
+    def test_role_show(self):
+        """Test showing a specific role."""
+        output = self.api.tokens.show_role(self.slot_id, "SO")
+        self.assertIn("Security Officer", output)
+        self.assertIn("PIN Initialized: Yes", output)
+
+    def test_role_show_unknown(self):
+        """Test showing an unknown role."""
+        output = self.api.tokens.show_role(self.slot_id, "UNKNOWN")
+        self.assertIn("Unknown role", output)
+
+    def test_role_init_cu(self):
+        """Test initializing the CU role."""
+        self.api.tokens.init_role(self.slot_id, "CU", "cupin123",
+                                   audit=self.api.audit, session_id=self.session_id)
+        p = self.storage.get_partition(self.slot_id)
+        self.assertIsNotNone(p["cu_pin_hash"])
+
+    def test_role_init_invalid_role(self):
+        """Test that init fails for SO role."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.init_role(self.slot_id, "SO", "newpin123")
+
+    def test_role_deactivate(self):
+        """Test deactivating a role."""
+        self.api.tokens.init_pin(self.slot_id, "copin123", "CO")
+        self.api.tokens.deactivate_role(self.slot_id, "CO",
+                                         audit=self.api.audit, session_id=self.session_id)
+        p = self.storage.get_partition(self.slot_id)
+        self.assertIsNone(p["co_pin_hash"])
+
+    def test_role_resetpw(self):
+        """Test resetting a role PIN."""
+        self.api.tokens.init_pin(self.slot_id, "copin123", "CO")
+        self.api.tokens.reset_pin(self.slot_id, "CO", "newcopin456",
+                                   audit=self.api.audit, session_id=self.session_id)
+        # Verify the new PIN works
+        sid = self.api.C_OpenSession(self.slot_id)
+        from pkcs11.constants import CKU_USER
+        self.api.C_Login(sid, CKU_USER, "newcopin456")
+        self.assertTrue(self.api.auth.is_logged_in(sid))
+
+    def test_role_resetpw_invalid_role(self):
+        """Test that resetpw fails for SO role."""
+        with self.assertRaises(PKCS11Error):
+            self.api.tokens.reset_pin(self.slot_id, "SO", "newpin123")
+
+
 if __name__ == "__main__":
     unittest.main()

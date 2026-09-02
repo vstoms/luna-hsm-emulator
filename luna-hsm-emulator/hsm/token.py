@@ -488,3 +488,280 @@ class TokenManager:
                 f"{entry['to_version']:<10} {entry['direction']:<10} {rollback:<8} {notes}"
             )
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Partition operations (matching real LunaCM commands)
+    # ------------------------------------------------------------------
+
+    def init_partition(self, slot_id: int, so_pin: str, label: str = None,
+                        audit=None, session_id: int = 0):
+        """Initialize an application partition (partition init).
+
+        On a real Luna 7, this is done from lunash (server-side), not lunacm.
+        We simulate it here for educational purposes.
+        """
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+        if p.get("initialized"):
+            raise PKCS11Error(CKR_TOKEN_WRITE_PROTECTED,
+                              "Partition is already initialized. Use 'hsm factoryreset' first.")
+        self.auth.set_pin(slot_id, ROLE_SO, so_pin)
+        updates = {"initialized": 1}
+        if label:
+            updates["label"] = label
+        self.storage.update_partition(slot_id, **updates)
+        if audit:
+            audit.log(session_id, ROLE_SO, "PartitionInit", success=True,
+                       detail=f"slot={slot_id}, label={label or p['name']}")
+
+    def change_partition_label(self, slot_id: int, new_label: str,
+                                audit=None, session_id: int = 0):
+        """Change a partition's label (partition changelabel)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+        old_label = p.get("label", "")
+        self.storage.update_partition(slot_id, label=new_label)
+        if audit:
+            audit.log(session_id, "CO", "PartitionChangeLabel", success=True,
+                       detail=f"slot={slot_id}, '{old_label}' -> '{new_label}'")
+
+    def clear_partition(self, slot_id: int, audit=None, session_id: int = 0):
+        """Delete all token objects on a partition (partition clear)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+        objs = self.storage.get_all_objects(slot_id)
+        count = len(objs)
+        for obj, _ in objs:
+            self.storage.delete_object(obj.handle)
+        if audit:
+            audit.log(session_id, "CO", "PartitionClear", success=True,
+                       detail=f"slot={slot_id}, deleted {count} objects")
+        return count
+
+    def show_partition_contents(self, slot_id: int) -> str:
+        """Show the contents of a partition (partition contents)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            return f"  Slot {slot_id}: No partition present"
+        objs = self.storage.get_all_objects(slot_id)
+        if not objs:
+            return f"  Partition '{p['name']}' (slot {slot_id}) is empty."
+        lines = [
+            f"  Partition: {p['name']}  (slot {slot_id})",
+            f"  Label:     {p.get('label', '')}",
+            f"  Objects:   {len(objs)}",
+            "",
+            f"  {'Handle':<12} {'Label':<25} {'Class':<18} {'Key Type':<12} {'State':<12}",
+            "  " + "-" * 80,
+        ]
+        from pkcs11.constants import cko_name, ckk_name, cks_name, CKA_KEY_TYPE
+        for obj, km in objs:
+            cls = cko_name(obj.object_class())
+            kt = ckk_name(obj.key_type()) if obj.has(CKA_KEY_TYPE) else "N/A"
+            state = cks_name(obj.state) if hasattr(obj, "state") else "N/A"
+            lines.append(f"  0x{obj.handle:08X}   {obj.label():<25} {cls:<18} {kt:<12} {state:<12}")
+        return "\n".join(lines)
+
+    def show_mechanisms(self, slot_id: int) -> str:
+        """Show all available mechanisms on a partition (partition showmechanism)."""
+        from pkcs11.mechanisms import MECHANISMS, MF_GENERATE, MF_GENERATE_KEY_PAIR, MF_ENCRYPT, MF_DECRYPT, MF_SIGN, MF_VERIFY, MF_DIGEST, MF_WRAP, MF_UNWRAP, MF_DERIVE
+        from pkcs11.constants import ckm_name
+
+        flag_names = [
+            (MF_GENERATE, "gen"), (MF_GENERATE_KEY_PAIR, "genpair"),
+            (MF_ENCRYPT, "enc"), (MF_DECRYPT, "dec"),
+            (MF_SIGN, "sign"), (MF_VERIFY, "verify"),
+            (MF_DIGEST, "digest"), (MF_WRAP, "wrap"),
+            (MF_UNWRAP, "unwrap"), (MF_DERIVE, "derive"),
+        ]
+
+        lines = [
+            f"  Available mechanisms for slot {slot_id}:",
+            "",
+            f"  {'Mechanism':<30} {'KeyRange':<16} {'Flags'}",
+            "  " + "-" * 75,
+        ]
+        for mech_id in sorted(MECHANISMS.keys()):
+            info = MECHANISMS[mech_id]
+            name = ckm_name(mech_id)
+            if info.min_key_size and info.max_key_size:
+                kr = f"{info.min_key_size}-{info.max_key_size}"
+            else:
+                kr = "N/A"
+            flags = " ".join(fn for fval, fn in flag_names if info.supports(fval))
+            lines.append(f"  {name:<30} {kr:<16} {flags}")
+        return "\n".join(lines)
+
+    def show_policies(self, slot_id: int) -> str:
+        """Show partition policies (partition showpolicies)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            return f"  Slot {slot_id}: No partition present"
+
+        policies = [
+            ("NOSIGNATURE", "Require signed firmware for this partition", True),
+            ("NOLOGINOBJ", "Do not allow login objects", False),
+            ("FORCE_PIN_CHANGE", "Force PIN change on first login", False),
+            ("ALLOW_KEY_CLONE", "Allow key cloning to backup HSM", True),
+            ("ALLOW_KEY_DERIVE", "Allow key derivation operations", True),
+            ("ALLOW_BULK", "Allow bulk data operations", True),
+            ("MIN_PIN_LEN", "Minimum PIN length", 4),
+            ("MAX_PIN_LEN", "Maximum PIN length", 32),
+            ("MAX_LOGIN_ATTEMPTS", "Maximum failed login attempts before lockout", p.get("max_login_attempts", 10)),
+        ]
+
+        lines = [
+            f"  Partition Policies for '{p['name']}' (slot {slot_id}):",
+            "",
+            f"  {'Policy':<25} {'Description':<50} {'Value'}",
+            "  " + "-" * 90,
+        ]
+        for name, desc, value in policies:
+            lines.append(f"  {name:<25} {desc:<50} {value}")
+        return "\n".join(lines)
+
+    def change_policy(self, slot_id: int, policy_name: str, value,
+                      audit=None, session_id: int = 0):
+        """Change a partition policy value (partition changepolicy)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+
+        if policy_name.upper() == "MAX_LOGIN_ATTEMPTS":
+            self.storage.update_partition(slot_id, max_login_attempts=int(value))
+            if audit:
+                audit.log(session_id, "SO", "PartitionChangePolicy", success=True,
+                           detail=f"slot={slot_id}, {policy_name}={value}")
+        else:
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              f"Policy '{policy_name}' is not modifiable or does not exist.")
+
+    # ------------------------------------------------------------------
+    # Role operations (matching real LunaCM commands)
+    # ------------------------------------------------------------------
+
+    def list_roles(self, slot_id: int) -> str:
+        """List roles on a partition (role list)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            return f"  Slot {slot_id}: No partition present"
+
+        roles = [
+            ("SO", "Security Officer", p.get("so_pin_hash") is not None,
+             "LOCKED" if p.get("so_locked") else "Unlocked"),
+            ("CO", "Crypto Officer", p.get("co_pin_hash") is not None,
+             "LOCKED" if p.get("co_locked") else "Unlocked"),
+            ("CU", "Crypto User", p.get("cu_pin_hash") is not None,
+             "LOCKED" if p.get("cu_locked") else "Unlocked"),
+        ]
+
+        lines = [
+            f"  Roles on partition '{p['name']}' (slot {slot_id}):",
+            "",
+            f"  {'Role':<6} {'Description':<25} {'Initialized':<14} {'Status'}",
+            "  " + "-" * 60,
+        ]
+        for name, desc, initialized, status in roles:
+            init = "Yes" if initialized else "No"
+            lines.append(f"  {name:<6} {desc:<25} {init:<14} {status}")
+        return "\n".join(lines)
+
+    def show_role(self, slot_id: int, role_name: str) -> str:
+        """Show state of a role (role show)."""
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            return f"  Slot {slot_id}: No partition present"
+
+        role_name = role_name.upper()
+        role_map = {"SO": ("so", "Security Officer"),
+                    "CO": ("co", "Crypto Officer"),
+                    "CU": ("cu", "Crypto User")}
+
+        if role_name not in role_map:
+            return f"  Unknown role: {role_name}. Valid: SO, CO, CU"
+
+        prefix, desc = role_map[role_name]
+        initialized = p.get(f"{prefix}_pin_hash") is not None
+        locked = bool(p.get(f"{prefix}_locked", 0))
+        attempts = p.get(f"{prefix}_login_attempts", 0)
+        max_attempts = p.get("max_login_attempts", 10)
+
+        lines = [
+            f"  Role: {role_name} ({desc})",
+            f"  Partition: {p['name']} (slot {slot_id})",
+            f"  PIN Initialized: {'Yes' if initialized else 'No'}",
+            f"  Status: {'LOCKED' if locked else 'Active'}",
+            f"  Failed Login Attempts: {attempts} / {max_attempts}",
+        ]
+        return "\n".join(lines)
+
+    def init_role(self, slot_id: int, role_name: str, pin: str,
+                  audit=None, session_id: int = 0):
+        """Initialize a role on a partition (role init).
+
+        This is used to initialize the CU role or re-initialize CO.
+        Requires SO to be logged in on a real HSM.
+        """
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+
+        role_name = role_name.upper()
+        if role_name not in ("CO", "CU"):
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              "Only CO and CU roles can be initialized with 'role init'")
+
+        self.auth.set_pin(slot_id, role_name, pin)
+        if audit:
+            audit.log(session_id, "SO", "RoleInit", success=True,
+                       detail=f"slot={slot_id}, role={role_name}")
+
+    def deactivate_role(self, slot_id: int, role_name: str,
+                        audit=None, session_id: int = 0):
+        """Deactivate a role (role deactivate).
+
+        This clears the PIN for the role, effectively disabling login.
+        """
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+
+        role_name = role_name.upper()
+        if role_name not in ("CO", "CU"):
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              "Only CO and CU roles can be deactivated")
+
+        prefix = role_name.lower()
+        self.storage.update_partition(slot_id, **{
+            f"{prefix}_pin_hash": None,
+            f"{prefix}_pin_salt": None,
+            f"{prefix}_login_attempts": 0,
+            f"{prefix}_locked": 0,
+        })
+        if audit:
+            audit.log(session_id, "SO", "RoleDeactivate", success=True,
+                       detail=f"slot={slot_id}, role={role_name}")
+
+    def reset_pin(self, slot_id: int, role_name: str, new_pin: str,
+                  audit=None, session_id: int = 0):
+        """Reset a role's PIN (role resetpw).
+
+        On a real HSM, this requires SO authentication. It sets a new
+        PIN without requiring the old one.
+        """
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+
+        role_name = role_name.upper()
+        if role_name not in ("CO", "CU"):
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              "Only CO and CU roles can be reset")
+
+        self.auth.set_pin(slot_id, role_name, new_pin)
+        if audit:
+            audit.log(session_id, "SO", "RoleResetPW", success=True,
+                       detail=f"slot={slot_id}, role={role_name}")

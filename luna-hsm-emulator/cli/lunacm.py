@@ -127,8 +127,8 @@ class LunaCMShell(cmd.Cmd):
         cmd_name = parts[0].lower()
         subcommands = {
             "slot": ["list", "set"],
-            "partition": ["create", "delete", "list", "showinfo"],
-            "role": ["login", "logout", "changepw"],
+            "partition": ["create", "delete", "list", "showinfo", "init", "changelabel", "clear", "contents", "showmechanism", "showpolicies", "changepolicy"],
+            "role": ["login", "logout", "changepw", "list", "show", "init", "deactivate", "resetpw"],
             "key": ["generate", "list", "show", "delete", "wrap", "unwrap"],
             "crypto": ["encrypt", "decrypt", "sign", "verify", "digest"],
             "audit": ["log"],

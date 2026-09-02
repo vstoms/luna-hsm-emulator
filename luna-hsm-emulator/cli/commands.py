@@ -121,7 +121,7 @@ class CommandHandler:
     def cmd_partition(self, args: list):
         """Handle 'partition' commands."""
         if not args:
-            print("  Usage: partition create -name <name> | partition delete -name <name> | partition list | partition showinfo")
+            print("  Usage: partition create | delete | list | showinfo | init | changelabel | clear | contents | showmechanism | showpolicies | changepolicy")
             return
         sub = args[0]
         args = self._parse_flags(args[1:])
@@ -156,6 +156,113 @@ class CommandHandler:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
             print(self.api.tokens.show_partition_info(self.active_slot))
+        elif sub == "init":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            label = self._get_arg(args, "-label")
+            print("  [PED Simulation] Enter SO PIN to initialize partition:")
+            so_pin = getpass.getpass("  SO PIN: ")
+            try:
+                self.api.tokens.init_partition(
+                    self.active_slot, so_pin, label,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Partition on slot {self.active_slot} initialized successfully.")
+                self._print_explain([
+                    "Calling C_InitToken to initialize the application partition.",
+                    "This sets the SO PIN and optionally a new label.",
+                    "On a real Luna 7, partition init is performed via LunaSH,",
+                    "not LunaCM. We simulate it here for training purposes.",
+                    "Return code: CKR_OK (0x00000000)",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+                self._print_explain([f"Return code: {ckr_name(e.code)} (0x{e.code:08X})"])
+        elif sub == "changelabel":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            new_label = self._get_arg(args, "-label")
+            if not new_label:
+                print("  Usage: partition changelabel -label <new_label>")
+                return
+            try:
+                self.api.tokens.change_partition_label(
+                    self.active_slot, new_label,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Partition label changed to '{new_label}'.")
+                self._print_explain([
+                    "Changing a partition label updates the CKA_LABEL of the token.",
+                    "This operation requires Crypto Officer (CO) authentication.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        elif sub == "clear":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            confirm = input("  Delete ALL objects on this partition? (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Cancelled.")
+                return
+            try:
+                count = self.api.tokens.clear_partition(
+                    self.active_slot, audit=self.api.audit,
+                    session_id=self.session_id or 0
+                )
+                print(f"  Partition cleared. {count} object(s) deleted.")
+                self._print_explain([
+                    "Partition clear deletes all token objects (CKA_TOKEN=TRUE)",
+                    "from the partition. Session objects are not affected.",
+                    "This is a destructive operation and requires CO authentication.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        elif sub == "contents":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(self.api.tokens.show_partition_contents(self.active_slot))
+        elif sub == "showmechanism":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(self.api.tokens.show_mechanisms(self.active_slot))
+            self._print_explain([
+                "This calls C_GetMechanismList and C_GetMechanismInfo for each",
+                "supported mechanism on the active partition. The flags show",
+                "which operations each mechanism supports (encrypt, sign, etc.).",
+            ])
+        elif sub == "showpolicies":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(self.api.tokens.show_policies(self.active_slot))
+            self._print_explain([
+                "Partition policies control security behaviors on the Luna 7.",
+                "These include key extraction, cloning, PIN rules, and more.",
+                "Policies are set at partition creation time and some cannot be",
+                "changed afterward, ensuring security invariants are maintained.",
+            ])
+        elif sub == "changepolicy":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            policy_name = self._get_arg(args, "-name")
+            value = self._get_arg(args, "-value")
+            if not policy_name or value is None:
+                print("  Usage: partition changepolicy -name <policy> -value <value>")
+                return
+            try:
+                self.api.tokens.change_policy(
+                    self.active_slot, policy_name, value,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Policy '{policy_name}' set to '{value}'.")
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
         else:
             print(f"  Unknown partition subcommand: {sub}")
 
@@ -166,7 +273,7 @@ class CommandHandler:
     def cmd_role(self, args: list):
         """Handle 'role' commands."""
         if not args:
-            print("  Usage: role login -name <co|cu|so> | role logout | role changepw -name <role>")
+            print("  Usage: role login | logout | changepw | list | show | init | deactivate | resetpw")
             return
         sub = args[0]
 
@@ -235,6 +342,115 @@ class CommandHandler:
                 print(f"  PIN changed for {role_name.upper()}.")
             except PKCS11Error as e:
                 print(f"  Failed: {e}")
+        elif sub == "list":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(self.api.tokens.list_roles(self.active_slot))
+            self._print_explain([
+                "The Luna 7 supports three roles per partition: SO, CO, and CU.",
+                "Each role has different capabilities and can be independently",
+                "initialized, locked, or deactivated.",
+            ])
+        elif sub == "show":
+            role_name = self._get_arg(args[1:], "-name")
+            if not role_name:
+                print("  Usage: role show -name <so|co|cu>")
+                return
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(self.api.tokens.show_role(self.active_slot, role_name))
+        elif sub == "init":
+            role_name = self._get_arg(args[1:], "-name")
+            if not role_name:
+                print("  Usage: role init -name <co|cu>")
+                return
+            role_name = role_name.upper()
+            if role_name not in ("CO", "CU"):
+                print("  Only CO and CU roles can be initialized with 'role init'.")
+                return
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(f"  [PED Simulation] Set PIN for role '{role_name}':")
+            pin = getpass.getpass("  New PIN: ")
+            confirm = getpass.getpass("  Confirm PIN: ")
+            if pin != confirm:
+                print("  Error: PINs do not match.")
+                return
+            try:
+                self.api.tokens.init_role(
+                    self.active_slot, role_name, pin,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Role '{role_name}' initialized.")
+                self._print_explain([
+                    f"Role init sets the PIN for the {role_name} role.",
+                    "On a real Luna 7, this requires SO authentication.",
+                    "The CU role is optional and provides read-only access",
+                    "to cryptographic objects for verify/decrypt operations.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        elif sub == "deactivate":
+            role_name = self._get_arg(args[1:], "-name")
+            if not role_name:
+                print("  Usage: role deactivate -name <co|cu>")
+                return
+            role_name = role_name.upper()
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            confirm = input(f"  Deactivate role '{role_name}'? This will clear its PIN. (yes/no): ")
+            if confirm.lower() != "yes":
+                print("  Cancelled.")
+                return
+            try:
+                self.api.tokens.deactivate_role(
+                    self.active_slot, role_name,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  Role '{role_name}' deactivated. PIN cleared.")
+                self._print_explain([
+                    "Deactivating a role clears its PIN, preventing future logins.",
+                    "On a real Luna 7, this requires SO authentication and is",
+                    "used as a security measure to disable unused roles.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        elif sub == "resetpw":
+            role_name = self._get_arg(args[1:], "-name")
+            if not role_name:
+                print("  Usage: role resetpw -name <co|cu>")
+                return
+            role_name = role_name.upper()
+            if role_name not in ("CO", "CU"):
+                print("  Only CO and CU roles can be reset with 'role resetpw'.")
+                return
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            print(f"  [PED Simulation] Reset PIN for role '{role_name}' (requires SO):")
+            new_pin = getpass.getpass("  New PIN: ")
+            confirm = getpass.getpass("  Confirm PIN: ")
+            if new_pin != confirm:
+                print("  Error: PINs do not match.")
+                return
+            try:
+                self.api.tokens.reset_pin(
+                    self.active_slot, role_name, new_pin,
+                    audit=self.api.audit, session_id=self.session_id or 0
+                )
+                print(f"  PIN reset for role '{role_name}'.")
+                self._print_explain([
+                    "Role resetpw sets a new PIN without requiring the old one.",
+                    "This is an SO-only operation on a real Luna 7, used when",
+                    "a user forgets their PIN or when an account is locked.",
+                    "Unlike changepw, this does NOT require the old PIN.",
+                ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
         else:
             print(f"  Unknown role subcommand: {sub}")
 
@@ -980,11 +1196,23 @@ class CommandHandler:
     partition delete -name <name>      Delete a partition
     partition list                     List all partitions
     partition showinfo                 Show partition details
+    partition init [-label <label>]     Initialize the active partition (set SO PIN)
+    partition changelabel -label <l>   Change partition label
+    partition clear                    Delete all objects on partition
+    partition contents                 Show all objects on partition
+    partition showmechanism            Show available PKCS#11 mechanisms
+    partition showpolicies             Show partition policies
+    partition changepolicy -name <p> -value <v>  Change a partition policy
 
   Authentication:
     role login -name <co|cu|so>        Login as a role
     role logout                        Logout current role
-    role changepw -name <role>         Change role password
+    role changepw -name <role>         Change role password (requires old PIN)
+    role list                          List all roles on the partition
+    role show -name <so|co|cu>         Show state of a specific role
+    role init -name <co|cu>            Initialize a role (set PIN)
+    role deactivate -name <co|cu>      Deactivate a role (clear PIN)
+    role resetpw -name <co|cu>         Reset role PIN (SO only, no old PIN needed)
 
   Key Operations:
     key generate -kt <aes|rsa|ec|des3> -label <name> [-ks <size>] [-curve <name>]
