@@ -1588,14 +1588,41 @@ class LunaSHCommands:
     def cmd_sysconf(self, args: list):
         """Handle 'sysconf' commands."""
         if not args:
-            print("  Usage: sysconf timezone | banner | forceSOLogin | ssh | reboot | poweroff")
+            print("  Usage: sysconf timezone | banner | forceSOLogin | ssh | regenCert | appliance reboot | poweroff")
             return
         if not self._check_login():
             return
         sub = args[0]
         rest = args[1:]
 
-        if sub == "timezone":
+        if sub in ("regenCert", "regencert"):
+            if not self._check_role(ROLE_ADMIN):
+                return
+            force = "-force" in rest
+            csr = "-csr" in rest
+            if not force:
+                confirm = input("  Regenerate the NTLS server certificate? Existing NTLS connections will be broken. (yes/no): ")
+                if confirm.lower() != "yes":
+                    print("  Cancelled.")
+                    return
+            cert = self.appliance.connections.regenerate_ntls_cert()
+            print(f"  NTLS server certificate regenerated.")
+            print(f"    Subject:     {cert.get('subject', 'N/A')}")
+            print(f"    Serial:      {cert.get('serial', 'N/A')}")
+            print(f"    Fingerprint: {cert.get('fingerprint', 'N/A')}")
+            print(f"    Type:        {cert.get('type', 'N/A')}")
+            print(f"    Expiry:      {cert.get('expiry', 'N/A')}")
+            if csr:
+                print("  CSR option specified. Generate a CSR and have it signed by your CA.")
+                print("  On a real Luna 7, the -csr option outputs a CSR file for external CA signing.")
+            self._print_explain([
+                "Regenerating the NTLS server certificate creates a new self-signed",
+                "certificate and replaces the old one. All existing NTLS connections",
+                "must be re-established with the new certificate. On a real Luna 7,",
+                "the private and public keys are stored on the appliance file system.",
+            ])
+
+        elif sub == "timezone":
             if not rest:
                 config = self.appliance.get_sysconf()
                 print(f"  Current timezone: {config['timezone']}")
@@ -2723,6 +2750,7 @@ class LunaSHCommands:
     sysconf banner add <text> | clear | show  Manage login banner
     sysconf forceSOLogin enable|disable   Enable/disable forced SO login
     sysconf ssh port <port> | show         Configure SSH
+    sysconf regenCert [-csr] [-force]      Regenerate NTLS server certificate
     sysconf appliance reboot | poweroff    Reboot/poweroff appliance
 
   Services:

@@ -57,7 +57,7 @@ SUBCOMMANDS = {
     "network": ["show", "hostname", "interface", "dns", "route", "ping"],
     "ntls": ["show", "certificate", "connection", "ipcheck", "threads", "timer", "tcp_keepalive"],
     "stc": ["enable", "disable", "show", "status", "identity", "connection", "cipher", "hmac", "rekeyThreshold", "activationTimeOut", "convert", "admin"],
-    "sysconf": ["timezone", "banner", "forceSOLogin", "ssh", "appliance"],
+    "sysconf": ["timezone", "banner", "forceSOLogin", "ssh", "regenCert", "appliance"],
     "service": ["list", "start", "stop", "restart", "status"],
     "syslog": ["show", "severity", "rotate", "remotehost"],
     "my": ["password", "file", "public-key"],
