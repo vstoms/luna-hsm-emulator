@@ -83,7 +83,7 @@ Luna Backup HSM 7 emulation with STM recovery, cloning protocol, backup/restore,
 
 ### High Availability
 
-HA groups with member management, configurable retry/polling (including infinite polling), and key material synchronization across members.
+HA groups support round-robin and active/standby routing, automatic failover, manual or automatic recovery, retry tracking, simulated network partitions, partial synchronization failures, domain-based persistent-key replication, firmware/policy compatibility checks, and non-replicated session objects.
 
 ### Appliance Management (LunaSH)
 
@@ -130,7 +130,7 @@ pip install -r requirements.txt
 python tests/test_pkcs11.py -v
 ```
 
-All 290 tests should pass.
+All 298 tests should pass.
 
 ---
 
@@ -1285,7 +1285,8 @@ luna-hsm-emulator/
 │   ├── test_pkcs11.py       # PKCS#11 and appliance tests
 │   ├── test_ped.py          # PED authentication and quorum tests
 │   ├── test_domain.py       # Cloning domain and secure cloning tests
-│   └── test_lifecycle.py    # Partition lifecycle and quota tests
+│   ├── test_lifecycle.py    # Partition lifecycle and quota tests
+│   └── test_ha_behavior.py  # HA routing, failover, and synchronization tests
 ├── requirements.txt
 └── README.md
 ```
@@ -1365,9 +1366,10 @@ The suite covers:
 | `TestPEDManager` | 7 | PED colors, quorum, duplication, loss, remote PED, colored-role login |
 | `TestCloningDomains` | 7 | Domain inheritance/change, secure cloning, HA domain enforcement |
 | `TestPartitionLifecycle` | 9 | PPSO/legacy states, role hierarchy, deletion authorization, quotas |
+| `TestHABehavior` | 8 | Load balancing, failover, recovery, network failures, compatibility, session objects |
 
 ```
-Ran 290 tests in 4.1s
+Ran 298 tests in 4.1s
 
 OK
 ```

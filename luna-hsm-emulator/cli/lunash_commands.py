@@ -2548,12 +2548,16 @@ class LunaSHCommands:
         """Handle 'ha' commands — High Availability group management."""
         if not args:
             print("  Usage: ha list | create | delete | show | addmember | removemember |")
-            print("         setretry | setinterval | synchronize | status")
+            print("         setretry | setinterval | setmode | recovery | synchronize | status |")
+            print("         fail | recover | network | operation | firmware")
             return
         if not self._check_login():
             return
         sub = args[0]
         rest = args[1:]
+        if sub in ("setmode", "recovery", "fail", "recover", "network", "operation", "firmware"):
+            if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
+                return
 
         if sub == "list":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
@@ -2615,12 +2619,18 @@ class LunaSHCommands:
             print(f"  Group Name:        {group['name']}")
             print(f"  Label:             {group.get('label', '')}")
             print(f"  State:             {group['state']}")
+            print(f"  Mode:              {group['mode']}")
+            print(f"  Recovery Mode:     {group['recovery_mode']}")
             print(f"  Retry Count:       {group['retry_count']}{' (infinite)' if group['infinite_polling'] else ''}")
             print(f"  Poll Interval:     {group['poll_interval']}s")
-            print(f"  Members:")
-            for m in group["members"]:
+            print(f"  Operations:        {group['operation_count']}  Failovers: {group['failover_count']}")
+            print()
+            print(f"  {'Member':<8} {'Slot':<6} {'State':<13} {'Role':<9} {'Objects':<9} {'Last Sync':<20} {'Sync'}")
+            print("  " + "-" * 92)
+            for index, m in enumerate(group["members"], 1):
                 sync = m.get("last_sync") or "Never"
-                print(f"    Slot {m['slot_id']}: {m['partition']:<20} Serial: {m['serial']:<12} Status: {m['status']:<8} Objects: {m['objects']:<6} Last Sync: {sync}")
+                print(f"  {index:<8} {m['slot_id']:<6} {m['state']:<13} {m['role']:<9} "
+                      f"{len(self.appliance.deployment._token_objects(m['slot_id'])):<9} {sync:<20} {m['sync_status']}")
 
         elif sub == "addmember":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
@@ -2635,8 +2645,11 @@ class LunaSHCommands:
             if result["success"]:
                 print(f"  Member added to HA group '{name}': slot {slot}.")
                 if self.appliance.deployment.get_ha_group(name).get("synchronize_on_add"):
-                    self.appliance.deployment.synchronize_ha_group(name)
-                    print(f"  Group synchronized. All members now have {result['member']['objects']} object(s).")
+                    sync = self.appliance.deployment.synchronize_ha_group(name)
+                    if sync["success"]:
+                        print(f"  Group synchronized. Source has {sync['objects']} persistent object(s).")
+                    else:
+                        print(f"  Member added, but synchronization is partial: {sync.get('failures', sync.get('error'))}")
             else:
                 print(f"  Error: {result['error']}")
 
@@ -2683,6 +2696,65 @@ class LunaSHCommands:
             else:
                 print(f"  Error: {result['error']}")
 
+        elif sub == "setmode":
+            name = self._get_arg(rest, "-name")
+            mode = self._get_arg(rest, "-mode")
+            result = self.appliance.deployment.set_ha_mode(name, mode) if name and mode else {
+                "success": False, "error": "Usage: ha setmode -name <group> -mode <round-robin|active-standby>"}
+            print(f"  HA mode set to {result['mode']}." if result["success"] else f"  Error: {result['error']}")
+
+        elif sub == "recovery":
+            name = self._get_arg(rest, "-name")
+            mode = self._get_arg(rest, "-mode")
+            result = self.appliance.deployment.set_ha_recovery_mode(name, mode) if name and mode else {
+                "success": False, "error": "Usage: ha recovery -name <group> -mode <automatic|manual>"}
+            print(f"  Recovery mode set to {result['recovery_mode']}." if result["success"] else f"  Error: {result['error']}")
+
+        elif sub in ("fail", "recover"):
+            name = self._get_arg(rest, "-name")
+            slot = self._get_arg(rest, "-slot")
+            if not name or not slot:
+                print(f"  Usage: ha {sub} -name <group> -slot <id>")
+                return
+            result = (self.appliance.deployment.fail_ha_member(name, int(slot)) if sub == "fail"
+                      else self.appliance.deployment.recover_ha_member(name, int(slot)))
+            print(f"  Member {slot}: {result.get('state', 'recovery complete')}." if result["success"]
+                  else f"  Error: {result['error']}")
+
+        elif sub == "network":
+            name = self._get_arg(rest, "-name")
+            slot = self._get_arg(rest, "-slot")
+            state = self._get_arg(rest, "-state")
+            if not name or not slot or state not in ("partitioned", "restored"):
+                print("  Usage: ha network -name <group> -slot <id> -state <partitioned|restored>")
+                return
+            result = self.appliance.deployment.set_ha_network_partition(
+                name, int(slot), state == "partitioned")
+            print(f"  Member {slot} network state: {state}." if result["success"] else f"  Error: {result['error']}")
+
+        elif sub == "operation":
+            name = self._get_arg(rest, "-name")
+            operation = self._get_arg(rest, "-operation") or "crypto-operation"
+            session_object = "-sessionobject" in rest
+            result = self.appliance.deployment.route_ha_operation(name, operation, session_object) if name else {
+                "success": False, "error": "Usage: ha operation -name <group> [-operation <name>] [-sessionobject]"}
+            if result["success"]:
+                print(f"  Operation '{operation}' routed to slot {result['slot_id']} ({result['serial']}).")
+                if session_object:
+                    print("  Session object remains on the selected member and is not replicated.")
+            else:
+                print(f"  Error: {result['error']}")
+
+        elif sub == "firmware":
+            name = self._get_arg(rest, "-name")
+            slot = self._get_arg(rest, "-slot")
+            version = self._get_arg(rest, "-version")
+            if not name or not slot or not version:
+                print("  Usage: ha firmware -name <group> -slot <id> -version <version>")
+                return
+            result = self.appliance.deployment.set_ha_member_firmware(name, int(slot), version)
+            print(f"  Member firmware set to {version}." if result["success"] else f"  Error: {result['error']}")
+
         elif sub == "synchronize":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
                 return
@@ -2696,13 +2768,15 @@ class LunaSHCommands:
                 print(f"  Members: {result['members']}, Objects per member: {result['objects']}")
                 print(f"  Timestamp: {result['timestamp']}")
                 self._print_explain([
-                    "Synchronization copies key material from the source partition",
-                    "to all member partitions so they can serve identical requests.",
-                    "On a real Luna 7, this uses the cloning protocol over the",
-                    "partition's configured cloning domain.",
+                    "Synchronization copies persistent key material from the source partition",
+                    "to compatible, reachable members using the cloning domain.",
+                    "Session objects are deliberately not replicated.",
                 ])
             else:
-                print(f"  Error: {result['error']}")
+                if result.get("partial"):
+                    print(f"  Partial synchronization failure: {result['failures']}")
+                else:
+                    print(f"  Error: {result['error']}")
 
         elif sub == "status":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
@@ -2715,10 +2789,17 @@ class LunaSHCommands:
             if result["success"]:
                 print(f"  HA Group:          {result['name']}")
                 print(f"  State:             {result['state']}")
-                print(f"  Members:           {result['members']} ({result['active_members']} active)")
+                print(f"  Mode:              {result['mode']} ({result['recovery_mode']} recovery)")
+                print(f"  Members:           {result['members']} ({result['active_members']} available)")
                 print(f"  Retry Count:       {result['retry_count']}")
                 print(f"  Poll Interval:     {result['poll_interval']}s")
-                print(f"  Infinite Polling:  {'Yes' if result['infinite_polling'] else 'No'}")
+                print(f"  Operations:        {result['operation_count']}  Failovers: {result['failover_count']}")
+                print()
+                print(f"  {'Member':<8} {'Slot':<6} {'State':<13} {'Objects':<9} {'Last Sync':<20} {'Sync'}")
+                print("  " + "-" * 82)
+                for index, member in enumerate(result["member_status"], 1):
+                    print(f"  {index:<8} {member['slot_id']:<6} {member['state']:<13} "
+                          f"{member['objects']:<9} {(member.get('last_sync') or 'Never'):<20} {member['sync_status']}")
             else:
                 print(f"  Error: {result['error']}")
 
@@ -3165,8 +3246,14 @@ class LunaSHCommands:
     ha removemember -name <n> -slot <id>  Remove a member from an HA group
     ha setretry -name <n> -retry <count|-1>  Set retry count (-1 for infinite polling)
     ha setinterval -name <n> -interval <s>  Set polling interval in seconds
-    ha synchronize -name <n>             Synchronize all members in an HA group
-    ha status -name <n>                   Show HA group status
+    ha setmode -name <n> -mode <round-robin|active-standby>
+    ha recovery -name <n> -mode <automatic|manual>
+    ha synchronize -name <n>             Synchronize persistent objects across members
+    ha operation -name <n> -operation <op>  Route a load-balanced operation
+    ha fail|recover -name <n> -slot <id>  Fail or recover a member
+    ha network -name <n> -slot <id> -state <partitioned|restored>
+    ha firmware -name <n> -slot <id> -version <v>  Simulate member firmware
+    ha status -name <n>                   Show member availability and sync status
 
   NTP:
     ntp show                               Show NTP configuration

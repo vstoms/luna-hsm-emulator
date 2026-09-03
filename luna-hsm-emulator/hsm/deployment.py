@@ -2,6 +2,7 @@
 
 import json
 import time
+import hashlib
 from typing import Optional
 
 from hsm.domain import CloningDomainManager, CloningDomainError
@@ -58,12 +59,49 @@ class DeploymentManager:
     # HA groups
     # ------------------------------------------------------------------
 
+    def _token_objects(self, slot_id: int) -> list:
+        """Return persistent objects only; PKCS#11 session objects never replicate."""
+        return [(obj, material) for obj, material in self.storage.get_all_objects(slot_id)
+                if obj.is_token_object()]
+
+    def _policy_fingerprint(self, slot_id: int) -> str:
+        from hsm.policies import POLICY_CATALOG
+        stored = self.storage.get_partition_policies(slot_id)
+        effective = {p.policy_id: stored.get(p.policy_id, p.default_value)
+                     for p in POLICY_CATALOG}
+        return hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:16].upper()
+
+    def _normalize_ha_group(self, group: dict) -> dict:
+        """Upgrade HA groups persisted by earlier emulator versions in place."""
+        group.setdefault("mode", "round-robin")
+        group.setdefault("recovery_mode", "automatic")
+        group.setdefault("round_robin_cursor", 0)
+        group.setdefault("operation_count", 0)
+        group.setdefault("failover_count", 0)
+        group.setdefault("last_operation", None)
+        for index, member in enumerate(group.get("members", [])):
+            member.setdefault("state", member.get("status", "active"))
+            member.setdefault("status", member["state"])
+            member.setdefault("role", "active" if group["mode"] == "round-robin" or index == 0 else "standby")
+            member.setdefault("sync_status", "current" if member.get("last_sync") else "not-synchronized")
+            member.setdefault("network_partition", False)
+            member.setdefault("failure_reason", None)
+            member.setdefault("retry_attempts", 0)
+            member.setdefault("firmware", self.storage.get_meta("firmware_version") or "7.13.0")
+            member.setdefault("policy_fingerprint", self._policy_fingerprint(member["slot_id"]))
+        return group
+
+    def _save_ha_group(self, groups: dict, group: dict):
+        groups[group["name"]] = group
+        self._write("ha_groups", groups)
+
     def list_ha_groups(self) -> list:
         groups = self._read("ha_groups", {})
-        return list(groups.values())
+        return [self._normalize_ha_group(group) for group in groups.values()]
 
     def get_ha_group(self, name: str) -> Optional[dict]:
-        return self._read("ha_groups", {}).get(name)
+        group = self._read("ha_groups", {}).get(name)
+        return self._normalize_ha_group(group) if group else None
 
     def create_ha_group(self, name: str, slot_id: int, label: str = "") -> dict:
         groups = self._read("ha_groups", {})
@@ -80,13 +118,27 @@ class DeploymentManager:
             "poll_interval": 0,
             "infinite_polling": False,
             "synchronize_on_add": True,
+            "mode": "round-robin",
+            "recovery_mode": "automatic",
+            "round_robin_cursor": 0,
+            "operation_count": 0,
+            "failover_count": 0,
+            "last_operation": None,
             "members": [{
                 "slot_id": slot_id,
                 "serial": f"HA-{slot_id:04d}",
                 "partition": partition["name"],
                 "status": "active",
-                "objects": self.storage.count_objects(slot_id),
+                "state": "active",
+                "role": "active",
+                "objects": len(self._token_objects(slot_id)),
                 "last_sync": None,
+                "sync_status": "current",
+                "network_partition": False,
+                "failure_reason": None,
+                "retry_attempts": 0,
+                "firmware": self.storage.get_meta("firmware_version") or "7.13.0",
+                "policy_fingerprint": self._policy_fingerprint(slot_id),
             }],
             "domain_fingerprint": self.domains.get_partition_domain(slot_id)["fingerprint"],
             "created_at": time.time(),
@@ -108,6 +160,7 @@ class DeploymentManager:
         group = groups.get(group_name)
         if group is None:
             return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
         partition = self.storage.get_partition(slot_id)
         if partition is None:
             return {"success": False, "error": f"Partition slot {slot_id} not found"}
@@ -117,13 +170,30 @@ class DeploymentManager:
             self.domains.assert_matching(group["members"][0]["slot_id"], slot_id)
         except CloningDomainError as exc:
             return {"success": False, "error": str(exc), "code": exc.code}
+        source = group["members"][0]
+        firmware = self.storage.get_meta("firmware_version") or "7.13.0"
+        policy_fingerprint = self._policy_fingerprint(slot_id)
+        if firmware != source["firmware"]:
+            return {"success": False, "error": "LUNA_RET_HA_FIRMWARE_MISMATCH: member firmware is incompatible",
+                    "code": "LUNA_RET_HA_FIRMWARE_MISMATCH"}
+        if policy_fingerprint != self._policy_fingerprint(source["slot_id"]):
+            return {"success": False, "error": "LUNA_RET_HA_POLICY_MISMATCH: partition policies are incompatible",
+                    "code": "LUNA_RET_HA_POLICY_MISMATCH"}
         group["members"].append({
             "slot_id": slot_id,
             "serial": serial or f"HA-{slot_id:04d}",
             "partition": partition["name"],
             "status": "active",
-            "objects": self.storage.count_objects(slot_id),
+            "state": "active",
+            "role": "active" if group["mode"] == "round-robin" else "standby",
+            "objects": len(self._token_objects(slot_id)),
             "last_sync": None,
+            "sync_status": "out-of-sync",
+            "network_partition": False,
+            "failure_reason": None,
+            "retry_attempts": 0,
+            "firmware": firmware,
+            "policy_fingerprint": policy_fingerprint,
         })
         self._write("ha_groups", groups)
         return {"success": True, "member": group["members"][-1]}
@@ -141,6 +211,191 @@ class DeploymentManager:
         group["members"] = members
         self._write("ha_groups", groups)
         return {"success": True}
+
+    def set_ha_mode(self, group_name: str, mode: str) -> dict:
+        """Select round-robin load balancing or active/standby routing."""
+        if mode not in ("round-robin", "active-standby"):
+            return {"success": False, "error": "Mode must be round-robin or active-standby"}
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        group["mode"] = mode
+        for index, member in enumerate(group["members"]):
+            member["role"] = "active" if mode == "round-robin" or index == 0 else "standby"
+        self._save_ha_group(groups, group)
+        return {"success": True, "mode": mode}
+
+    def set_ha_recovery_mode(self, group_name: str, mode: str) -> dict:
+        if mode not in ("automatic", "manual"):
+            return {"success": False, "error": "Recovery mode must be automatic or manual"}
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        group["recovery_mode"] = mode
+        self._save_ha_group(groups, group)
+        return {"success": True, "recovery_mode": mode}
+
+    def _find_ha_member(self, group: dict, slot_id: int):
+        return next((member for member in group["members"] if member["slot_id"] == slot_id), None)
+
+    def fail_ha_member(self, group_name: str, slot_id: int, reason: str = "simulated failure") -> dict:
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        member = self._find_ha_member(group, slot_id)
+        if member is None:
+            return {"success": False, "error": f"Slot {slot_id} is not an HA member"}
+        member.update({"state": "unavailable", "status": "unavailable",
+                       "sync_status": "out-of-sync", "failure_reason": reason})
+        if member["role"] == "active":
+            replacement = next((m for m in group["members"]
+                                if m is not member and m["state"] in ("active", "standby")), None)
+            if replacement:
+                if group["mode"] == "active-standby":
+                    replacement["role"] = "active"
+                    member["role"] = "standby"
+                group["failover_count"] += 1
+        group["state"] = "degraded"
+        self._save_ha_group(groups, group)
+        return {"success": True, "slot_id": slot_id, "state": member["state"]}
+
+    def set_ha_network_partition(self, group_name: str, slot_id: int, partitioned: bool) -> dict:
+        if partitioned:
+            result = self.fail_ha_member(group_name, slot_id, "simulated network partition")
+            if not result["success"]:
+                return result
+            groups = self._read("ha_groups", {})
+            group = self._normalize_ha_group(groups[group_name])
+            self._find_ha_member(group, slot_id)["network_partition"] = True
+            self._save_ha_group(groups, group)
+            return result
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        member = self._find_ha_member(group, slot_id)
+        if member is None:
+            return {"success": False, "error": f"Slot {slot_id} is not an HA member"}
+        member["network_partition"] = False
+        member["failure_reason"] = None
+        member["state"] = "recovering"
+        member["status"] = "recovering"
+        self._save_ha_group(groups, group)
+        if group["recovery_mode"] == "automatic":
+            return self.recover_ha_member(group_name, slot_id)
+        return {"success": True, "slot_id": slot_id, "state": "recovering"}
+
+    def check_ha_compatibility(self, group_name: str, slot_id: int,
+                               source_slot: int = None) -> dict:
+        group = self.get_ha_group(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        member = self._find_ha_member(group, slot_id)
+        if member is None:
+            return {"success": False, "error": f"Slot {slot_id} is not an HA member"}
+        source = (self._find_ha_member(group, source_slot) if source_slot is not None
+                  else group["members"][0])
+        errors = []
+        try:
+            self.domains.assert_matching(source["slot_id"], slot_id)
+        except CloningDomainError as exc:
+            errors.append(str(exc))
+        current_firmware = member.get("firmware")
+        if current_firmware != source.get("firmware"):
+            errors.append("LUNA_RET_HA_FIRMWARE_MISMATCH")
+        source_policy = self._policy_fingerprint(source["slot_id"])
+        current_policy = self._policy_fingerprint(slot_id)
+        if current_policy != source_policy:
+            errors.append("LUNA_RET_HA_POLICY_MISMATCH")
+        return {"success": not errors, "compatible": not errors, "errors": errors}
+
+    def set_ha_member_firmware(self, group_name: str, slot_id: int, firmware: str) -> dict:
+        """Set a per-member simulated firmware version for compatibility training."""
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        member = self._find_ha_member(group, slot_id)
+        if member is None:
+            return {"success": False, "error": f"Slot {slot_id} is not an HA member"}
+        member["firmware"] = firmware
+        self._save_ha_group(groups, group)
+        return {"success": True, "firmware": firmware}
+
+    def route_ha_operation(self, group_name: str, operation: str,
+                           session_object: bool = False) -> dict:
+        """Route an operation to a healthy member with load balancing/failover."""
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        eligible = [m for m in group["members"]
+                    if m["state"] in ("active", "standby") and not m["network_partition"]]
+        if not eligible:
+            return {"success": False, "error": "LUNA_RET_HA_NO_AVAILABLE_MEMBER",
+                    "code": "LUNA_RET_HA_NO_AVAILABLE_MEMBER"}
+        if group["mode"] == "round-robin":
+            index = group["round_robin_cursor"] % len(eligible)
+            member = eligible[index]
+            group["round_robin_cursor"] = (index + 1) % len(eligible)
+        else:
+            member = next((m for m in eligible if m["role"] == "active"), eligible[0])
+            if member["role"] != "active":
+                member["role"] = "active"
+                group["failover_count"] += 1
+        group["operation_count"] += 1
+        group["last_operation"] = {"operation": operation, "slot_id": member["slot_id"],
+                                   "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                                   "session_object": bool(session_object)}
+        self._save_ha_group(groups, group)
+        return {"success": True, "slot_id": member["slot_id"], "serial": member["serial"],
+                "operation": operation, "load_balanced": group["mode"] == "round-robin",
+                "session_object_replicated": False if session_object else None}
+
+    def recover_ha_member(self, group_name: str, slot_id: int) -> dict:
+        groups = self._read("ha_groups", {})
+        group = groups.get(group_name)
+        if group is None:
+            return {"success": False, "error": f"HA group '{group_name}' not found"}
+        group = self._normalize_ha_group(group)
+        member = self._find_ha_member(group, slot_id)
+        if member is None:
+            return {"success": False, "error": f"Slot {slot_id} is not an HA member"}
+        if member["network_partition"]:
+            return {"success": False, "error": "Member remains isolated by a network partition"}
+        compatibility = self.check_ha_compatibility(group_name, slot_id)
+        if not compatibility["compatible"]:
+            member.update({"state": "incompatible", "status": "incompatible",
+                           "sync_status": "out-of-sync",
+                           "failure_reason": ", ".join(compatibility["errors"])})
+            self._save_ha_group(groups, group)
+            return {"success": False, "error": member["failure_reason"], "partial": True}
+        source = next((m for m in group["members"]
+                       if m["slot_id"] != slot_id and m["state"] in ("active", "standby")), None)
+        if source:
+            try:
+                self.domains.clone_objects(source["slot_id"], slot_id, token_objects_only=True)
+            except Exception as exc:
+                member["failure_reason"] = str(exc)
+                member["sync_status"] = "partial"
+                self._save_ha_group(groups, group)
+                return {"success": False, "error": str(exc), "partial": True}
+        member.update({"state": "active", "status": "active", "sync_status": "current",
+                       "failure_reason": None, "retry_attempts": 0,
+                       "objects": len(self._token_objects(slot_id)),
+                       "last_sync": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+        group["state"] = "active" if all(m["state"] in ("active", "standby") for m in group["members"]) else "degraded"
+        self._save_ha_group(groups, group)
+        return {"success": True, "slot_id": slot_id, "state": member["state"]}
 
     def set_ha_retry(self, group_name: str, retry_count: int) -> dict:
         if retry_count < -1:
@@ -166,48 +421,89 @@ class DeploymentManager:
         return {"success": True, "poll_interval": seconds}
 
     def synchronize_ha_group(self, name: str) -> dict:
+        """Replicate persistent keys independently and report partial failures."""
         groups = self._read("ha_groups", {})
         group = groups.get(name)
         if group is None:
             return {"success": False, "error": f"HA group '{name}' not found"}
+        group = self._normalize_ha_group(group)
         if not group["members"]:
             return {"success": False, "error": f"HA group '{name}' has no members"}
+        source = next((m for m in group["members"]
+                       if m["state"] in ("active", "standby") and not m["network_partition"]), None)
+        if source is None:
+            return {"success": False, "error": "LUNA_RET_HA_NO_AVAILABLE_MEMBER"}
 
-        source_slot = group["members"][0]["slot_id"]
-        cloned = 0
-        try:
-            for member in group["members"][1:]:
-                result = self.domains.clone_objects(source_slot, member["slot_id"])
-                cloned += len(result["cloned"])
-        except Exception as exc:
-            # Keep Luna-style domain errors intact while returning the existing
-            # DeploymentManager result shape used by the CLI.
-            return {"success": False, "error": str(exc),
-                    "code": getattr(exc, "code", "LUNA_RET_HA_SYNCHRONIZE_FAILED")}
-
-        source_objects = self.storage.count_objects(source_slot)
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        source["objects"] = len(self._token_objects(source["slot_id"]))
+        source["last_sync"] = timestamp
+        source["sync_status"] = "current"
+        cloned = 0
+        failures = []
         for member in group["members"]:
-            member["objects"] = self.storage.count_objects(member["slot_id"])
-            member["last_sync"] = timestamp
-            member["status"] = "active"
-        self._write("ha_groups", groups)
-        return {"success": True, "group": name, "objects": source_objects,
-                "cloned": cloned, "members": len(group["members"]), "timestamp": timestamp}
+            if member is source:
+                continue
+            if member["network_partition"]:
+                member["retry_attempts"] += 1
+                member["sync_status"] = "out-of-sync"
+                failures.append({"slot_id": member["slot_id"], "error": "network partition"})
+                continue
+            if member["state"] == "unavailable" and group["recovery_mode"] == "manual":
+                member["retry_attempts"] += 1
+                failures.append({"slot_id": member["slot_id"], "error": member["failure_reason"] or "unavailable"})
+                continue
+            compatibility = self.check_ha_compatibility(
+                name, member["slot_id"], source_slot=source["slot_id"])
+            if not compatibility["compatible"]:
+                member.update({"state": "incompatible", "status": "incompatible",
+                               "sync_status": "out-of-sync",
+                               "failure_reason": ", ".join(compatibility["errors"])})
+                failures.append({"slot_id": member["slot_id"], "error": member["failure_reason"]})
+                continue
+            try:
+                result = self.domains.clone_objects(
+                    source["slot_id"], member["slot_id"], token_objects_only=True)
+                cloned += len(result["cloned"])
+                member.update({"state": "active", "status": "active", "sync_status": "current",
+                               "objects": len(self._token_objects(member["slot_id"])),
+                               "last_sync": timestamp, "failure_reason": None, "retry_attempts": 0})
+            except Exception as exc:
+                member["sync_status"] = "partial"
+                member["failure_reason"] = str(exc)
+                member["retry_attempts"] += 1
+                failures.append({"slot_id": member["slot_id"], "error": str(exc)})
+
+        group["state"] = "degraded" if failures else "active"
+        self._save_ha_group(groups, group)
+        return {"success": not failures, "partial": bool(failures), "group": name,
+                "objects": source["objects"], "cloned": cloned,
+                "members": len(group["members"]), "failures": failures,
+                "timestamp": timestamp}
 
     def get_ha_status(self, name: str) -> dict:
         group = self.get_ha_group(name)
         if group is None:
             return {"success": False, "error": f"HA group '{name}' not found"}
+        members = []
+        for member in group["members"]:
+            data = dict(member)
+            data["objects"] = len(self._token_objects(member["slot_id"]))
+            members.append(data)
         return {
             "success": True,
             "name": name,
             "state": group["state"],
-            "members": len(group["members"]),
-            "active_members": sum(1 for m in group["members"] if m["status"] == "active"),
+            "mode": group["mode"],
+            "recovery_mode": group["recovery_mode"],
+            "members": len(members),
+            "member_status": members,
+            "active_members": sum(1 for m in members if m["state"] in ("active", "standby")),
             "retry_count": group["retry_count"],
             "poll_interval": group["poll_interval"],
             "infinite_polling": group["infinite_polling"],
+            "operation_count": group["operation_count"],
+            "failover_count": group["failover_count"],
+            "last_operation": group["last_operation"],
         }
 
     # ------------------------------------------------------------------

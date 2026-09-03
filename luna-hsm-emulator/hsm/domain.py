@@ -157,7 +157,7 @@ class CloningDomainManager:
         return bool(stored.get(policy.policy_id, policy.default_value))
 
     def clone_objects(self, source_slot: int, destination_slot: int,
-                      labels: list = None) -> dict:
+                      labels: list = None, token_objects_only: bool = False) -> dict:
         if source_slot == destination_slot:
             raise PKCS11Error(CKR_ARGUMENTS_BAD, "Source and destination partitions must differ")
         if self.storage.get_partition(source_slot) is None:
@@ -170,6 +170,8 @@ class CloningDomainManager:
         cloned, skipped_policy, skipped_existing = [], [], []
         source_objects = self.storage.get_all_objects(source_slot)
         for obj, material in source_objects:
+            if token_objects_only and not obj.is_token_object():
+                continue
             if labels and obj.label() not in labels:
                 continue
             object_class = obj.get(CKA_CLASS)

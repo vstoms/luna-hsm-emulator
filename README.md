@@ -7,7 +7,7 @@ A fully functional software emulator of the Thales Luna 7 Network HSM, built for
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![PKCS#11](https://img.shields.io/badge/PKCS%2311-v2.40-green)](https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html)
 [![License](https://img.shields.io/badge/License-Educational-orange)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-290%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-298%20passing-brightgreen)](#testing)
 
 </div>
 
@@ -130,7 +130,24 @@ Luna Backup HSM 7 emulation with STM recovery, secure cloning-based backup/resto
 
 ### High Availability
 
-HA groups with member management, configurable retry/polling (including infinite polling), and domain-validated key synchronization across members.
+HA groups now model operational behavior as well as configuration:
+
+- Round-robin load balancing and active/standby routing modes
+- Automatic failover with operation and failover counters
+- Per-member active, standby, unavailable, recovering, and incompatible states
+- Automatic or manual failed-member recovery with retry tracking
+- Cloning-domain key replication and per-member synchronization status
+- Partial synchronization results when only some members can be updated
+- Simulated network partitions and restoration
+- Firmware and partition-policy compatibility checks
+- Session objects remain local to the selected member and are never replicated
+
+```text
+ha status -name production-ha
+ha operation -name production-ha -operation sign
+ha network -name production-ha -slot 2 -state partitioned
+ha recover -name production-ha -slot 2
+```
 
 ### Appliance Management (LunaSH)
 
@@ -669,8 +686,9 @@ luna-hsm-emulator/
 ├── tests/
 │   ├── test_pkcs11.py           # PKCS#11 and appliance tests
 │   ├── test_ped.py              # PED and quorum tests
-│   ├── test_domain.py           # Domain, cloning, and HA tests
-│   └── test_lifecycle.py        # Partition lifecycle and quota tests
+│   ├── test_domain.py           # Domain and cloning tests
+│   ├── test_lifecycle.py        # Partition lifecycle and quota tests
+│   └── test_ha_behavior.py      # HA routing, failover, and synchronization tests
 ├── requirements.txt
 └── README.md
 ```
@@ -718,9 +736,10 @@ The suite covers:
 | `TestPEDManager` | 7 | PED colors, quorum, duplication, loss, remote PED, colored-role login |
 | `TestCloningDomains` | 7 | Domain inheritance/change, secure cloning, HA domain enforcement |
 | `TestPartitionLifecycle` | 9 | PPSO/legacy states, role hierarchy, deletion authorization, quotas |
+| `TestHABehavior` | 8 | Load balancing, failover, recovery, network failures, compatibility, session objects |
 
 ```
-Ran 290 tests in 4.1s
+Ran 298 tests in 4.1s
 
 OK
 ```
