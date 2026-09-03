@@ -24,6 +24,8 @@ This handler implements the major LunaSH command groups:
 import getpass
 import time
 
+from cli.prompts import confirm_proceed
+
 from hsm.appliance import (
     Appliance, ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR, ROLE_AUDIT, ALL_ROLES,
     ROLE_DESCRIPTIONS,
@@ -261,9 +263,10 @@ class LunaSHCommands:
         elif sub == "factoryReset":
             if not self._check_role(ROLE_ADMIN):
                 return
-            confirm = input("  WARNING: Factory reset will erase ALL data. Type 'FACTORYRESET' to confirm: ")
-            if confirm != "FACTORYRESET":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    "Are you sure you wish to reset this HSM to factory default settings?",
+                    "All partitions and data will be erased.",
+                    force="-force" in rest):
                 return
             if self.api:
                 self.api.tokens.factory_reset()
@@ -275,9 +278,10 @@ class LunaSHCommands:
         elif sub == "zeroize":
             if not self._check_role(ROLE_ADMIN):
                 return
-            confirm = input("  WARNING: Zeroize will permanently destroy ALL key material. Type 'ZEROIZE' to confirm: ")
-            if confirm != "ZEROIZE":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    "Are you sure you wish to zeroize this HSM?",
+                    "All partitions and key material will be permanently destroyed.",
+                    force="-force" in rest):
                 return
             if self.api:
                 self.api.tokens.factory_reset()
@@ -563,9 +567,9 @@ class LunaSHCommands:
             if not name:
                 print("  Usage: partition delete -name <name>")
                 return
-            confirm = input(f"  Delete partition '{name}'? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to delete the partition named: {name}",
+                    force="-force" in rest):
                 return
             try:
                 if self.api:
@@ -652,9 +656,9 @@ class LunaSHCommands:
             if not name:
                 print("  Usage: partition clear -name <name>")
                 return
-            confirm = input(f"  Clear ALL objects on partition '{name}'? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to delete all objects on partition: {name}",
+                    force="-force" in rest):
                 return
             if self.api:
                 p = self.api.storage.get_partition_by_name(name)
@@ -780,10 +784,12 @@ class LunaSHCommands:
                 object_count = (sum(self.api.storage.count_objects(p["slot_id"])
                                     for p in self.api.storage.get_all_partitions())
                                 if target_hsm else self.api.storage.count_objects(slot_id))
-                force = False
-                if object_count:
-                    confirm = input("  Domain change will zeroize affected objects. Type 'DOMAINCHANGE' to continue: ")
-                    force = confirm == "DOMAINCHANGE"
+                force = "-force" in rest
+                if object_count and not force:
+                    if not confirm_proceed(
+                            "Changing the cloning domain will zeroize all affected objects."):
+                        return
+                    force = True
                 if target_hsm:
                     if inherit:
                         raise CloningDomainError("LUNA_RET_INVALID_DOMAIN", "-inherit is valid only for partitions")
@@ -845,9 +851,9 @@ class LunaSHCommands:
             if not username:
                 print("  Usage: user delete -name <username>")
                 return
-            confirm = input(f"  Delete user '{username}'? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to delete the user: {username}",
+                    force="-force" in rest):
                 return
             result = self.appliance.delete_user(username)
             if result["success"]:
@@ -1630,9 +1636,10 @@ class LunaSHCommands:
             if not client or not slot:
                 print("  Usage: stc convert -client <name> -slot <id>")
                 return
-            confirm = input(f"  Convert NTLS connection for '{client}' on slot {slot} to STC? This is irreversible. (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to convert the NTLS connection for client",
+                    f"'{client}' on slot {slot} to STC?  This operation is irreversible.",
+                    force="-force" in rest):
                 return
             result = self.appliance.connections.convert_ntls_to_stc(client, int(slot))
             if result["success"]:
@@ -1907,11 +1914,11 @@ class LunaSHCommands:
             email = self._get_arg(rest, "-email")
             san = self._get_arg(rest, "-san")
 
-            if not force:
-                confirm = input("  Regenerate the NTLS server certificate? Existing NTLS connections will be broken. (yes/no): ")
-                if confirm.lower() != "yes":
-                    print("  Cancelled.")
-                    return
+            if not confirm_proceed(
+                    "Are you sure you wish to regenerate the NTLS server certificate?",
+                    "All existing NTLS connections will be broken.",
+                    force=force):
+                return
 
             result = self.appliance.renew_ntls_certificate(
                 hostname=hostname, key_type=key_type, key_size=key_size,
@@ -2033,17 +2040,15 @@ class LunaSHCommands:
             if rest[0] == "reboot":
                 if not self._check_role(ROLE_ADMIN):
                     return
-                confirm = input("  Reboot appliance? (yes/no): ")
-                if confirm.lower() == "yes":
+                if confirm_proceed("Are you sure you wish to reboot the appliance?",
+                                   force="-force" in rest):
                     result = self.appliance.reboot()
                     print(f"  {result['message']}")
-                else:
-                    print("  Cancelled.")
             elif rest[0] == "poweroff":
                 if not self._check_role(ROLE_ADMIN):
                     return
-                confirm = input("  Power off appliance? (yes/no): ")
-                if confirm.lower() == "yes":
+                if confirm_proceed("Are you sure you wish to power off the appliance?",
+                                   force="-force" in rest):
                     result = self.appliance.poweroff()
                     print(f"  {result['message']}")
                 else:
@@ -2309,11 +2314,9 @@ class LunaSHCommands:
             print(f"  File '{filename}' deleted.")
 
         elif sub == "erase":
-            confirm = input("  Erase all package files? (yes/no): ")
-            if confirm.lower() == "yes":
+            if confirm_proceed("Are you sure you wish to erase all package files?",
+                               force="-force" in args[1:]):
                 print("  All package files erased.")
-            else:
-                print("  Cancelled.")
 
         else:
             print(f"  Unknown package subcommand: {sub}")
@@ -2394,13 +2397,13 @@ class LunaSHCommands:
             elif bsub == "factoryReset":
                 if not self._check_role(ROLE_ADMIN):
                     return
-                confirm = input("  Factory reset backup HSM? Type 'BACKUPRESET' to confirm: ")
-                if confirm == "BACKUPRESET":
+                if confirm_proceed(
+                        "Are you sure you wish to reset the backup HSM to factory default settings?",
+                        "All backup partitions and data will be erased.",
+                        force="-force" in brest):
                     if self.api:
                         self.api.backup.factory_reset(audit=self.api.audit)
                         print("  Backup HSM reset to factory defaults.")
-                else:
-                    print("  Cancelled.")
 
             elif bsub == "partition":
                 if not brest:
@@ -2518,13 +2521,11 @@ class LunaSHCommands:
                 if not self.appliance.is_audit_logged_in():
                     print("  Error: Auditor login required.")
                     return
-                confirm = input("  Clear ALL audit logs? (yes/no): ")
-                if confirm.lower() == "yes":
+                if confirm_proceed("Are you sure you wish to clear all audit logs?",
+                                   force="-force" in args[2:]):
                     if self.api:
                         self.api.storage.clear_audit_logs()
                         print("  Audit logs cleared.")
-                else:
-                    print("  Cancelled.")
             elif lsub == "tail":
                 if self.api:
                     logs = self.api.storage.get_audit_logs()

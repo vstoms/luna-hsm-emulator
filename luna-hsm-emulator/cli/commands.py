@@ -11,6 +11,8 @@ import getpass
 import binascii
 from typing import Optional
 
+from cli.prompts import confirm_proceed
+
 from pkcs11.constants import (
     CKR_OK, PKCS11Error, ckr_name, cka_name, ckm_name, cko_name, ckk_name,
     CKA_CLASS, CKA_TOKEN, CKA_LABEL, CKA_VALUE_LEN, CKA_KEY_TYPE,
@@ -271,9 +273,9 @@ class CommandHandler:
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            confirm = input("  Delete ALL objects on this partition? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    "Are you sure you wish to delete all objects on this partition?",
+                    force="-force" in args):
                 return
             try:
                 count = self.api.tokens.clear_partition(
@@ -343,11 +345,9 @@ class CommandHandler:
                     old_val = stored.get(policy.policy_id, policy.default_value)
                     _, _, is_destr = validate_policy_change_safe(policy, old_val, int(value) if str(value).isdigit() else (1 if str(value).lower() in ("on","1","true","yes") else 0))
                     if is_destr and not force:
-                        print(f"  WARNING: Changing policy '{policy.name}' is DESTRUCTIVE!")
-                        print(f"  This will delete ALL objects on the partition.")
-                        confirm = input("  Type 'DESTROY' to confirm: ")
-                        if confirm != "DESTROY":
-                            print("  Cancelled.")
+                        if not confirm_proceed(
+                                f"Changing the policy '{policy.name}' is destructive.",
+                                "All objects on the partition will be deleted."):
                             return
                         force = True
                 self.api.tokens.change_policy(
@@ -617,9 +617,10 @@ class CommandHandler:
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            confirm = input(f"  Deactivate role '{role_name}' while retaining its credential? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to deactivate the role '{role_name}'?",
+                    "Its credential will be retained.",
+                    force="-force" in args):
                 return
             actor = self.api.auth.get_role(self.session_id) if self.session_id else None
             try:
@@ -870,9 +871,9 @@ class CommandHandler:
             return
         try:
             obj, _ = self.api.keystore.retrieve_by_label(self.active_slot, label)
-            confirm = input(f"  Delete key '{label}' (handle 0x{obj.handle:08X})? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to destroy the object with label:",
+                    f"'{label}' (handle 0x{obj.handle:08X})?"):
                 return
             self.api.C_DestroyObject(self.session_id, obj.handle)
             print(f"  Key '{label}' deleted.")
@@ -1199,12 +1200,10 @@ class CommandHandler:
             if sub == "show":
                 print(self.api.audit.show())
             elif sub == "clear":
-                confirm = input("  Clear all audit entries? (yes/no): ")
-                if confirm.lower() == "yes":
+                if confirm_proceed("Are you sure you wish to clear all audit entries?",
+                                   force="-force" in args):
                     self.api.audit.clear()
                     print("  Audit log cleared.")
-                else:
-                    print("  Cancelled.")
             elif sub == "verify":
                 valid = self.api.audit.verify_chain()
                 print(f"  Audit chain integrity: {'VERIFIED' if valid else 'BROKEN'}")
@@ -1240,14 +1239,14 @@ class CommandHandler:
         elif sub == "firmware":
             self._hsm_firmware(args[1:])
         elif sub == "factoryreset":
-            confirm = input("  WARNING: This will delete ALL partitions, keys, and audit logs.\n  Type 'FACTORYRESET' to confirm: ")
-            if confirm == "FACTORYRESET":
+            if confirm_proceed(
+                    "Are you sure you wish to reset this HSM to factory default settings?",
+                    "All partitions, keys, and audit logs will be erased.",
+                    force="-force" in args):
                 self.api.tokens.factory_reset()
                 self.active_slot = None
                 self.session_id = None
                 print("  HSM reset to factory defaults.")
-            else:
-                print("  Cancelled.")
         elif sub == "export":
             outfile = self._get_arg(args[1:], "-file")
             if not outfile:
@@ -1338,9 +1337,10 @@ class CommandHandler:
                 return
 
             # Confirm
-            confirm = input(f"  Upgrade firmware from {pre['current_version']} to {target}? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Upgrade cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to upgrade the firmware from",
+                    f"{pre['current_version']} to {target}?",
+                    force="-force" in args):
                 return
 
             # Perform upgrade with staged progress
@@ -1384,9 +1384,9 @@ class CommandHandler:
                 return
             last = history[-1]
             print(f"  Last upgrade: {last['from_version']} -> {last['to_version']}")
-            confirm = input(f"  Roll back to {last['from_version']}? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Rollback cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to roll back the firmware to {last['from_version']}?",
+                    force="-force" in args):
                 return
 
             result = self.api.tokens.rollback_firmware(audit=self.api.audit)
@@ -1599,9 +1599,10 @@ class CommandHandler:
                 return
             domain = domain or self.api.tokens.domains.get_partition_domain(int(slot))["domain_id"]
             labels = labels_str.split(",") if labels_str else None
-            confirm = input(f"  Restore objects to slot {slot}? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to restore objects to slot {slot}?",
+                    "Existing objects with matching labels may be affected.",
+                    force="-force" in rest):
                 return
             try:
                 result = self.api.backup.restore_objects(
@@ -1633,14 +1634,14 @@ class CommandHandler:
             if not self.api.backup.is_connected():
                 print("  No backup HSM connected. Use 'backup connect' first.")
                 return
-            confirm = input("  WARNING: This will erase ALL backup partitions and reset the backup HSM.\n  Type 'BACKUPRESET' to confirm: ")
-            if confirm == "BACKUPRESET":
+            if confirm_proceed(
+                    "Are you sure you wish to reset the backup HSM to factory default settings?",
+                    "All backup partitions and data will be erased.",
+                    force="-force" in args):
                 self.api.backup.factory_reset(
                     audit=self.api.audit, session_id=self.session_id or 0
                 )
                 print("  Backup HSM reset to factory defaults.")
-            else:
-                print("  Cancelled.")
 
         else:
             print(f"  Unknown backup subcommand: {sub}")
@@ -1724,9 +1725,9 @@ class CommandHandler:
             if not target:
                 print("  Usage: backup firmware upgrade -version <version>")
                 return
-            confirm = input(f"  Upgrade backup HSM firmware to {target}? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    f"Are you sure you wish to upgrade the backup HSM firmware to {target}?",
+                    force="-force" in rest):
                 return
             try:
                 result = self.api.backup.upgrade_firmware(
@@ -1742,9 +1743,10 @@ class CommandHandler:
                 print(f"  Error: {e}")
 
         elif sub == "rollback":
-            confirm = input("  WARNING: Rollback will ERASE all backup partitions (zeroize). Continue? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
+            if not confirm_proceed(
+                    "Are you sure you wish to roll back the backup HSM firmware?",
+                    "Rollback will zeroize the backup HSM and erase all backup partitions.",
+                    force="-force" in rest):
                 return
             try:
                 result = self.api.backup.rollback_firmware(

@@ -695,7 +695,7 @@ key list
 
 # Factory reset (destroys everything)
 hsm factoryreset
-# Type 'FACTORYRESET' to confirm
+# Type 'proceed' to continue, or 'quit' to quit now (add -force to skip the prompt)
 
 # Verify everything is gone
 partition list
@@ -827,7 +827,7 @@ partition changepolicy -policy 25 -value 5
 
 # Try to enable private key wrapping (destructive — requires confirmation)
 partition changepolicy -policy 1 -value 1
-# This will warn: DESTRUCTIVE! Type 'DESTROY' to confirm.
+# This is destructive — a CAUTION block appears; type 'proceed' to continue, or 'quit' to quit now.
 
 # Mutual exclusion: cloning and wrapping cannot both be On
 # First disable cloning, then enable wrapping
