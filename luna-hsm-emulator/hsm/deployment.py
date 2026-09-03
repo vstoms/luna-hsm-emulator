@@ -401,11 +401,19 @@ class DeploymentManager:
         if retry_count < -1:
             return {"success": False, "error": "Retry count must be -1 or greater"}
         groups = self._read("ha_groups", {})
-        group = groups.get(group_name)
-        if group is None:
-            return {"success": False, "error": f"HA group '{group_name}' not found"}
-        group["retry_count"] = retry_count
-        group["infinite_polling"] = retry_count == -1
+        if group_name is None:
+            settings = self._read("ha_client_settings", {})
+            settings["retry_count"] = retry_count
+            self._write("ha_client_settings", settings)
+            for group in groups.values():
+                group["retry_count"] = retry_count
+                group["infinite_polling"] = retry_count == -1
+        else:
+            group = groups.get(group_name)
+            if group is None:
+                return {"success": False, "error": f"HA group '{group_name}' not found"}
+            group["retry_count"] = retry_count
+            group["infinite_polling"] = retry_count == -1
         self._write("ha_groups", groups)
         return {"success": True, "retry_count": retry_count, "infinite_polling": retry_count == -1}
 
@@ -413,10 +421,17 @@ class DeploymentManager:
         if seconds < 0:
             return {"success": False, "error": "Polling interval cannot be negative"}
         groups = self._read("ha_groups", {})
-        group = groups.get(group_name)
-        if group is None:
-            return {"success": False, "error": f"HA group '{group_name}' not found"}
-        group["poll_interval"] = seconds
+        if group_name is None:
+            settings = self._read("ha_client_settings", {})
+            settings["poll_interval"] = seconds
+            self._write("ha_client_settings", settings)
+            for group in groups.values():
+                group["poll_interval"] = seconds
+        else:
+            group = groups.get(group_name)
+            if group is None:
+                return {"success": False, "error": f"HA group '{group_name}' not found"}
+            group["poll_interval"] = seconds
         self._write("ha_groups", groups)
         return {"success": True, "poll_interval": seconds}
 

@@ -2,8 +2,9 @@
 
 Roles:
   - HSO  (HSM Security Officer)  — full administrative access
-  - SO   (Partition Security Officer) — partition-level admin
-  - CO   (Crypto Officer)         — key management
+  - PO   (Partition Security Officer) — partition-level admin
+  - CO   (Crypto Officer)
+  - LCO  (Limited Crypto Officer)      — V1 per-key operations         — key management
   - CU   (Crypto User)            — cryptographic operations only
 
 PIN-based authentication with configurable lockout (default 10 attempts).
@@ -22,18 +23,22 @@ from pkcs11.constants import (
 
 # Role constants
 ROLE_HSO = "HSO"
-ROLE_SO = "SO"
+ROLE_SO = "SO"       # Internal/storage name; exposed by LunaCM as PO.
+ROLE_PO = ROLE_SO
 ROLE_CO = "CO"
+ROLE_LCO = "LCO"
 ROLE_CU = "CU"
 
-MIN_PIN_LEN = 4
-MAX_PIN_LEN = 32
+MIN_PIN_LEN = 8
+MAX_PIN_LEN = 255
 
 # Maps CLI role names to internal role
 ROLE_MAP = {
     "hso": ROLE_HSO,
-    "so": ROLE_SO,
+    "po": ROLE_PO,
+    "so": ROLE_SO,  # Backward-compatible emulator alias.
     "co": ROLE_CO,
+    "lco": ROLE_LCO,
     "cu": ROLE_CU,
 }
 
@@ -78,7 +83,8 @@ class AuthManager:
         if self.ped.get_auth_mode() == "ped":
             serial_text, separator, shared_secret = (pin or "").partition("|")
             serials = [value.strip() for value in serial_text.split(",") if value.strip()]
-            key_type = {ROLE_SO: "blue", ROLE_CO: "black", ROLE_CU: "gray"}.get(role)
+            key_type = {ROLE_SO: "blue", ROLE_CO: "black",
+                        ROLE_LCO: "black", ROLE_CU: "gray"}.get(role)
             try:
                 self.ped.authenticate(key_type, serials,
                                       shared_secret if separator else None,
@@ -88,10 +94,13 @@ class AuthManager:
             self._sessions[session_id] = (slot_id, role)
             return
 
-        # Validate PIN length
-        if len(pin) < MIN_PIN_LEN or len(pin) > MAX_PIN_LEN:
+        # Policy 25 stores minimum length as (255 - desired length).
+        policies = self.storage.get_partition_policies(slot_id)
+        minimum = 255 - policies.get(25, 247)
+        maximum = policies.get(26, 255)
+        if len(pin) < minimum or len(pin) > maximum:
             raise PKCS11Error(CKR_PIN_LEN_RANGE,
-                              f"PIN must be {MIN_PIN_LEN}-{MAX_PIN_LEN} characters")
+                              f"PIN must be {minimum}-{maximum} characters")
 
         # Check lockout
         lock_key = f"{role.lower()}_locked"
@@ -152,8 +161,12 @@ class AuthManager:
 
     def set_pin(self, slot_id: int, role: str, pin: str):
         """Set or change the PIN for a role on a partition."""
-        if len(pin) < MIN_PIN_LEN or len(pin) > MAX_PIN_LEN:
-            raise PKCS11Error(CKR_PIN_LEN_RANGE)
+        policies = self.storage.get_partition_policies(slot_id)
+        minimum = 255 - policies.get(25, 247)
+        maximum = policies.get(26, 255)
+        if len(pin) < minimum or len(pin) > maximum:
+            raise PKCS11Error(CKR_PIN_LEN_RANGE,
+                              f"PIN must be {minimum}-{maximum} characters")
         pin_hash, pin_salt = self.storage.hash_pin(pin)
         self.storage.update_partition(slot_id, **{
             f"{role.lower()}_pin_hash": pin_hash,

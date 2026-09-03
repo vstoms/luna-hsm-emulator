@@ -85,7 +85,7 @@ class TestPartitionLifecycle(unittest.TestCase):
         self.api.tokens.reset_pin(slot, "CO", "new-password", actor_role=ROLE_SO)
         with self.assertRaises(PKCS11Error):
             self.api.tokens.reset_pin(slot, "SO", "new-so", actor_role=ROLE_SO)
-        self.api.tokens.reset_pin(slot, "SO", "new-so", actor_role=ROLE_HSO)
+        self.api.tokens.reset_pin(slot, "SO", "new-so-password", actor_role=ROLE_HSO)
 
     def test_locked_role_is_reset_by_partition_so(self):
         slot = self.api.tokens.create_partition("locked")
@@ -137,7 +137,7 @@ class TestPartitionLifecycle(unittest.TestCase):
         slot = self.api.tokens.create_partition("app1", max_objects=7, max_storage=4096)
         output = self.api.tokens.show_partition_info(slot)
         for text in ("Partition Type:", "Lifecycle State:", "Domain Initialized:",
-                     "Object Quota:", "Storage Quota:", "SO  UNINITIALIZED",
+                     "Object Quota:", "Storage Quota:", "PO  UNINITIALIZED",
                      "CO  UNINITIALIZED", "CU  UNINITIALIZED"):
             self.assertIn(text, output)
 

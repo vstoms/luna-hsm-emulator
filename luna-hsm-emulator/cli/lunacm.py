@@ -5,11 +5,13 @@ that mimics the real lunacm utility for educational purposes.
 """
 
 import cmd
+import shlex
 import sys
 import os
 import getpass
 
 from cli.commands import CommandHandler
+from cli.output import invoke_with_result
 from pkcs11.api import PKCS11API
 from storage.db import Storage
 from pkcs11.constants import CKR_OK
@@ -30,7 +32,7 @@ class LunaCMShell(cmd.Cmd):
   Type 'help' for command reference, 'exit' to quit.
 """
 
-    prompt = "LunaCM Emulator v7.x > "
+    prompt = "lunacm:> "
 
     def __init__(self, api: PKCS11API, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -42,30 +44,43 @@ class LunaCMShell(cmd.Cmd):
 
     def _run(self, line: str):
         """Parse and run a command line."""
-        parts = line.split()
+        try:
+            parts = shlex.split(line)
+        except ValueError as error:
+            print(f"  Syntax Error: {error}")
+            return
         if not parts:
             return
-        cmd_name = parts[0].lower()
+        aliases = {"a": "appid", "ccfg": "clientconfig", "f": "file",
+                   "ha": "hagroup", "par": "partition", "p": "ped",
+                   "rb": "remotebackup", "ro": "role", "s": "slot",
+                   "r": "srk", "stcc": "stcconfig"}
+        cmd_name = aliases.get(parts[0].lower(), parts[0].lower())
         rest = parts[1:]
 
         dispatch = {
-            "slot": self.handler.cmd_slot,
+            "appid": self.handler.cmd_unavailable,
+            "clientconfig": self.handler.cmd_unavailable,
+            "file": self.handler.cmd_unavailable,
+            "hagroup": self.handler.cmd_hagroup,
             "partition": self.handler.cmd_partition,
+            "ped": self.handler.cmd_unavailable,
+            "remotebackup": self.handler.cmd_unavailable,
             "role": self.handler.cmd_role,
-            "key": self.handler.cmd_key,
-            "crypto": self.handler.cmd_crypto,
-            "audit": self.handler.cmd_audit,
-            "hsm": self.handler.cmd_hsm,
-            "backup": self.handler.cmd_backup,
+            "slot": self.handler.cmd_slot,
+            "srk": self.handler.cmd_unavailable,
+            "stc": self.handler.cmd_unavailable,
+            "stcconfig": self.handler.cmd_unavailable,
+            "stm": self.handler.cmd_unavailable,
             "help": self.handler.cmd_help,
+            "?": self.handler.cmd_help,
         }
 
         handler = dispatch.get(cmd_name)
         if handler:
-            try:
-                handler(rest)
-            except Exception as e:
-                print(f"  Error: {e}")
+            invoke_with_result(handler, rest,
+                               "Command Result : No Error",
+                               "Command Result : 1 (Failure)")
         elif cmd_name in ("exit", "quit", "bye"):
             print("  Exiting lunacm emulator.")
             return True
@@ -104,45 +119,15 @@ class LunaCMShell(cmd.Cmd):
     def do_role(self, arg):
         self._run(f"role {arg}" if arg else "role")
 
-    def do_key(self, arg):
-        self._run(f"key {arg}" if arg else "key")
-
-    def do_crypto(self, arg):
-        self._run(f"crypto {arg}" if arg else "crypto")
-
-    def do_audit(self, arg):
-        self._run(f"audit {arg}" if arg else "audit")
-
-    def do_hsm(self, arg):
-        self._run(f"hsm {arg}" if arg else "hsm")
-
-    def do_backup(self, arg):
-        self._run(f"backup {arg}" if arg else "backup")
-
     # ------------------------------------------------------------------
     # Tab completion
     # ------------------------------------------------------------------
 
+    def completenames(self, text, *ignored):
+        """Real LunaCM does not provide partial-command tab completion."""
+        return []
+
     def completedefault(self, text, line, begidx, endidx):
-        """Default completion for subcommands."""
-        parts = line.split()
-        if len(parts) <= 1:
-            return []
-        cmd_name = parts[0].lower()
-        subcommands = {
-            "slot": ["list", "set"],
-            "partition": ["create", "delete", "list", "showinfo", "init", "changelabel", "clear", "contents", "showmechanism", "showpolicies", "changepolicy", "policytemplate"],
-            "role": ["login", "logout", "changepw", "list", "show", "init", "deactivate", "resetpw"],
-            "key": ["generate", "list", "show", "delete", "wrap", "unwrap"],
-            "crypto": ["encrypt", "decrypt", "sign", "verify", "digest"],
-            "audit": ["log"],
-            "hsm": ["show", "factoryreset", "export", "import", "firmware"],
-            "backup": ["connect", "disconnect", "show", "init", "login", "logout", "list",
-                       "create-partition", "backup", "restore", "stm", "firmware", "factoryreset"],
-        }
-        subs = subcommands.get(cmd_name, [])
-        if len(parts) == 2 or (len(parts) == 1 and not text):
-            return [s for s in subs if s.startswith(text)]
         return []
 
     def completedefault_old(self, text, line, begidx, endidx):
@@ -160,9 +145,9 @@ class LunaCMShell(cmd.Cmd):
     # ------------------------------------------------------------------
 
     def postloop(self):
-        if self.handler.session_id is not None:
+        for session_id in set(self.handler._slot_sessions.values()):
             try:
-                self.handler.api.C_CloseSession(self.handler.session_id)
+                self.handler.api.C_CloseSession(session_id)
             except Exception:
                 pass
 
@@ -176,9 +161,9 @@ def run_shell(api: PKCS11API):
         print("\n  Use 'exit' to quit.")
         shell.cmdloop()
     finally:
-        if shell.handler.session_id is not None:
+        for session_id in set(shell.handler._slot_sessions.values()):
             try:
-                api.C_CloseSession(shell.handler.session_id)
+                api.C_CloseSession(session_id)
             except Exception:
                 pass
 
@@ -186,29 +171,35 @@ def run_shell(api: PKCS11API):
 def run_command(api: PKCS11API, command_line: str):
     """Run a single command non-interactively."""
     handler = CommandHandler(api)
-    # Parse the command line
-    parts = command_line.split()
+    try:
+        parts = shlex.split(command_line)
+    except ValueError as error:
+        print(f"  Syntax Error: {error}")
+        return
     if not parts:
         return
-    cmd_name = parts[0].lower()
+    aliases = {"a": "appid", "ccfg": "clientconfig", "f": "file",
+               "ha": "hagroup", "par": "partition", "p": "ped",
+               "rb": "remotebackup", "ro": "role", "s": "slot",
+               "r": "srk", "stcc": "stcconfig"}
+    cmd_name = aliases.get(parts[0].lower(), parts[0].lower())
     rest = parts[1:]
     dispatch = {
-        "slot": handler.cmd_slot,
-        "partition": handler.cmd_partition,
-        "role": handler.cmd_role,
-        "key": handler.cmd_key,
-        "crypto": handler.cmd_crypto,
-        "audit": handler.cmd_audit,
-        "hsm": handler.cmd_hsm,
-        "backup": handler.cmd_backup,
-        "help": handler.cmd_help,
+        "appid": handler.cmd_unavailable, "audit": handler.cmd_audit,
+        "clientconfig": handler.cmd_unavailable, "file": handler.cmd_unavailable,
+        "hagroup": handler.cmd_hagroup, "hsm": handler.cmd_hsm,
+        "partition": handler.cmd_partition, "ped": handler.cmd_unavailable,
+        "remotebackup": handler.cmd_unavailable, "role": handler.cmd_role,
+        "slot": handler.cmd_slot, "srk": handler.cmd_unavailable,
+        "stc": handler.cmd_unavailable, "stcconfig": handler.cmd_unavailable,
+        "stm": handler.cmd_unavailable, "help": handler.cmd_help,
+        "?": handler.cmd_help,
     }
     h = dispatch.get(cmd_name)
     if h:
-        try:
-            h(rest)
-        except Exception as e:
-            print(f"  Error: {e}")
+        invoke_with_result(h, rest,
+                           "Command Result : No Error",
+                           "Command Result : 1 (Failure)")
     elif cmd_name in ("exit", "quit"):
         pass
     else:

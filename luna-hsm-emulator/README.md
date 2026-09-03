@@ -32,8 +32,8 @@ Full implementation of `C_Initialize` through `C_DeriveKey` — sessions, slots,
 
 | Shell | Purpose | Access |
 |-------|---------|--------|
-| **lunacm** | Client-side PKCS#11 configuration manager — keys, crypto, partitions, audit | Local console |
-| **lunash** | Server-side appliance shell — users, network, NTLS, STC, clients, services, HA, licenses | SSH-style |
+| **lunacm** | Client-side Luna configuration manager — slots, partitions, roles, clients, HA groups, PED/STC/STM | Local console |
+| **lunash** | Server-side appliance shell — users, HSM/partition administration, network, NTLS/STC, and services | SSH-style |
 
 Both shells support tab-completion, command shortnames, and `--explain` mode for educational output.
 
@@ -60,21 +60,26 @@ Both channels support full lifecycle: create, connect, disconnect, restore. NTLS
 ### Partition Management & Policies
 
 - PPSO and legacy partition workflows with uninitialized, roles-pending, ready, and deactivated states
-- Separate SO, CO, and CU initialization, activation, lockout, and superior-role reset rules
+- V0 and V1 partitions with PO, CO, CU, and V1-only LCO role lifecycle
+- Independent HSM SO and partition PO identities, lockouts, and zeroization behavior
+- Separate Luna 7 HSM and partition policy catalogs with documented IDs and PIN-policy encoding
+- Independent cloning domains initialized during the partition-init ceremony
+- Extended Domain Management (policy 44), labeled secondary domains, and CPv4 negotiation
+- Scalable Key Storage authenticated blobs, SMK cloning, and SMK rollover for V1 partitions
 - HSM SO-authorized deletion and enforced object/persisted-byte quotas
 - Comprehensive status via `partition show -partition <name>`
-- **30-policy catalog** matching Luna 7 capabilities, including destructive changes and mutual exclusion
 - **Partition Policy Templates (PPT)** — predefined sets (FIPS Strict, High Security, Development, Backup Ready) plus custom templates
 
 ### Role-Based Authentication
 
-Four-role hierarchy with PIN lockout policies and PED (PIN Entry Device) simulation:
+Luna role hierarchy with PIN lockout policies and PED (PIN Entry Device) simulation:
 
 | Role | Capabilities |
 |------|-------------|
 | **HSO** (HSM Security Officer) | Full HSM administration, factory reset, partition creation |
-| **SO** (Partition Security Officer) | Partition initialization, PIN management |
+| **PO** (Partition Security Officer; internally PKCS#11 SO) | Partition initialization and role administration |
 | **CO** (Crypto Officer) | Key generation, deletion, wrapping, attribute management |
+| **LCO** (Limited Crypto Officer, V1 only) | Constrained key-management role |
 | **CU** (Crypto User) | Cryptographic operations only (encrypt, decrypt, sign, verify) |
 
 ### Backup HSM
@@ -83,7 +88,7 @@ Luna Backup HSM 7 emulation with STM recovery, cloning protocol, backup/restore,
 
 ### High Availability
 
-HA groups support round-robin and active/standby routing, automatic failover, manual or automatic recovery, retry tracking, simulated network partitions, partial synchronization failures, domain-based persistent-key replication, firmware/policy compatibility checks, and non-replicated session objects.
+Client-side `lunacm:> hagroup` management supports round-robin and active/standby routing, automatic failover, manual or automatic recovery, retry tracking, simulated network partitions, partial synchronization failures, domain-based persistent-key replication, firmware/policy compatibility checks, and non-replicated session objects.
 
 ### Appliance Management (LunaSH)
 

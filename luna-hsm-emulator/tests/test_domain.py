@@ -26,6 +26,8 @@ class TestCloningDomains(unittest.TestCase):
         self.api.C_Initialize()
         self.source = self.api.tokens.create_partition("source", "Source")
         self.destination = self.api.tokens.create_partition("destination", "Destination")
+        self.api.tokens.init_token(self.source, "source-password", "Source", "shared-domain")
+        self.api.tokens.init_token(self.destination, "destination-password", "Destination", "shared-domain")
 
     def tearDown(self):
         self.api.C_Finalize()
@@ -39,10 +41,10 @@ class TestCloningDomains(unittest.TestCase):
         )
         return session
 
-    def test_new_partitions_inherit_hsm_domain(self):
+    def test_initialized_partitions_have_explicit_matching_domains(self):
         source = self.api.tokens.show_cloning_domain(self.source)
         destination = self.api.tokens.show_cloning_domain(self.destination)
-        self.assertTrue(source["inherited"])
+        self.assertFalse(source["inherited"])
         self.assertEqual(source["domain_id"], destination["domain_id"])
 
     def test_direct_clone_preserves_non_extractable_key(self):
@@ -87,6 +89,44 @@ class TestCloningDomains(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["cloned"], 1)
         self.assertIsNotNone(self.storage.get_object_by_label(self.destination, "ha-key")[0])
+
+    def test_extended_domains_negotiate_cpv4(self):
+        self.api.tokens.change_policy(
+            self.source, "ALLOW_EXTENDED_DOMAIN_MANAGEMENT", 1, force=True)
+        self.api.tokens.change_policy(
+            self.destination, "ALLOW_EXTENDED_DOMAIN_MANAGEMENT", 1, force=True)
+        secondary = self.api.tokens.domains.domain_from_secret("secondary-shared")
+        self.api.tokens.domains.add_domain(self.source, secondary, "migration")
+        # Make destination primary differ, but add the shared secondary domain.
+        self.api.tokens.set_cloning_domain(
+            self.destination,
+            self.api.tokens.domains.domain_from_secret("different-primary"), force=True)
+        self.api.tokens.domains.add_domain(self.destination, secondary, "shared")
+        self._generate_key("cpv4-key")
+        result = self.api.tokens.clone_partition(self.source, self.destination)
+        self.assertEqual(result["cloning_protocol"], "CPv4")
+        self.assertEqual(result["domain_label"], "migration")
+
+    def test_extended_domains_limit_and_original_domain_protection(self):
+        self.api.tokens.change_policy(
+            self.source, "ALLOW_EXTENDED_DOMAIN_MANAGEMENT", 1, force=True)
+        domains = self.api.tokens.domains
+        domains.add_domain(self.source, domains.domain_from_secret("second"), "second")
+        domains.add_domain(self.source, domains.domain_from_secret("third"), "third", primary=True)
+        with self.assertRaises(CloningDomainError):
+            domains.add_domain(self.source, domains.domain_from_secret("fourth"), "fourth")
+        with self.assertRaises(CloningDomainError):
+            domains.delete_domain(self.source, "")
+        self.assertTrue(domains.list_domains(self.source)[2]["primary"])
+
+    def test_disabling_extended_domains_removes_secondary_domains(self):
+        self.api.tokens.change_policy(
+            self.source, "ALLOW_EXTENDED_DOMAIN_MANAGEMENT", 1, force=True)
+        self.api.tokens.domains.add_domain(
+            self.source, self.api.tokens.domains.domain_from_secret("secondary"), "extra")
+        self.api.tokens.change_policy(
+            self.source, "ALLOW_EXTENDED_DOMAIN_MANAGEMENT", 0, force=True)
+        self.assertEqual(len(self.api.tokens.domains.list_domains(self.source)), 1)
 
     def test_ha_rejects_and_does_not_sync_mismatched_domains(self):
         appliance = Appliance(self.storage)

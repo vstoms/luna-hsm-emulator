@@ -16,63 +16,51 @@ LunaSH features emulated:
 """
 
 import cmd
+import shlex
 import sys
 
 from cli.lunash_commands import LunaSHCommands
+from cli.output import invoke_with_result
 from hsm.appliance import Appliance
 from pkcs11.api import PKCS11API
 
 
 # Command shortname mapping (matches real LunaSH shortcuts)
 COMMAND_SHORTCUTS = {
-    "a": "audit",
-    "cli": "client",
-    "hs": "hsm",
-    "m": "my",
-    "ne": "network",
-    "nt": "ntls",
-    "pac": "package",
-    "par": "partition",
-    "se": "service",
-    "sta": "status",
-    "sysc": "sysconf",
-    "sysl": "syslog",
-    "u": "user",
-    "t": "token",
-    "ha": "ha",
-    "ntp": "ntp",
-    "bond": "bond",
-    "lic": "license",
-    "ped": "ped",
+    "a": "audit", "cli": "client", "clu": "cluster", "hs": "hsm",
+    "k": "keyring", "m": "my", "ne": "network", "nt": "ntls",
+    "pac": "package", "par": "partition", "se": "service",
+    "sta": "status", "stc": "stc", "sysc": "sysconf",
+    "sysl": "syslog", "u": "user", "w": "webserver",
 }
 
 # Subcommand completions per top-level command
 SUBCOMMANDS = {
     "status": ["cpu", "mem", "disk", "date", "time", "interface", "ps", "netstat", "sensors"],
-    "hsm": ["login", "logout", "show", "init", "factoryReset", "zeroize", "firmware",
-            "showPolicies", "changePolicy", "stm", "ped", "selfTest", "time", "information", "supportInfo"],
-    "partition": ["list", "create", "delete", "show", "init", "showPolicies",
-                  "changePolicy", "clear", "activate", "deactivate", "rename", "resize",
-                  "domain", "clone"],
+    "hsm": ["backup", "changePolicy", "changePw", "checkCertificates", "displayLicenses",
+            "factoryReset", "firmware", "fm", "generateDAK", "information", "init", "login",
+            "logout", "ped", "qos", "restart", "restore", "selfTest", "setLegacyDomain", "show",
+            "showPolicies", "stc", "stm", "supportInfo", "tamper", "time", "update", "zeroize"],
+    "partition": ["activate", "backup", "changePolicy", "changePw", "clear", "create",
+                  "createChallenge", "deactivate", "delete", "init", "list", "rename", "resize",
+                  "restore", "show", "showContents", "showPolicies", "stcIdentity"],
     "user": ["list", "add", "delete", "enable", "disable", "password"],
     "client": ["list", "register", "delete", "show", "assignPartition", "revokePartition"],
     "network": ["show", "hostname", "interface", "dns", "route", "ping"],
     "ntls": ["show", "bind", "unbind", "certificate", "connection", "ipcheck", "threads", "timer", "tcp_keepalive"],
     "stc": ["enable", "disable", "show", "status", "identity", "connection", "cipher", "hmac", "rekeyThreshold", "activationTimeOut", "convert", "admin"],
-    "sysconf": ["timezone", "banner", "forceSOLogin", "ssh", "regenCert", "appliance"],
+    "sysconf": ["appliance", "banner", "config", "ctc", "drift", "fingerprint",
+                "forceSOLogin", "installCert", "license", "ntp", "radius", "regenCert",
+                "reimage", "scp", "snmp", "ssh", "time", "timezone", "tls", "user"],
     "service": ["list", "start", "stop", "restart", "status"],
     "syslog": ["show", "severity", "rotate", "remotehost"],
     "my": ["password", "file", "public-key"],
     "package": ["list", "verify", "update", "listfile", "deletefile", "erase"],
     "token": ["backup"],
     "audit": ["login", "logout", "show", "log"],
-    "ha": ["list", "create", "delete", "show", "addmember", "removemember",
-           "setretry", "setinterval", "setmode", "recovery", "synchronize", "status",
-           "fail", "recover", "network", "operation", "firmware"],
-    "ntp": ["show", "add", "delete", "enable", "disable", "sync"],
-    "bond": ["show", "configure", "enable", "disable", "delete"],
-    "license": ["list", "show", "setlimit", "enable", "disable"],
-    "ped": ["show", "connect", "disconnect", "key"],
+    "cluster": ["admin", "backup", "client", "config", "create", "delete", "disable", "enable", "join", "leave", "list", "member", "restore", "show", "status"],
+    "keyring": ["create", "delete", "disable", "enable", "list", "reset", "show", "unlock"],
+    "webserver": ["bind", "certificate", "ciphers", "disable", "enable", "groups", "origin", "show"],
 }
 
 
@@ -106,32 +94,62 @@ class LunaSHShell(cmd.Cmd):
         if user:
             hostname = self.appliance.storage.get_meta("appliance_hostname") or "luna7"
             hsm_state = " (HSO)" if self.appliance.is_hsm_logged_in() else ""
-            self.prompt = f"{user.username}@{hostname}{hsm_state}> "
+            self.prompt = f"[{hostname}] lunash:>{hsm_state} "
         else:
-            self.prompt = "luna7 (not logged in)> "
+            self.prompt = "login as: "
 
     # ------------------------------------------------------------------
     # Command dispatch
     # ------------------------------------------------------------------
 
     def _resolve_command(self, name: str) -> str:
-        """Resolve a command shortname to its full name."""
+        """Resolve documented shortcuts and unambiguous LunaSH prefixes."""
         name = name.lower()
         if name in COMMAND_SHORTCUTS:
             return COMMAND_SHORTCUTS[name]
+        commands = set(SUBCOMMANDS) | {"help"}
+        if name in commands:
+            return name
+        matches = sorted(command for command in commands if command.startswith(name))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            print(f"  Ambiguous command '{name}': {', '.join(matches)}")
+            return ""
         return name
 
     def _run(self, line: str):
         """Parse and run a command line."""
-        parts = line.split()
+        try:
+            parts = shlex.split(line)
+        except ValueError as error:
+            print(f"  Syntax Error: {error}")
+            return
         if not parts:
             return
+        if parts[0].lower() == "tb":
+            parts = ["token", "backup", *parts[1:]]
+        if not self.appliance.is_logged_in():
+            invoke_with_result(self.handler.cmd_login, [parts[0]],
+                               "Command Result : 0 (Success)",
+                               "Command Result : 1 (Failure)")
+            self._update_prompt()
+            return
         cmd_name = self._resolve_command(parts[0])
+        if not cmd_name:
+            return
         rest = parts[1:]
+        if rest and not rest[0].startswith("-") and cmd_name in SUBCOMMANDS:
+            token = rest[0].lower()
+            choices = SUBCOMMANDS[cmd_name]
+            matches = [choice for choice in choices if choice.lower().startswith(token)]
+            if len(matches) == 1:
+                rest[0] = matches[0]
+            elif len(matches) > 1 and token not in {choice.lower() for choice in choices}:
+                print(f"  Ambiguous subcommand '{rest[0]}': {', '.join(matches)}")
+                return
 
         dispatch = {
-            "login": self.handler.cmd_login,
-            "logout": self.handler.cmd_logout,
             "status": self.handler.cmd_status,
             "hsm": self.handler.cmd_hsm,
             "partition": self.handler.cmd_partition,
@@ -147,20 +165,18 @@ class LunaSHShell(cmd.Cmd):
             "package": self.handler.cmd_package,
             "token": self.handler.cmd_token,
             "audit": self.handler.cmd_audit,
-            "ha": self.handler.cmd_ha,
-            "ntp": self.handler.cmd_ntp,
-            "bond": self.handler.cmd_bond,
-            "license": self.handler.cmd_license,
-            "ped": self.handler.cmd_ped,
+            "cluster": self.handler.cmd_unavailable,
+            "keyring": self.handler.cmd_unavailable,
+            "webserver": self.handler.cmd_unavailable,
             "help": self.handler.cmd_help,
+            "?": self.handler.cmd_help,
         }
 
         handler = dispatch.get(cmd_name)
         if handler:
-            try:
-                handler(rest)
-            except Exception as e:
-                print(f"  Error: {e}")
+            invoke_with_result(handler, rest,
+                               "Command Result : 0 (Success)",
+                               "Command Result : 1 (Failure)")
             self._update_prompt()
         elif cmd_name in ("exit", "quit", "bye"):
             print("  Exiting LunaSH.")
@@ -191,12 +207,6 @@ class LunaSHShell(cmd.Cmd):
         self.handler.cmd_help([])
 
     # Custom command handlers
-    def do_login(self, arg):
-        self._run("login")
-
-    def do_logout(self, arg):
-        self._run("logout")
-
     def do_status(self, arg):
         self._run(f"status {arg}" if arg else "status")
 
@@ -303,7 +313,11 @@ def run_lunash(appliance: Appliance, api: PKCS11API = None):
 def run_lunash_command(appliance: Appliance, api: PKCS11API, command_line: str):
     """Run a single LunaSH command non-interactively."""
     handler = LunaSHCommands(appliance, api)
-    parts = command_line.split()
+    try:
+        parts = shlex.split(command_line)
+    except ValueError as error:
+        print(f"  Syntax Error: {error}")
+        return
     if not parts:
         return
 
@@ -314,8 +328,6 @@ def run_lunash_command(appliance: Appliance, api: PKCS11API, command_line: str):
 
     rest = parts[1:]
     dispatch = {
-        "login": handler.cmd_login,
-        "logout": handler.cmd_logout,
         "status": handler.cmd_status,
         "hsm": handler.cmd_hsm,
         "partition": handler.cmd_partition,
@@ -340,10 +352,9 @@ def run_lunash_command(appliance: Appliance, api: PKCS11API, command_line: str):
     }
     h = dispatch.get(cmd_name)
     if h:
-        try:
-            h(rest)
-        except Exception as e:
-            print(f"  Error: {e}")
+        invoke_with_result(h, rest,
+                           "Command Result : 0 (Success)",
+                           "Command Result : 1 (Failure)")
     elif cmd_name in ("exit", "quit"):
         pass
     else:

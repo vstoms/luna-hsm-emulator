@@ -666,12 +666,12 @@ class TestFirmwareUpgrade(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["new_version"], "7.12.0")
 
-    def test_factory_reset_clears_firmware(self):
-        """Test that factory reset restores default firmware version."""
+    def test_factory_reset_preserves_firmware(self):
+        """Factory reset does not roll back installed firmware."""
         self.api.tokens.perform_firmware_upgrade("7.15.0", audit=self.api.audit)
         self.api.tokens.factory_reset()
-        self.assertEqual(self.api.tokens._get_firmware_version(), "7.13.0")
-        self.assertEqual(self.api.tokens._get_firmware_history(), [])
+        self.assertEqual(self.api.tokens._get_firmware_version(), "7.15.0")
+        self.assertEqual(len(self.api.tokens._get_firmware_history()), 1)
 
     def test_firmware_upgrade_audited(self):
         """Test that firmware upgrade is recorded in audit log."""
@@ -800,7 +800,7 @@ class TestRoleCommands(unittest.TestCase):
     def test_role_list(self):
         """Test listing roles on a partition."""
         output = self.api.tokens.list_roles(self.slot_id)
-        self.assertIn("SO", output)
+        self.assertIn("PO", output)
         self.assertIn("CO", output)
         self.assertIn("CU", output)
         self.assertIn("Security Officer", output)
@@ -867,6 +867,7 @@ class TestBackupHSM(unittest.TestCase):
         self.api = PKCS11API(self.storage)
         self.api.C_Initialize()
         self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.api.tokens.init_token(self.slot_id, "partition-password", "Test", "backup-domain")
         self.domain = self.api.tokens.domains.get_partition_domain(self.slot_id)["domain_id"]
         self.session_id = self.api.C_OpenSession(self.slot_id)
 
@@ -1244,8 +1245,9 @@ class TestPartitionPolicies(unittest.TestCase):
         ids = [p.policy_id for p in POLICY_CATALOG]
         self.assertIn(0, ids)  # ALLOW_PRIVATE_KEY_CLONING
         self.assertIn(1, ids)  # ALLOW_PRIVATE_KEY_WRAPPING
-        self.assertIn(23, ids)  # MIN_PIN_LENGTH
-        self.assertIn(25, ids)  # MAX_LOGIN_ATTEMPTS
+        self.assertIn(20, ids)  # MAX_LOGIN_ATTEMPTS
+        self.assertIn(25, ids)  # MIN_PIN_LENGTH
+        self.assertIn(44, ids)  # EXTENDED_DOMAIN_MANAGEMENT
 
     def test_show_policies_default(self):
         """Test showing policies with default values."""
@@ -1264,7 +1266,7 @@ class TestPartitionPolicies(unittest.TestCase):
     def test_change_policy_by_id(self):
         """Test changing a policy by numeric ID."""
         self.api.tokens.change_policy(
-            self.slot_id, "25", "5", audit=self.api.audit, force=True
+            self.slot_id, "20", "5", audit=self.api.audit, force=True
         )
         self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MAX_LOGIN_ATTEMPTS"), 5)
 
@@ -1278,19 +1280,19 @@ class TestPartitionPolicies(unittest.TestCase):
     def test_change_policy_min_pin_length(self):
         """Test changing MIN_PIN_LENGTH."""
         self.api.tokens.change_policy(
-            self.slot_id, "MIN_PIN_LENGTH", "8", audit=self.api.audit, force=True
+            self.slot_id, "MIN_PIN_LENGTH", "247", audit=self.api.audit, force=True
         )
-        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MIN_PIN_LENGTH"), 8)
+        self.assertEqual(self.api.tokens.get_min_pin_length(self.slot_id), 8)
 
     def test_change_policy_invalid_value(self):
         """Test that invalid policy value fails."""
         with self.assertRaises(PKCS11Error):
-            self.api.tokens.change_policy(self.slot_id, "MIN_PIN_LENGTH", "2", force=True)
+            self.api.tokens.change_policy(self.slot_id, "MIN_PIN_LENGTH", "248", force=True)
 
-    def test_change_non_modifiable_policy(self):
-        """Test that non-modifiable policies cannot be changed."""
-        with self.assertRaises(PKCS11Error):
-            self.api.tokens.change_policy(self.slot_id, "MAX_PIN_LENGTH", "16", force=True)
+    def test_change_max_pin_length(self):
+        """The documented maximum PIN policy is modifiable."""
+        self.api.tokens.change_policy(self.slot_id, "MAX_PIN_LENGTH", "128", force=True)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "MAX_PIN_LENGTH"), 128)
 
     def test_change_policy_unknown(self):
         """Test that unknown policy fails."""
@@ -1417,7 +1419,7 @@ class TestPartitionPolicies(unittest.TestCase):
         # Check that some policies were changed
         self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_PRIVATE_KEY_WRAPPING"), 0)
         self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_RAW_RSA_OPERATIONS"), 0)
-        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_RESTRICTED_TO_V1"), 1)
+        self.assertEqual(self.api.tokens.get_policy_value(self.slot_id, "ALLOW_NON_FIPS_ALGORITHMS"), 0)
 
     def test_apply_template_destructive(self):
         """Test that applying a destructive template clears objects."""
@@ -2365,7 +2367,8 @@ class TestDeploymentFeatures(unittest.TestCase):
         self.api.C_Initialize()
         self.slot1 = self.api.tokens.create_partition("part1", "Partition 1")
         self.slot2 = self.api.tokens.create_partition("part2", "Partition 2")
-        self.api.tokens.init_token(self.slot1, "sopin123", "Partition 1")
+        self.api.tokens.init_token(self.slot1, "sopin123", "Partition 1", "ha-domain")
+        self.api.tokens.init_token(self.slot2, "sopin456", "Partition 2", "ha-domain")
         self.appliance = Appliance(self.storage)
         self.appliance.login("admin", "admin123")
         self.dm = self.appliance.deployment

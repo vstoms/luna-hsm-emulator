@@ -7,7 +7,7 @@ from pkcs11.constants import PKCS11Error, CKR_ACTION_PROHIBITED, CKR_TOKEN_NOT_P
 PARTITION_PPSO = "PPSO"
 PARTITION_LEGACY = "LEGACY"
 VALID_PARTITION_TYPES = {PARTITION_PPSO, PARTITION_LEGACY}
-ROLES = ("SO", "CO", "CU")
+ROLES = ("SO", "CO", "LCO", "CU")
 
 
 class PartitionLifecycleManager:
@@ -30,7 +30,8 @@ class PartitionLifecycleManager:
     def _save(self, state: dict):
         self.storage.set_meta(self.META_KEY, json.dumps(state))
 
-    def register(self, slot_id: int, partition_type: str = PARTITION_PPSO):
+    def register(self, slot_id: int, partition_type: str = PARTITION_PPSO,
+                 version: int = 0):
         partition_type = partition_type.upper()
         if partition_type not in VALID_PARTITION_TYPES:
             raise PKCS11Error(CKR_ACTION_PROHIBITED,
@@ -38,8 +39,9 @@ class PartitionLifecycleManager:
         state = self._load()
         state[str(slot_id)] = {
             "type": partition_type,
+            "version": int(version),
             "active": True,
-            "domain_initialized": True,
+            "domain_initialized": False,
             "roles": {role: {"active": False} for role in ROLES},
         }
         self._save(state)
@@ -59,8 +61,9 @@ class PartitionLifecycleManager:
             # Existing databases predate lifecycle metadata and behave as PPSO.
             state[key] = {
                 "type": PARTITION_PPSO,
+                "version": 0,
                 "active": True,
-                "domain_initialized": True,
+                "domain_initialized": bool(partition.get("initialized")),
                 "roles": {role: {"active": bool(partition.get(f"{role.lower()}_pin_hash"))}
                           for role in ROLES},
             }
@@ -107,11 +110,15 @@ class PartitionLifecycleManager:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
         entry = self._entry(slot_id)
         ptype = entry["type"]
+        entry.setdefault("version", 0)
+        entry["roles"].setdefault("LCO", {"active": False})
         roles = {}
         for role in ROLES:
             prefix = role.lower()
             # Legacy partitions have no independent Partition SO identity.
             supported = not (ptype == PARTITION_LEGACY and role == "SO")
+            if role == "LCO" and entry.get("version", 0) != 1:
+                supported = False
             initialized = supported and bool(partition.get(f"{prefix}_pin_hash"))
             locked = supported and bool(partition.get(f"{prefix}_locked", 0))
             active = initialized and bool(entry["roles"].get(role, {}).get("active"))
@@ -146,6 +153,7 @@ class PartitionLifecycleManager:
         return {
             "state": lifecycle_state,
             "type": ptype,
+            "version": entry.get("version", 0),
             "active": bool(entry.get("active", True)),
             "domain_initialized": bool(entry.get("domain_initialized", False)),
             "roles": roles,

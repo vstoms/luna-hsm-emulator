@@ -1,8 +1,8 @@
 """Command handlers for the lunacm CLI emulator.
 
-Each handler corresponds to a lunacm command group (slot, partition,
-role, key, crypto, audit, hsm).  The interactive shell in lunacm.py
-dispatches to these handlers.
+The interactive shell dispatches the documented LunaCM command groups to
+handlers here. Some legacy handlers remain as internal test/API helpers but
+are intentionally not exposed as top-level LunaCM commands.
 """
 
 import os
@@ -14,7 +14,7 @@ from typing import Optional
 from cli.prompts import confirm_proceed
 
 from pkcs11.constants import (
-    CKR_OK, PKCS11Error, ckr_name, cka_name, ckm_name, cko_name, ckk_name,
+    CKR_OK, CKU_USER, PKCS11Error, ckr_name, cka_name, ckm_name, cko_name, ckk_name,
     CKA_CLASS, CKA_TOKEN, CKA_LABEL, CKA_VALUE_LEN, CKA_KEY_TYPE,
     CKA_SENSITIVE, CKA_EXTRACTABLE, CKA_ENCRYPT, CKA_DECRYPT,
     CKA_SIGN, CKA_VERIFY, CKA_WRAP, CKA_UNWRAP, CKA_DERIVE,
@@ -47,6 +47,7 @@ class CommandHandler:
         self.api = api
         self.active_slot = active_slot
         self.session_id = None
+        self._slot_sessions = {}
         self.explain_mode = False
 
     # ------------------------------------------------------------------
@@ -56,7 +57,10 @@ class CommandHandler:
     def _ensure_session(self):
         """Open a session on the active slot if not already open."""
         if self.session_id is None and self.active_slot is not None:
-            self.session_id = self.api.C_OpenSession(self.active_slot)
+            self.session_id = self._slot_sessions.get(self.active_slot)
+            if self.session_id is None:
+                self.session_id = self.api.C_OpenSession(self.active_slot)
+                self._slot_sessions[self.active_slot] = self.session_id
         if self.session_id is None:
             print("  Error: No active session. Use 'slot set' to select a slot.")
             return False
@@ -70,8 +74,8 @@ class CommandHandler:
 
     def _parse_flags(self, args: list) -> tuple:
         """Separate --explain flag from other args. Returns (args_without_explain)."""
-        self.explain_mode = "--explain" in args
-        return [a for a in args if a != "--explain"]
+        self.explain_mode = any(argument.lower() == "--explain" for argument in args)
+        return [argument for argument in args if argument.lower() != "--explain"]
 
     # ------------------------------------------------------------------
     # Slot commands
@@ -82,7 +86,7 @@ class CommandHandler:
         if not args:
             print("  Usage: slot list | slot set -slot <id>")
             return
-        sub = args[0]
+        sub = args[0].lower()
         if sub == "list":
             slots = self.api.C_GetSlotList()
             if not slots:
@@ -110,10 +114,9 @@ class CommandHandler:
                 print(f"  Error: Slot {slot_id} does not exist.")
                 return
             self.active_slot = slot_id
-            if self.session_id is not None:
-                self.api.C_CloseSession(self.session_id)
-                self.session_id = None
-            print(f"  Active slot set to {slot_id}.")
+            # LunaCM preserves each slot's session/login state while switching.
+            self.session_id = self._slot_sessions.get(slot_id)
+            print(f"  Current Slot Id: {slot_id}")
         else:
             print(f"  Unknown slot subcommand: {sub}")
 
@@ -127,7 +130,7 @@ class CommandHandler:
             print("  Usage: partition create | delete | list | showinfo | init | changelabel | clear | contents |")
             print("         showmechanism | showpolicies | changepolicy | policytemplate | domain | clone")
             return
-        sub = args[0]
+        sub = args[0].lower()
         args = self._parse_flags(args[1:])
 
         if sub == "create":
@@ -174,19 +177,23 @@ class CommandHandler:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
             label = self._get_arg(args, "-label")
-            print("  [PED Simulation] Enter SO PIN to initialize partition:")
-            so_pin = getpass.getpass("  SO PIN: ")
+            if not confirm_proceed("Initializing the partition sets its PO credential and cloning domain.",
+                                   force=self._has_flag(args, "-force", "-f")):
+                print("  Command aborted.")
+                return
+            print("  [PED Simulation] Enter PO credential and cloning domain:")
+            so_pin = getpass.getpass("  PO password: ")
+            domain = getpass.getpass("  Cloning domain: ")
             try:
                 self.api.tokens.init_partition(
-                    self.active_slot, so_pin, label,
+                    self.active_slot, so_pin, label, domain,
                     audit=self.api.audit, session_id=self.session_id or 0
                 )
                 print(f"  Partition on slot {self.active_slot} initialized successfully.")
                 self._print_explain([
                     "Calling C_InitToken to initialize the application partition.",
-                    "This sets the SO PIN and optionally a new label.",
-                    "On a real Luna 7, partition init is performed via LunaSH,",
-                    "not LunaCM. We simulate it here for training purposes.",
+                    "This sets the PO credential and optionally a new label.",
+                    "The PO credential and independent cloning domain are now initialized.",
                     "Return code: CKR_OK (0x00000000)",
                 ])
             except PKCS11Error as e:
@@ -212,11 +219,142 @@ class CommandHandler:
                 ])
             except PKCS11Error as e:
                 print(f"  Error: {e}")
-        elif sub == "domain":
+        elif sub == "smkclone":
+            if not self.session_id or self.api.auth.get_role(self.session_id) != ROLE_CO:
+                print("  Error: Source partition CO login is required.")
+                return
+            destination = self._get_arg(args, "-slot", "-sl")
+            if self.active_slot is None or destination is None:
+                print("  Usage: partition smkclone -slot <destination_slot> -password <CO_password> [-force]")
+                return
+            if not confirm_proceed("This command overwrites the SMK in the target partition.",
+                                   force=self._has_flag(args, "-force", "-f")):
+                print("  Command aborted.")
+                return
+            password = self._get_arg(args, "-password", "-p") or getpass.getpass(
+                "  Target CO password: ")
+            target_session = None
+            try:
+                target_session = self.api.C_OpenSession(int(destination))
+                self.api.C_Login(target_session, CKU_USER, password)
+                result = self.api.tokens.sks.clone_smk(self.active_slot, int(destination))
+                print(f"  SMK cloned using {result['cloning_protocol']}; generation {result['generation']}.")
+            except (PKCS11Error, CloningDomainError) as error:
+                print(f"  Error: {error}")
+            finally:
+                if target_session is not None:
+                    self.api.C_CloseSession(target_session)
+        elif sub == "smkrollover":
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            action = args[0] if args else "show"
+            if not self.session_id or self.api.auth.get_role(self.session_id) != ROLE_CO:
+                print("  Error: Partition CO login is required.")
+                return
+            start = self._has_flag(args, "-start", "-s")
+            end = self._has_flag(args, "-end", "-e")
+            if not start and not end:
+                print("  Usage: partition smkrollover [-start|-s] [-end|-e] [-force]")
+                return
+            if not confirm_proceed("SMK rollover changes or deletes SMK material.",
+                                   force=self._has_flag(args, "-force", "-f")):
+                print("  Command aborted.")
+                return
+            try:
+                if start:
+                    result = self.api.tokens.sks.rollover_start(self.active_slot)
+                    if end:
+                        result = self.api.tokens.sks.rollover_end(self.active_slot)
+                else:
+                    result = self.api.tokens.sks.rollover_end(self.active_slot)
+                print(f"  SMK generation: {result['generation']}; rollover active: {result['rollover_active']}")
+            except PKCS11Error as error:
+                print(f"  Error: {error}")
+        elif sub == "domainlist":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            domains = self.api.tokens.domains.list_domains(self.active_slot)
+            print("  Defined Domains")
+            for number, domain in enumerate(domains, 1):
+                label = domain["label"] or "Label not set"
+                primary = " - primary" if domain.get("primary") else ""
+                print(f"    Domain Label[{number - 1}]: {label}{primary}")
+                print(f"      Fingerprint: {domain['fingerprint']}")
+        elif sub == "domainadd":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            if not self.session_id or self.api.auth.get_role(self.session_id) != ROLE_SO:
+                print("  Error: Partition PO login is required.")
+                return
+            label = self._get_arg(args, "-domainlabel", "-label", "-dl")
+            secret = self._get_arg(args, "-domain", "-d")
+            try:
+                if self._has_flag(args, "-domainped"):
+                    key_list = input("  Present Red PED key serials (comma-separated): ")
+                    shared = (getpass.getpass("  PED shared secret: ")
+                              if self.api.auth.ped.requires_shared_secret("red") else None)
+                    domain_id = self.api.auth.ped.authenticate(
+                        "red", [key.strip() for key in key_list.split(",") if key.strip()],
+                        shared).domain_id
+                elif secret:
+                    domain_id = self.api.tokens.domains.domain_from_secret(secret)
+                else:
+                    print("  Usage: partition domainadd {-domain <secret>|-domainped} [-domainlabel <label>] [-primary]")
+                    return
+                result = self.api.tokens.domains.add_domain(
+                    self.active_slot, domain_id, label,
+                    primary=self._has_flag(args, "-primary"))
+                print(f"  Domain '{label}' added ({result['fingerprint']}).")
+            except CloningDomainError as error:
+                print(f"  Error: {error}")
+        elif sub == "domaindelete":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            if not self.session_id or self.api.auth.get_role(self.session_id) != ROLE_SO:
+                print("  Error: Partition PO login is required.")
+                return
+            label = self._get_arg(args, "-domainlabel", "-label", "-dl")
+            try:
+                if label is None:
+                    removable = [domain for domain in self.api.tokens.domains.list_domains(
+                        self.active_slot) if not domain.get("primary")]
+                    for number, domain in enumerate(removable, 1):
+                        print(f"  {number}: {domain['label'] or 'Label not set'}")
+                    selection = int(input("  Enter the domain number to delete: "))
+                    label = removable[selection - 1]["label"]
+                if not confirm_proceed("You are about to delete a partition cloning domain.",
+                                       force=self._has_flag(args, "-force", "-f")):
+                    print("  Command aborted.")
+                    return
+                result = self.api.tokens.domains.delete_domain(self.active_slot, label)
+                print(f"  Domain '{result['label'] or 'Label not set'}' deleted.")
+            except (CloningDomainError, ValueError, IndexError) as error:
+                print(f"  Error: {error}")
+        elif sub == "domainchangelabel":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            if not self.session_id or self.api.auth.get_role(self.session_id) != ROLE_SO:
+                print("  Error: Partition PO login is required.")
+                return
+            old_label = self._get_arg(args, "-domainlabel", "-oldlabel", "-ol")
+            new_label = self._get_arg(args, "-newlabel", "-nl")
+            try:
+                result = self.api.tokens.domains.change_domain_label(
+                    self.active_slot, old_label, new_label,
+                    primary=self._has_flag(args, "-primary", "-p"))
+                print(f"  Domain label changed to '{result['label']}'.")
+            except CloningDomainError as error:
+                print(f"  Error: {error}")
+        elif sub == "domain":
+            # Legacy emulator alias; documented interfaces use domainlist/add/delete/changelabel.
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            action = args[0].lower() if args else "show"
             try:
                 if action == "show":
                     info = self.api.tokens.show_cloning_domain(self.active_slot)
@@ -224,7 +362,7 @@ class CommandHandler:
                     print(f"  Domain Fingerprint: {info['fingerprint']}")
                     print(f"  Domain Source:      {info['source']}")
                 elif action == "set":
-                    inherit = "-inherit" in args
+                    inherit = self._has_flag(args, "-inherit")
                     if inherit:
                         domain_id = None
                     elif self.api.auth.ped.get_auth_mode() == "ped":
@@ -238,7 +376,7 @@ class CommandHandler:
                         domain_secret = self._get_arg(args, "-domain") or getpass.getpass(
                             "  Cloning domain secret: ")
                         domain_id = self.api.tokens.domains.domain_from_secret(domain_secret)
-                    force = "-force" in args
+                    force = self._has_flag(args, "-force", "-f")
                     result = self.api.tokens.set_cloning_domain(
                         self.active_slot, domain_id, inherit, force,
                         audit=self.api.audit, session_id=self.session_id or 0)
@@ -263,6 +401,7 @@ class CommandHandler:
                     audit=self.api.audit, session_id=self.session_id or 0)
                 print(f"  Secure clone complete: {len(result['cloned'])} object(s).")
                 print(f"  Domain fingerprint: {result['domain_fingerprint']}")
+                print(f"  Cloning protocol:   {result['cloning_protocol']}")
                 self._print_explain([
                     "Cloning keeps sensitive key material inside the secure boundary and does not require extractability.",
                     "Wrapping exports an encrypted key blob; backup creates an offline recoverable copy.",
@@ -275,7 +414,7 @@ class CommandHandler:
                 return
             if not confirm_proceed(
                     "Are you sure you wish to delete all objects on this partition?",
-                    force="-force" in args):
+                    force=self._has_flag(args, "-force", "-f")):
                 return
             try:
                 count = self.api.tokens.clear_partition(
@@ -309,7 +448,7 @@ class CommandHandler:
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            verbose = "-verbose" in args or "-v" in args
+            verbose = self._has_flag(args, "-verbose", "-v")
             print(self.api.tokens.show_policies(self.active_slot, verbose=verbose))
             self._print_explain([
                 "Partition policies control security behaviors on the Luna 7.",
@@ -327,7 +466,7 @@ class CommandHandler:
                 return
             policy_name = self._get_arg(args, "-policy") or self._get_arg(args, "-name")
             value = self._get_arg(args, "-value")
-            force = "-force" in args
+            force = self._has_flag(args, "-force", "-f")
             if not policy_name or value is None:
                 print("  Usage: partition changepolicy -policy <id_or_name> -value <value> [-force]")
                 print("  Use 'partition showpolicies' to see available policies.")
@@ -370,7 +509,7 @@ class CommandHandler:
             print("         create -name <name> -desc <desc> -policies <id=val,...> |")
             print("         delete -name <name> | apply -name <name> [-force]")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "list":
@@ -446,7 +585,7 @@ class CommandHandler:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
             name = self._get_arg(rest, "-name")
-            force = "-force" in args
+            force = self._has_flag(args, "-force", "-f")
             if not name:
                 print("  Usage: partition policytemplate apply -name <name> [-force]")
                 return
@@ -478,21 +617,23 @@ class CommandHandler:
         if not args:
             print("  Usage: role login | logout | changepw | list | show | init | activate | deactivate | resetpw")
             return
-        sub = args[0]
+        sub = args[0].lower()
 
         if sub == "login":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
-                print("  Usage: role login -name <co|cu|so>")
+                print("  Usage: role login -name <po|co|lco|cu>")
                 return
             role_name = role_name.lower()
             if role_name not in ROLE_MAP:
-                print(f"  Unknown role: {role_name}. Valid: co, cu, so")
+                print(f"  Unknown role: {role_name}. Valid: po, co, lco, cu")
                 return
+            mapped_role = ROLE_MAP[role_name]
             if not self._ensure_session():
                 return
             if self.api.auth.ped.get_auth_mode() == "ped":
-                color = {"so": "Blue", "co": "Black", "cu": "Gray"}[role_name]
+                color = {ROLE_SO: "Blue", ROLE_CO: "Black", "LCO": "Black",
+                         ROLE_CU: "Gray"}[mapped_role]
                 print(f"  Present {color} PED key serials for '{role_name.upper()}'.")
                 serials = input("  Key serials (comma-separated): ")
                 secret = ""
@@ -505,17 +646,22 @@ class CommandHandler:
                 pin = getpass.getpass("  PIN: ")
             try:
                 from pkcs11.constants import CKU_SO, CKU_USER, CKU_CONTEXT_SPECIFIC
-                user_type = (CKU_SO if role_name == "so" else
-                             CKU_CONTEXT_SPECIFIC if role_name == "cu" else CKU_USER)
-                self.api.C_Login(self.session_id, user_type, pin)
-                print(f"  Logged in as {role_name.upper()}.")
+                user_type = (CKU_SO if mapped_role == ROLE_SO else
+                             CKU_CONTEXT_SPECIFIC if mapped_role == ROLE_CU else CKU_USER)
+                if mapped_role == "LCO":
+                    self.api.auth.login(self.session_id, self.active_slot, mapped_role, pin)
+                    self.api.sessions.get_session(self.session_id).user_type = CKU_USER
+                else:
+                    self.api.C_Login(self.session_id, user_type, pin)
+                display_role = "PO" if mapped_role == ROLE_SO else mapped_role
+                print(f"  Logged in as {display_role}.")
                 self._print_explain([
-                    f"Calling C_Login with userType={'CKU_SO' if role_name == 'so' else 'CKU_USER'}",
-                    f"Role: {ROLE_MAP[role_name]}",
+                    f"Calling C_Login with userType={'CKU_SO' if mapped_role == ROLE_SO else 'CKU_USER'}",
+                    f"Role: {display_role}",
                     "Return code: CKR_OK (0x00000000)",
-                    f"Security Note: The {role_name.upper()} role has "
-                    + ("full administrative access to the partition." if role_name == "so"
-                       else "key management capabilities." if role_name == "co"
+                    f"Security Note: The {display_role} role has "
+                    + ("full administrative access to the partition." if mapped_role == ROLE_SO
+                       else "key management capabilities." if mapped_role in (ROLE_CO, "LCO")
                        else "cryptographic operation capabilities only."),
                 ])
             except PKCS11Error as e:
@@ -534,11 +680,11 @@ class CommandHandler:
         elif sub == "changepw":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
-                print("  Usage: role changepw -name <co|cu|so>")
+                print("  Usage: role changepw -name <po|co|lco|cu>")
                 return
             role_name = role_name.lower()
             if role_name not in ROLE_MAP:
-                print(f"  Unknown role: {role_name}. Valid: co, cu, so")
+                print(f"  Unknown role: {role_name}. Valid: po, co, lco, cu")
                 return
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
@@ -561,14 +707,14 @@ class CommandHandler:
                 return
             print(self.api.tokens.list_roles(self.active_slot))
             self._print_explain([
-                "The Luna 7 supports three roles per partition: SO, CO, and CU.",
+                "Luna partitions expose PO, CO, and CU; V1 partitions also expose LCO.",
                 "Each role has different capabilities and can be independently",
                 "initialized, locked, or deactivated.",
             ])
         elif sub == "show":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
-                print("  Usage: role show -name <so|co|cu>")
+                print("  Usage: role show -name <po|co|lco|cu>")
                 return
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
@@ -577,11 +723,11 @@ class CommandHandler:
         elif sub == "init":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
-                print("  Usage: role init -name <co|cu>")
+                print("  Usage: role init -name <co|lco|cu>")
                 return
             role_name = role_name.upper()
-            if role_name not in ("CO", "CU"):
-                print("  Only CO and CU roles can be initialized with 'role init'.")
+            if role_name not in ("CO", "LCO", "CU"):
+                print("  Only CO, LCO, and CU roles can be initialized with 'role init'.")
                 return
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
@@ -602,7 +748,7 @@ class CommandHandler:
                 print(f"  Role '{role_name}' initialized.")
                 self._print_explain([
                     f"Role init sets the PIN for the {role_name} role.",
-                    "On a real Luna 7, this requires SO authentication.",
+                    "On a real Luna 7, this requires PO authentication.",
                     "The CU role is optional and provides read-only access",
                     "to cryptographic objects for verify/decrypt operations.",
                 ])
@@ -611,7 +757,7 @@ class CommandHandler:
         elif sub == "deactivate":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
-                print("  Usage: role deactivate -name <co|cu>")
+                print("  Usage: role deactivate -name <co|lco|cu>")
                 return
             role_name = role_name.upper()
             if self.active_slot is None:
@@ -620,7 +766,7 @@ class CommandHandler:
             if not confirm_proceed(
                     f"Are you sure you wish to deactivate the role '{role_name}'?",
                     "Its credential will be retained.",
-                    force="-force" in args):
+                    force=self._has_flag(args, "-force", "-f")):
                 return
             actor = self.api.auth.get_role(self.session_id) if self.session_id else None
             try:
@@ -632,7 +778,7 @@ class CommandHandler:
                 print(f"  Role '{role_name}' deactivated. Credential retained for superior-role reactivation.")
                 self._print_explain([
                     "Deactivating a role blocks login while retaining its credential.",
-                    "On a real Luna 7, this requires SO authentication and is",
+                    "On a real Luna 7, this requires PO authentication and is",
                     "used as a security measure to disable unused roles.",
                 ])
             except PKCS11Error as e:
@@ -640,7 +786,7 @@ class CommandHandler:
         elif sub == "activate":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name or self.active_slot is None:
-                print("  Usage: role activate -name <co|cu>")
+                print("  Usage: role activate -name <co|lco|cu>")
                 return
             actor = self.api.auth.get_role(self.session_id) if self.session_id else None
             try:
@@ -653,16 +799,16 @@ class CommandHandler:
         elif sub == "resetpw":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
-                print("  Usage: role resetpw -name <co|cu>")
+                print("  Usage: role resetpw -name <co|lco|cu>")
                 return
             role_name = role_name.upper()
-            if role_name not in ("CO", "CU"):
-                print("  Only CO and CU roles can be reset with 'role resetpw'.")
+            if role_name not in ("CO", "LCO", "CU"):
+                print("  Only CO, LCO, and CU roles can be reset with 'role resetpw'.")
                 return
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            print(f"  [PED Simulation] Reset PIN for role '{role_name}' (requires SO):")
+            print(f"  [PED Simulation] Reset PIN for role '{role_name}' (requires PO):")
             new_pin = getpass.getpass("  New PIN: ")
             confirm = getpass.getpass("  Confirm PIN: ")
             if new_pin != confirm:
@@ -678,7 +824,7 @@ class CommandHandler:
                 print(f"  PIN reset for role '{role_name}'.")
                 self._print_explain([
                     "Role resetpw sets a new PIN without requiring the old one.",
-                    "This is an SO-only operation on a real Luna 7, used when",
+                    "This is a PO-only operation on a real Luna 7, used when",
                     "a user forgets their PIN or when an account is locked.",
                     "Unlike changepw, this does NOT require the old PIN.",
                 ])
@@ -696,7 +842,7 @@ class CommandHandler:
         if not args:
             print("  Usage: key generate | key list | key show | key delete | key wrap | key unwrap")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "generate":
@@ -957,7 +1103,7 @@ class CommandHandler:
         if not args:
             print("  Usage: crypto encrypt | crypto decrypt | crypto sign | crypto verify | crypto digest")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "encrypt":
@@ -1196,12 +1342,12 @@ class CommandHandler:
             if len(args) < 2:
                 print("  Usage: audit log show | audit log clear | audit log verify")
                 return
-            sub = args[1]
+            sub = args[1].lower()
             if sub == "show":
                 print(self.api.audit.show())
             elif sub == "clear":
                 if confirm_proceed("Are you sure you wish to clear all audit entries?",
-                                   force="-force" in args):
+                                   force=self._has_flag(args, "-force", "-f")):
                     self.api.audit.clear()
                     print("  Audit log cleared.")
             elif sub == "verify":
@@ -1221,7 +1367,7 @@ class CommandHandler:
         if not args:
             print("  Usage: hsm show | hsm factoryreset | hsm export | hsm import | hsm firmware <subcommand>")
             return
-        sub = args[0]
+        sub = args[0].lower()
         if sub == "show":
             info = self.api.tokens.get_hsm_info()
             fw_info = self.api.tokens.get_firmware_info()
@@ -1242,7 +1388,7 @@ class CommandHandler:
             if confirm_proceed(
                     "Are you sure you wish to reset this HSM to factory default settings?",
                     "All partitions, keys, and audit logs will be erased.",
-                    force="-force" in args):
+                    force=self._has_flag(args, "-force", "-f")):
                 self.api.tokens.factory_reset()
                 self.active_slot = None
                 self.session_id = None
@@ -1269,7 +1415,7 @@ class CommandHandler:
         if not args:
             print("  Usage: hsm firmware show | hsm firmware list | hsm firmware upgrade -version <ver> | hsm firmware rollback | hsm firmware history")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "show":
@@ -1340,7 +1486,7 @@ class CommandHandler:
             if not confirm_proceed(
                     f"Are you sure you wish to upgrade the firmware from",
                     f"{pre['current_version']} to {target}?",
-                    force="-force" in args):
+                    force=self._has_flag(args, "-force", "-f")):
                 return
 
             # Perform upgrade with staged progress
@@ -1386,7 +1532,7 @@ class CommandHandler:
             print(f"  Last upgrade: {last['from_version']} -> {last['to_version']}")
             if not confirm_proceed(
                     f"Are you sure you wish to roll back the firmware to {last['from_version']}?",
-                    force="-force" in args):
+                    force=self._has_flag(args, "-force", "-f")):
                 return
 
             result = self.api.tokens.rollback_firmware(audit=self.api.audit)
@@ -1416,8 +1562,106 @@ class CommandHandler:
     # Backup HSM commands
     # ------------------------------------------------------------------
 
+    def cmd_hagroup(self, args: list):
+        """Handle the documented client-side LunaCM HA group commands."""
+        if not args:
+            print("  hagroup: addmember addstandby creategroup deletegroup halog haonly")
+            print("           interval listgroups recover recoverymode removemember")
+            print("           removestandby retry synchronize")
+            return
+        sub = args[0].lower()
+        rest = args[1:]
+        from hsm.deployment import DeploymentManager
+        deployment = DeploymentManager(self.api.storage)
+        group_name = self._get_arg(rest, "-group", "-label", "-g")
+        slot = self._get_arg(rest, "-slot", "-sl")
+
+        if sub == "listgroups":
+            groups = deployment.list_ha_groups()
+            if not groups:
+                print("  No HA groups configured.")
+            for group in groups:
+                print(f"  HA Group Label: {group['name']}  Members: {len(group['members'])}  State: {group['state']}")
+        elif sub == "creategroup":
+            label = self._get_arg(rest, "-label", "-group", "-g")
+            if not label or slot is None:
+                print("  Usage: hagroup creategroup -label <label> -slot <slot> -password <password>")
+                return
+            password = self._get_arg(rest, "-password", "-p") or getpass.getpass(
+                "  Partition CO password: ")
+            validation_session = self.api.C_OpenSession(int(slot))
+            try:
+                self.api.C_Login(validation_session, CKU_USER, password)
+            except PKCS11Error as error:
+                self.api.C_CloseSession(validation_session)
+                print(f"  Error: {error}")
+                return
+            self.api.C_CloseSession(validation_session)
+            result = deployment.create_ha_group(label, int(slot), label)
+            print(f"  HA group '{label}' created." if result["success"] else f"  Error: {result['error']}")
+        elif sub == "deletegroup":
+            if not group_name:
+                print("  Usage: hagroup deletegroup -label <label>")
+                return
+            result = deployment.delete_ha_group(group_name)
+            print(f"  HA group '{group_name}' deleted." if result["success"] else f"  Error: {result['error']}")
+        elif sub in ("addmember", "addstandby"):
+            if not group_name or slot is None:
+                print(f"  Usage: hagroup {sub} -group <label> -slot <slot> -password <password>")
+                return
+            password = self._get_arg(rest, "-password", "-p") or getpass.getpass(
+                "  Member CO password: ")
+            validation_session = self.api.C_OpenSession(int(slot))
+            try:
+                self.api.C_Login(validation_session, CKU_USER, password)
+            except PKCS11Error as error:
+                self.api.C_CloseSession(validation_session)
+                print(f"  Error: {error}")
+                return
+            self.api.C_CloseSession(validation_session)
+            result = deployment.add_ha_member(group_name, int(slot))
+            if result["success"] and sub == "addstandby":
+                deployment.set_ha_mode(group_name, "active-standby")
+            print(f"  Member slot {slot} added to '{group_name}'." if result["success"] else f"  Error: {result['error']}")
+        elif sub in ("removemember", "removestandby"):
+            if not group_name or slot is None:
+                print(f"  Usage: hagroup {sub} -group <label> -slot <slot>")
+                return
+            result = deployment.remove_ha_member(group_name, int(slot))
+            print(f"  Member slot {slot} removed." if result["success"] else f"  Error: {result['error']}")
+        elif sub == "synchronize":
+            result = deployment.synchronize_ha_group(group_name) if group_name else {
+                "success": False, "error": "Specify -group <label>"}
+            print(f"  HA group '{group_name}' synchronized." if result["success"] else f"  Error: {result['error']}")
+        elif sub == "retry":
+            value = self._get_arg(rest, "-count", "-c")
+            result = deployment.set_ha_retry(None, int(value)) if value is not None else {
+                "success": False, "error": "Specify -count <retries>"}
+            print(f"  HA retry count set to {result['retry_count']}." if result["success"] else f"  Error: {result['error']}")
+        elif sub == "interval":
+            value = self._get_arg(rest, "-interval", "-i")
+            result = deployment.set_ha_interval(None, int(value)) if value is not None else {
+                "success": False, "error": "Specify -interval <seconds>"}
+            print(f"  HA interval set to {result['poll_interval']}." if result["success"] else f"  Error: {result['error']}")
+        elif sub == "recoverymode":
+            mode = (self._get_arg(rest, "-mode", "-m") or "").lower()
+            mapped = {"activebasic": "manual", "activeenhanced": "automatic"}.get(mode)
+            if not mapped:
+                print("  Error: Specify -mode activeBasic or activeEnhanced")
+                return
+            results = [deployment.set_ha_recovery_mode(group["name"], mapped)
+                       for group in deployment.list_ha_groups()]
+            if all(result["success"] for result in results):
+                print(f"  Recovery mode: {'activeBasic' if mapped == 'manual' else 'activeEnhanced'}.")
+            else:
+                print("  Error: Unable to update recovery mode")
+        elif sub in ("halog", "haonly", "recover"):
+            print(f"  hagroup {sub} is recognized but not implemented yet.")
+        else:
+            print(f"  Unknown hagroup subcommand: {sub}")
+
     def cmd_backup(self, args: list):
-        """Handle 'backup' commands for the Luna Backup HSM 7."""
+        """Legacy emulator backup interface; canonical operations use partition archive."""
         if not args:
             print("  Usage: backup connect | disconnect | show | init | login | logout |")
             print("         backup list | backup create-partition | backup objects |")
@@ -1427,7 +1671,7 @@ class CommandHandler:
             print("         backup firmware show | backup firmware upgrade -version <v> |")
             print("         backup firmware rollback | backup factoryreset")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "connect":
@@ -1602,7 +1846,7 @@ class CommandHandler:
             if not confirm_proceed(
                     f"Are you sure you wish to restore objects to slot {slot}?",
                     "Existing objects with matching labels may be affected.",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             try:
                 result = self.api.backup.restore_objects(
@@ -1637,7 +1881,7 @@ class CommandHandler:
             if confirm_proceed(
                     "Are you sure you wish to reset the backup HSM to factory default settings?",
                     "All backup partitions and data will be erased.",
-                    force="-force" in args):
+                    force=self._has_flag(args, "-force", "-f")):
                 self.api.backup.factory_reset(
                     audit=self.api.audit, session_id=self.session_id or 0
                 )
@@ -1653,7 +1897,7 @@ class CommandHandler:
         if not args:
             print("  Usage: backup stm show | backup stm recover -string <random_user_string>")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "show":
@@ -1698,7 +1942,7 @@ class CommandHandler:
         if not args:
             print("  Usage: backup firmware show | backup firmware upgrade -version <v> | backup firmware rollback")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = self._parse_flags(args[1:])
 
         if sub == "show":
@@ -1727,7 +1971,7 @@ class CommandHandler:
                 return
             if not confirm_proceed(
                     f"Are you sure you wish to upgrade the backup HSM firmware to {target}?",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             try:
                 result = self.api.backup.upgrade_firmware(
@@ -1746,7 +1990,7 @@ class CommandHandler:
             if not confirm_proceed(
                     "Are you sure you wish to roll back the backup HSM firmware?",
                     "Rollback will zeroize the backup HSM and erase all backup partitions.",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             try:
                 result = self.api.backup.rollback_firmware(
@@ -1766,109 +2010,39 @@ class CommandHandler:
             print(f"  Unknown firmware subcommand: {sub}")
 
     def cmd_help(self, args: list = None):
-        """Show help."""
+        """Show the canonical LunaCM command hierarchy."""
         print("""
-  LunaCM Emulator v7.x — Command Reference
+  LunaCM Commands
 
-  Slot/Partition Management:
-    slot list                          List all slots/partitions
-    slot set -slot <id>                Set active slot
-    partition create -name <name>      Create a new partition
-    partition delete -name <name>      Delete a partition
-    partition list                     List all partitions
-    partition showinfo                 Show partition details
-    partition init [-label <label>]     Initialize the active partition (set SO PIN)
-    partition changelabel -label <l>   Change partition label
-    partition clear                    Delete all objects on partition
-    partition contents                 Show all objects on partition
-    partition showmechanism            Show available PKCS#11 mechanisms
-    partition showpolicies [-verbose]     Show partition policies (use -verbose for full details)
-    partition changepolicy -policy <id> -value <v> [-force]  Change a partition policy
-    partition policytemplate list          List available policy templates
-    partition policytemplate show -name <n> Show a specific template
-    partition policytemplate create -name <n> -desc <d> -policies <id=val,...>  Create a custom template
-    partition policytemplate delete -name <n>  Delete a custom template
-    partition policytemplate apply -name <n> [-force]  Apply a template to the active partition
-    partition domain show                 Show the active partition's effective domain
-    partition domain set [-inherit|-domain <secret>|-keys <red serials>] [-force]
-    partition clone -source <id> -destination <id> [-labels a,b]
-                                          Securely clone matching-domain objects
+    appid          Application IDs              clientconfig   Client configuration
+    file           File display                 hagroup        High-availability groups
+    partition      Partition operations         ped            Remote PED
+    remotebackup   Remote Backup server         role           Partition roles
+    slot           Slot selection/status        srk            Secure Recovery Key
+    stc            Secure Trusted Channel       stcconfig      STC configuration
+    stm            Secure Transport Mode
 
-  Authentication:
-    role login -name <co|cu|so>        Login as a role
-    role logout                        Logout current role
-    role changepw -name <role>         Change role password (requires old PIN)
-    role list                          List all roles on the partition
-    role show -name <so|co|cu>         Show state of a specific role
-    role init -name <co|cu>            Initialize a role (set PIN)
-    role deactivate -name <co|cu>      Deactivate a role (clear PIN)
-    role resetpw -name <co|cu>         Reset role PIN (SO only, no old PIN needed)
-
-  Key Operations:
-    key generate -kt <aes|rsa|ec|des3> -label <name> [-ks <size>] [-curve <name>]
-    key list                           List all key objects
-    key show -label <name>             Show key attributes
-    key delete -label <name>           Delete a key
-    key wrap -wrap-key <label> -target-key <label> [-out <file>]
-    key unwrap -wrap-key <label> -file <file> [-label <name>]
-
-  Cryptographic Operations:
-    crypto encrypt -key <label> -mech <MECH> -in <file> [-out <file>]
-    crypto decrypt -key <label> -mech <MECH> -in <file> [-out <file>]
-    crypto sign -key <label> -mech <MECH> -in <file> [-out <file>]
-    crypto verify -key <label> -mech <MECH> -in <file> -sig <file>
-    crypto digest -mech <MECH> -in <file>
-
-  Audit & Logging:
-    audit log show                     Display audit log
-    audit log clear                    Clear audit log
-    audit log verify                   Verify hash chain integrity
-
-  HSM Info:
-    hsm show                           Show HSM firmware/model info
-    hsm factoryreset                   Reset HSM to factory defaults
-    hsm export -file <path>            Export HSM state
-    hsm import -file <path>            Import HSM state
-    hsm firmware show                  Show current firmware info
-    hsm firmware list                  List all available firmware versions
-    hsm firmware upgrade -version <v>  Upgrade firmware to specified version
-    hsm firmware rollback              Roll back to previous firmware
-    hsm firmware history               Show firmware upgrade history
-
-  Backup HSM (Luna Backup HSM 7):
-    backup connect                     Connect a Luna Backup HSM 7
-    backup disconnect                  Disconnect the backup HSM
-    backup show                        Show backup HSM status
-    backup init                        Initialize backup HSM (set SO PIN)
-    backup login                       Log in to backup HSM as SO
-    backup logout                      Log out of backup HSM
-    backup list                        List backup partitions and objects
-    backup create-partition -domain <d>  Create a backup partition
-    backup backup -slot <id> -domain <d>  Clone objects to backup HSM
-    backup restore -slot <id> -domain <d>  Restore objects from backup HSM
-    backup stm show                    Show Secure Transport Mode status
-    backup stm recover -string <s>     Recover from Secure Transport Mode
-    backup firmware show               Show backup HSM firmware info
-    backup firmware upgrade -version <v>  Upgrade backup HSM firmware
-    backup firmware rollback           Roll back backup HSM firmware (destructive)
-    backup factoryreset                Reset backup HSM to factory defaults
-
-  Other:
-    help                               Show this help
-    exit / quit                        Exit the emulator
-
-  Add --explain to any command for PKCS#11 educational output.
-  Example: key generate -kt aes -ks 256 -label mykey --explain
+  Documented shortcuts: a, ccfg, f, ha, par, p, rb, ro, s, r, stc, stcc.
+  Commands and options are case-insensitive. The prompt is lunacm:>.
 """)
 
     # ------------------------------------------------------------------
     # Arg parsing helper
     # ------------------------------------------------------------------
 
+    def cmd_unavailable(self, args: list):
+        print("  This documented LunaCM command group is not implemented yet.")
+
     @staticmethod
-    def _get_arg(args: list, flag: str) -> Optional[str]:
-        """Extract -flag value from args list."""
-        for i, a in enumerate(args):
-            if a == flag and i + 1 < len(args):
-                return args[i + 1]
+    def _has_flag(args: list, *flags: str) -> bool:
+        wanted = {flag.lower() for flag in flags}
+        return any(argument.lower() in wanted for argument in args)
+
+    @staticmethod
+    def _get_arg(args: list, *flags: str) -> Optional[str]:
+        """Extract an option value; Luna commands and options ignore case."""
+        wanted = {flag.lower() for flag in flags}
+        for index, argument in enumerate(args):
+            if argument.lower() in wanted and index + 1 < len(args):
+                return args[index + 1]
         return None

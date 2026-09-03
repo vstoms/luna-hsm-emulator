@@ -24,6 +24,9 @@ class TestHABehavior(unittest.TestCase):
         self.api = PKCS11API(self.storage)
         self.api.C_Initialize()
         self.slots = [self.api.tokens.create_partition(f"member-{n}") for n in range(1, 4)]
+        for index, slot in enumerate(self.slots):
+            self.api.tokens.init_token(slot, f"member-password-{index}",
+                                       f"Member {index}", "ha-shared-domain")
         self.dm = Appliance(self.storage).deployment
         self.assertTrue(self.dm.create_ha_group("ha", self.slots[0])["success"])
         self.assertTrue(self.dm.add_ha_member("ha", self.slots[1])["success"])

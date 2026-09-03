@@ -7,6 +7,8 @@ authentication, storage quotas, and audit log.
 
 import time
 import os
+import json
+import secrets
 import hashlib
 import re
 from typing import Optional
@@ -18,9 +20,11 @@ from pkcs11.constants import (
     CKF_TOKEN_INITIALIZED, CKF_LOGIN_REQUIRED, CKF_RNG,
     CKR_ACTION_PROHIBITED, CKR_ARGUMENTS_BAD, CKR_USER_PIN_NOT_INITIALIZED,
 )
-from hsm.auth import AuthManager, ROLE_CO, ROLE_CU, ROLE_SO
+from hsm.auth import AuthManager, ROLE_CO, ROLE_LCO, ROLE_CU, ROLE_SO
 from hsm.domain import CloningDomainManager
 from hsm.lifecycle import PartitionLifecycleManager, PARTITION_PPSO, PARTITION_LEGACY
+from hsm.hsm_state import HSMStateManager
+from hsm.sks import SKSManager
 
 # Luna 7 simulated hardware model
 HSM_MODEL = "Luna Network HSM 7"
@@ -74,6 +78,7 @@ class TokenManager:
         self.auth = auth
         self.domains = CloningDomainManager(storage)
         self.lifecycle = PartitionLifecycleManager(storage)
+        self.sks = SKSManager(storage, self.lifecycle)
         self._next_slot = 1
 
     def _generate_serial(self) -> str:
@@ -175,7 +180,8 @@ class TokenManager:
                          max_objects: int = 1024,
                          max_storage: int = 1048576,
                          max_login_attempts: int = 10,
-                         partition_type: str = PARTITION_PPSO) -> int:
+                         partition_type: str = PARTITION_PPSO,
+                         version: int = 0) -> int:
         """Create a new partition. Returns the slot ID."""
         if self.storage.get_partition_by_name(name):
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
@@ -192,14 +198,13 @@ class TokenManager:
         while slot_id in used_slots:
             slot_id += 1
         self.storage.insert_partition(
-            slot_id=slot_id, name=name, label=label or name,
+            slot_id=slot_id, name=name, label=label or "",
             max_objects=max_objects, max_storage=max_storage,
             max_login_attempts=max_login_attempts,
         )
-        self.lifecycle.register(slot_id, partition_type)
-        # New partitions inherit the HSM cloning domain by default.
-        self.domains.set_partition_domain(slot_id, inherit=True)
-        self.lifecycle.set_domain_initialized(slot_id, True)
+        if version not in (0, 1):
+            raise PKCS11Error(CKR_ARGUMENTS_BAD, "Partition version must be 0 or 1")
+        self.lifecycle.register(slot_id, partition_type, version)
         return slot_id
 
     def delete_partition(self, name: str, hsm_so_authorized: bool = False,
@@ -217,8 +222,9 @@ class TokenManager:
             audit.log(session_id, "HSO", "PartitionDelete", success=True,
                       detail=f"slot={p['slot_id']}, name={name}")
 
-    def init_token(self, slot_id: int, so_pin: str, label: str = None):
-        """Initialize a PPSO partition SO or a legacy Partition Owner (CO)."""
+    def init_token(self, slot_id: int, so_pin: str, label: str = None,
+                   domain: str = None):
+        """Initialize the partition PO and its independent cloning domain."""
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
@@ -229,14 +235,23 @@ class TokenManager:
         if label:
             updates["label"] = label
         self.storage.update_partition(slot_id, **updates)
+        # API callers that omit a domain receive a unique domain. CLI callers
+        # prompt for one, matching the real partition-init ceremony.
+        domain_id = self.domains.domain_from_secret(domain or secrets.token_hex(16))
+        self.domains.set_partition_domain(slot_id, domain_id=domain_id, inherit=False)
+        self.lifecycle.set_domain_initialized(slot_id, True)
+        if self.lifecycle.status(slot_id)["version"] == 1:
+            self.storage.set_partition_policy(slot_id, 41, 1)
+            self.storage.set_partition_policy(slot_id, 40, 1)
+            self.sks.ensure_smk(slot_id)
 
     def init_pin(self, slot_id: int, user_pin: str, role: str = ROLE_CO):
         """Initialize the PIN for a user role (CO or CU)."""
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT)
-        if role not in (ROLE_CO, ROLE_CU):
-            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED, "InitPIN only for CO or CU roles")
+        if role not in (ROLE_CO, ROLE_LCO, ROLE_CU):
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED, "InitPIN only for CO, LCO, or CU roles")
         self.auth.set_pin(slot_id, role, user_pin)
 
     def show_partition_info(self, slot_id: int) -> str:
@@ -263,10 +278,11 @@ class TokenManager:
             f"  Max Login Attempts:  {p['max_login_attempts']}",
             "  Roles:",
         ]
-        for role in ("SO", "CO", "CU"):
+        for role in ("SO", "CO", "LCO", "CU"):
             state = lifecycle["roles"][role]
             attempts = f", failures={state['failed_attempts']}/{p['max_login_attempts']}" if state["supported"] else ""
-            lines.append(f"    {role:<3} {state['state']}{attempts}")
+            display_role = "PO" if role == "SO" else role
+            lines.append(f"    {display_role:<3} {state['state']}{attempts}")
         lines.append(f"  Created:             {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p['created_at']))}")
         return "\n".join(lines)
 
@@ -276,14 +292,14 @@ class TokenManager:
         if not partitions:
             return "  No partitions configured. Use 'partition create' to create one."
         lines = [
-            f"  {'Slot':<6} {'Name':<18} {'Type':<8} {'State':<28} {'Objects':<10} {'SO':<14} {'CO':<14} {'CU':<14}",
+            f"  {'Slot':<6} {'Name':<18} {'Version':<8} {'State':<28} {'Objects':<10} {'PO':<14} {'CO':<14} {'CU':<14}",
             "  " + "-" * 120,
         ]
         for p in partitions:
             obj_count = self.storage.count_objects(p["slot_id"])
             lifecycle = self.lifecycle.status(p["slot_id"])
             lines.append(
-                f"  {p['slot_id']:<6} {p['name']:<18} {lifecycle['type']:<8} "
+                f"  {p['slot_id']:<6} {p['name']:<18} {'V' + str(lifecycle['version']):<8} "
                 f"{lifecycle['state']:<28} {obj_count:<10} "
                 f"{lifecycle['roles']['SO']['state']:<14} "
                 f"{lifecycle['roles']['CO']['state']:<14} "
@@ -291,18 +307,29 @@ class TokenManager:
             )
         return "\n".join(lines)
 
-    def factory_reset(self):
-        """Reset the HSM to factory defaults — delete all partitions and objects."""
-        for p in self.storage.get_all_partitions():
-            self.storage.delete_partition(p["slot_id"])
-        self.storage.clear_audit_logs()
-        self.storage.set_meta("firmware_version", DEFAULT_FIRMWARE)
-        self.storage.set_meta("firmware_history", "[]")
-        from hsm.ped import PEDManager
-        PEDManager(self.storage).factory_reset()
-        self.storage.set_meta(CloningDomainManager.HSM_META, "")
+    def _erase_application_partitions(self):
+        for partition in self.storage.get_all_partitions():
+            self.storage.delete_partition(partition["slot_id"])
         self.storage.set_meta(CloningDomainManager.PARTITION_META, "{}")
         self.storage.set_meta(PartitionLifecycleManager.META_KEY, "{}")
+        self.storage.set_meta(SKSManager.META_KEY, "{}")
+
+    def zeroize(self):
+        """Zeroize user material while preserving policies, RPV, and Auditor."""
+        self._erase_application_partitions()
+        from hsm.ped import PEDManager
+        PEDManager(self.storage).zeroize()
+        HSMStateManager(self.storage).mark_zeroized()
+
+    def factory_reset(self):
+        """Reset HSM identities and policies without rolling back firmware."""
+        self._erase_application_partitions()
+        self.storage.clear_audit_logs()
+        from hsm.ped import PEDManager
+        PEDManager(self.storage).factory_reset()
+        HSMStateManager(self.storage).factory_reset()
+        self.storage.set_meta(CloningDomainManager.HSM_META, "")
+        self.storage.set_meta("hsm_policies", "{}")
 
     # ------------------------------------------------------------------
     # Firmware management
@@ -564,7 +591,7 @@ class TokenManager:
     # ------------------------------------------------------------------
 
     def init_partition(self, slot_id: int, so_pin: str, label: str = None,
-                        audit=None, session_id: int = 0):
+                       domain: str = None, audit=None, session_id: int = 0):
         """Initialize an application partition (partition init).
 
         On a real Luna 7, this is done from lunash (server-side), not lunacm.
@@ -576,13 +603,7 @@ class TokenManager:
         if p.get("initialized"):
             raise PKCS11Error(CKR_TOKEN_WRITE_PROTECTED,
                               "Partition is already initialized. Use 'hsm factoryreset' first.")
-        initial_role = (ROLE_CO if self.lifecycle.partition_type(slot_id) == PARTITION_LEGACY
-                        else ROLE_SO)
-        self.auth.set_pin(slot_id, initial_role, so_pin)
-        updates = {"initialized": 1}
-        if label:
-            updates["label"] = label
-        self.storage.update_partition(slot_id, **updates)
+        self.init_token(slot_id, so_pin, label, domain)
         if audit:
             audit.log(session_id, ROLE_SO, "PartitionInit", success=True,
                        detail=f"slot={slot_id}, label={label or p['name']}")
@@ -666,6 +687,47 @@ class TokenManager:
             flags = " ".join(fn for fval, fn in flag_names if info.supports(fval))
             lines.append(f"  {name:<30} {kr:<16} {flags}")
         return "\n".join(lines)
+
+    def _hsm_policy_values(self) -> dict:
+        from hsm.policies import get_default_hsm_policies
+        values = get_default_hsm_policies()
+        raw = self.storage.get_meta("hsm_policies")
+        if raw:
+            try:
+                values.update({int(key): value for key, value in json.loads(raw).items()})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return values
+
+    def show_hsm_policies(self, verbose: bool = False) -> str:
+        from hsm.policies import HSM_POLICY_CATALOG, format_policies_table
+        return "  HSM Policies:\n" + format_policies_table(
+            self._hsm_policy_values(), verbose=verbose, catalog=HSM_POLICY_CATALOG)
+
+    def change_hsm_policy(self, policy_name, value, force: bool = False,
+                          audit=None, session_id: int = 0):
+        from hsm.policies import get_hsm_policy, validate_policy_change
+        policy = get_hsm_policy(policy_name)
+        if policy is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
+                              f"HSM policy '{policy_name}' was not found")
+        values = self._hsm_policy_values()
+        old_value = values[policy.policy_id]
+        new_value = int(value) if str(value).isdigit() else (
+            1 if str(value).lower() in ("on", "true", "yes") else 0)
+        valid, error, destructive = validate_policy_change(policy, old_value, new_value)
+        if not valid:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, error)
+        if destructive and not force:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              "Destructive HSM policy change requires confirmation")
+        values[policy.policy_id] = new_value
+        self.storage.set_meta("hsm_policies", json.dumps(values))
+        if destructive and old_value != new_value:
+            self._erase_application_partitions()
+        if audit:
+            audit.log(session_id, "HSO", "HSMChangePolicy", success=True,
+                      detail=f"policy={policy.policy_id}, value={old_value}->{new_value}")
 
     def show_policies(self, slot_id: int, verbose: bool = False) -> str:
         """Show partition policies (partition showpolicies).
@@ -752,6 +814,19 @@ class TokenManager:
 
         # Apply the change
         self.storage.set_partition_policy(slot_id, policy.policy_id, new_value)
+        if policy.policy_id == 20:
+            self.storage.update_partition(slot_id, max_login_attempts=new_value)
+        if policy.policy_id == 44 and old_value == 1 and new_value == 0:
+            settings = self.domains._get_partition_settings()
+            setting = settings.get(str(slot_id), {})
+            if setting.get("domains"):
+                original = next((item for item in setting["domains"]
+                                 if item.get("original")), setting["domains"][0])
+                original["primary"] = True
+                original["original"] = True
+                setting["domains"] = [original]
+                setting["domain_id"] = original["domain_id"]
+                self.domains._save_partition_settings(settings)
 
         # If destructive, clear all objects
         if is_destructive:
@@ -817,7 +892,7 @@ class TokenManager:
 
     def get_min_pin_length(self, slot_id: int) -> int:
         """Get the minimum PIN length for this partition."""
-        return self.get_policy_value(slot_id, "MIN_PIN_LENGTH")
+        return 255 - self.get_policy_value(slot_id, "MIN_PIN_LENGTH")
 
     def get_max_login_attempts(self, slot_id: int) -> int:
         """Get the max login attempts for this partition."""
@@ -951,17 +1026,19 @@ class TokenManager:
             return f"  Slot {slot_id}: No partition present"
 
         lifecycle = self.lifecycle.status(slot_id)
-        descriptions = {"SO": "Security Officer", "CO": "Crypto Officer", "CU": "Crypto User"}
+        descriptions = {"SO": "Partition Security Officer", "CO": "Crypto Officer",
+                        "LCO": "Limited Crypto Officer", "CU": "Crypto User"}
         lines = [
             f"  Roles on partition '{p['name']}' (slot {slot_id}, {lifecycle['type']}):",
             "",
             f"  {'Role':<6} {'Description':<25} {'Initialized':<14} {'Status'}",
             "  " + "-" * 65,
         ]
-        for name in ("SO", "CO", "CU"):
+        for name in ("SO", "CO", "LCO", "CU"):
             role = lifecycle["roles"][name]
+            display_name = "PO" if name == "SO" else name
             init = "Yes" if role["initialized"] else "No"
-            lines.append(f"  {name:<6} {descriptions[name]:<25} {init:<14} {role['state']}")
+            lines.append(f"  {display_name:<6} {descriptions[name]:<25} {init:<14} {role['state']}")
         return "\n".join(lines)
 
     def show_role(self, slot_id: int, role_name: str) -> str:
@@ -971,12 +1048,14 @@ class TokenManager:
             return f"  Slot {slot_id}: No partition present"
 
         role_name = role_name.upper()
-        role_map = {"SO": ("so", "Security Officer"),
+        role_name = "SO" if role_name == "PO" else role_name
+        role_map = {"SO": ("so", "Partition Security Officer"),
                     "CO": ("co", "Crypto Officer"),
+                    "LCO": ("lco", "Limited Crypto Officer"),
                     "CU": ("cu", "Crypto User")}
 
         if role_name not in role_map:
-            return f"  Unknown role: {role_name}. Valid: SO, CO, CU"
+            return f"  Unknown role: {role_name}. Valid: PO, CO, LCO, CU"
 
         prefix, desc = role_map[role_name]
         role = self.lifecycle.status(slot_id)["roles"][role_name]
@@ -1003,9 +1082,11 @@ class TokenManager:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
 
         role_name = role_name.upper()
-        if role_name not in ("CO", "CU"):
+        if role_name not in ("CO", "LCO", "CU"):
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
-                              "Only CO and CU roles can be initialized with 'role init'")
+                              "Only CO, LCO, and CU roles can be initialized with 'role init'")
+        if role_name == "LCO" and self.lifecycle.status(slot_id)["version"] != 1:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, "LCO is available only on V1 partitions")
         ptype = self.lifecycle.partition_type(slot_id)
         superior = ROLE_SO if ptype == PARTITION_PPSO else ROLE_CO
         if actor_role != superior:
@@ -1029,9 +1110,9 @@ class TokenManager:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
 
         role_name = role_name.upper()
-        if role_name not in ("CO", "CU"):
+        if role_name not in ("CO", "LCO", "CU"):
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
-                              "Only CO and CU roles can be deactivated")
+                              "Only CO, LCO, and CU roles can be deactivated")
 
         ptype = self.lifecycle.partition_type(slot_id)
         superior = (ROLE_SO if ptype == PARTITION_PPSO else
@@ -1051,8 +1132,8 @@ class TokenManager:
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
-        if role_name not in ("CO", "CU"):
-            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED, "Only CO and CU can be activated")
+        if role_name not in ("CO", "LCO", "CU"):
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED, "Only CO, LCO, and CU can be activated")
         ptype = self.lifecycle.partition_type(slot_id)
         superior = (ROLE_SO if ptype == PARTITION_PPSO else
                     ("HSO" if role_name == "CO" else ROLE_CO))
@@ -1082,7 +1163,7 @@ class TokenManager:
             if actor_role != "HSO":
                 raise PKCS11Error(CKR_ACTION_PROHIBITED,
                                   "Only the HSM SO can reset the Partition SO")
-        elif role_name in ("CO", "CU"):
+        elif role_name in ("CO", "LCO", "CU"):
             ptype = self.lifecycle.partition_type(slot_id)
             superior = (ROLE_SO if ptype == PARTITION_PPSO else
                         ("HSO" if role_name == "CO" else ROLE_CO))

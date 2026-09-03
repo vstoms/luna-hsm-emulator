@@ -136,13 +136,17 @@ class Storage:
                 so_pin_salt TEXT,
                 co_pin_hash TEXT,
                 co_pin_salt TEXT,
+                lco_pin_hash TEXT,
+                lco_pin_salt TEXT,
                 cu_pin_hash TEXT,
                 cu_pin_salt TEXT,
                 so_login_attempts INTEGER DEFAULT 0,
                 co_login_attempts INTEGER DEFAULT 0,
+                lco_login_attempts INTEGER DEFAULT 0,
                 cu_login_attempts INTEGER DEFAULT 0,
                 so_locked INTEGER DEFAULT 0,
                 co_locked INTEGER DEFAULT 0,
+                lco_locked INTEGER DEFAULT 0,
                 cu_locked INTEGER DEFAULT 0,
                 max_login_attempts INTEGER DEFAULT 10,
                 flags INTEGER DEFAULT 0,
@@ -182,6 +186,16 @@ class Storage:
                 created_at REAL
             );
         """)
+        # Add newer role columns when opening a database created by an older
+        # emulator release.
+        columns = {row[1] for row in c.execute("PRAGMA table_info(partitions)")}
+        for name, declaration in (
+            ("lco_pin_hash", "TEXT"), ("lco_pin_salt", "TEXT"),
+            ("lco_login_attempts", "INTEGER DEFAULT 0"),
+            ("lco_locked", "INTEGER DEFAULT 0"),
+        ):
+            if name not in columns:
+                c.execute(f"ALTER TABLE partitions ADD COLUMN {name} {declaration}")
         self._conn.commit()
 
     # ------------------------------------------------------------------

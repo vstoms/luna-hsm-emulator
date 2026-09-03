@@ -71,8 +71,9 @@ class CloningDomainManager:
         if partition is None:
             raise CloningDomainError("LUNA_RET_PARTITION_NOT_FOUND",
                                      f"Partition slot {slot_id} not found")
-        setting = self._get_partition_settings().get(str(slot_id), {"inherit": True})
-        inherited = setting.get("inherit", True)
+        setting = self._get_partition_settings().get(
+            str(slot_id), {"inherit": False, "domain_id": None})
+        inherited = setting.get("inherit", False)
         domain_id = self.get_hsm_domain() if inherited else setting.get("domain_id")
         return {
             "slot_id": slot_id,
@@ -92,7 +93,7 @@ class CloningDomainManager:
     def _affected_inherited_slots(self) -> list:
         settings = self._get_partition_settings()
         return [p["slot_id"] for p in self.storage.get_all_partitions()
-                if settings.get(str(p["slot_id"]), {"inherit": True}).get("inherit", True)]
+                if settings.get(str(p["slot_id"]), {"inherit": False}).get("inherit", False)]
 
     def set_hsm_domain(self, domain_id: str, force: bool = False) -> dict:
         current = self.storage.get_meta(self.HSM_META)
@@ -124,8 +125,13 @@ class CloningDomainManager:
             )
         deleted = self._clear_slots([slot_id]) if changed and object_count and force else 0
         settings = self._get_partition_settings()
-        settings[str(slot_id)] = {"inherit": bool(inherit),
-                                  "domain_id": None if inherit else new_domain}
+        settings[str(slot_id)] = {
+            "inherit": bool(inherit),
+            "domain_id": None if inherit else new_domain,
+            "domains": [] if inherit else [
+                {"domain_id": new_domain, "label": "", "primary": True, "original": True}
+            ],
+        }
         self._save_partition_settings(settings)
         result = self.get_partition_domain(slot_id)
         result["objects_deleted"] = deleted
@@ -139,16 +145,114 @@ class CloningDomainManager:
                 deleted += 1
         return deleted
 
-    def assert_matching(self, source_slot: int, destination_slot: int) -> str:
-        source = self.get_partition_domain(source_slot)
-        destination = self.get_partition_domain(destination_slot)
-        if not source["domain_id"] or source["domain_id"] != destination["domain_id"]:
+    def list_domains(self, slot_id: int) -> list:
+        """Return all domains defined on a partition, including the primary."""
+        primary = self.get_partition_domain(slot_id)
+        settings = self._get_partition_settings()
+        setting = settings.get(str(slot_id), {})
+        domains = setting.get("domains")
+        if domains is None:
+            domains = ([{"domain_id": primary["domain_id"], "label": "",
+                         "primary": True, "original": True}] if primary["domain_id"] else [])
+        return [{**entry, "fingerprint": self.fingerprint(entry["domain_id"])}
+                for entry in domains]
+
+    def _extended_enabled(self, slot_id: int) -> bool:
+        from hsm.policies import get_policy_by_name
+        policy = get_policy_by_name("ALLOW_EXTENDED_DOMAIN_MANAGEMENT")
+        stored = self.storage.get_partition_policies(slot_id)
+        return bool(stored.get(policy.policy_id, policy.default_value))
+
+    def add_domain(self, slot_id: int, domain_id: str, label: str,
+                   primary: bool = False) -> dict:
+        if not self._extended_enabled(slot_id):
+            raise CloningDomainError("LUNA_RET_POLICY_ID_NOT_FOUND",
+                                     "Partition policy 44 must be enabled")
+        label = label or ""
+        settings = self._get_partition_settings()
+        setting = settings.get(str(slot_id))
+        if not setting or not setting.get("domain_id"):
+            raise CloningDomainError("LUNA_RET_INVALID_DOMAIN", "Partition is not initialized")
+        domains = setting.setdefault("domains", [
+            {"domain_id": setting["domain_id"], "label": "", "primary": True, "original": True}
+        ])
+        if len(domains) >= 3:
+            raise CloningDomainError("LUNA_RET_DOMAIN_COUNT_INVALID",
+                                     "A partition can contain at most three domains")
+        if any(item["domain_id"] == domain_id for item in domains):
+            raise CloningDomainError("LUNA_RET_DOMAIN_ALREADY_EXISTS", "Domain already exists")
+        if any(item["label"].lower() == label.lower() for item in domains):
+            raise CloningDomainError("LUNA_RET_DOMAIN_LABEL_INVALID",
+                                     "Domain label already exists or is not set")
+        if primary:
+            for item in domains:
+                item["primary"] = False
+            setting["domain_id"] = domain_id
+        entry = {"domain_id": domain_id, "label": label, "primary": primary,
+                 "original": False}
+        domains.append(entry)
+        self._save_partition_settings(settings)
+        return {**entry, "fingerprint": self.fingerprint(domain_id)}
+
+    def delete_domain(self, slot_id: int, label: str) -> dict:
+        if not self._extended_enabled(slot_id):
+            raise CloningDomainError("LUNA_RET_POLICY_ID_NOT_FOUND",
+                                     "Partition policy 44 must be enabled")
+        label = label or ""
+        settings = self._get_partition_settings()
+        setting = settings.get(str(slot_id), {})
+        domains = setting.get("domains", [])
+        entry = next((item for item in domains if item["label"].lower() == label.lower()), None)
+        if not entry:
+            raise CloningDomainError("LUNA_RET_DOMAIN_NOT_FOUND", f"Domain '{label}' not found")
+        if entry.get("original"):
+            raise CloningDomainError("LUNA_RET_OPERATION_RESTRICTED",
+                                     "The original partition domain cannot be deleted")
+        setting["domains"] = [item for item in domains if item is not entry]
+        self._save_partition_settings(settings)
+        return entry
+
+    def change_domain_label(self, slot_id: int, old_label: str, new_label: str,
+                            primary: bool = False) -> dict:
+        if not self._extended_enabled(slot_id):
+            raise CloningDomainError("LUNA_RET_POLICY_ID_NOT_FOUND",
+                                     "Partition policy 44 must be enabled")
+        old_label = old_label or ""
+        if not new_label:
+            raise CloningDomainError("LUNA_RET_DOMAIN_LABEL_INVALID", "A new label is required")
+        settings = self._get_partition_settings()
+        domains = settings.get(str(slot_id), {}).get("domains", [])
+        entry = next((item for item in domains if item["label"].lower() == old_label.lower()), None)
+        if not entry:
+            raise CloningDomainError("LUNA_RET_DOMAIN_NOT_FOUND", f"Domain '{old_label}' not found")
+        if any(item is not entry and item["label"].lower() == new_label.lower() for item in domains):
+            raise CloningDomainError("LUNA_RET_DOMAIN_LABEL_INVALID", "Domain label already exists")
+        entry["label"] = new_label
+        if primary:
+            for item in domains:
+                item["primary"] = item is entry
+            settings[str(slot_id)]["domain_id"] = entry["domain_id"]
+        self._save_partition_settings(settings)
+        return entry
+
+    def negotiate_cloning(self, source_slot: int, destination_slot: int) -> dict:
+        source_domains = sorted(self.list_domains(source_slot),
+                                key=lambda item: not item.get("primary"))
+        destination_ids = {entry["domain_id"] for entry in self.list_domains(destination_slot)}
+        shared = next((entry for entry in source_domains
+                       if entry["domain_id"] in destination_ids), None)
+        if not shared:
             raise CloningDomainError(
                 DOMAIN_MISMATCH_CODE,
                 f"Secure cloning failed: source slot {source_slot} and destination slot "
                 f"{destination_slot} do not share the same cloning domain",
             )
-        return source["domain_id"]
+        cpv4 = self._extended_enabled(source_slot) and self._extended_enabled(destination_slot)
+        return {"domain_id": shared["domain_id"], "domain_label": shared["label"],
+                "protocol": "CPv4" if cpv4 else "CPv3"}
+
+    def assert_matching(self, source_slot: int, destination_slot: int) -> str:
+        return self.negotiate_cloning(source_slot, destination_slot)["domain_id"]
 
     def _policy_enabled(self, slot_id: int, policy_name: str) -> bool:
         from hsm.policies import get_policy_by_name
@@ -164,7 +268,8 @@ class CloningDomainManager:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Source slot {source_slot} not found")
         if self.storage.get_partition(destination_slot) is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Destination slot {destination_slot} not found")
-        domain = self.assert_matching(source_slot, destination_slot)
+        negotiation = self.negotiate_cloning(source_slot, destination_slot)
+        domain = negotiation["domain_id"]
 
         existing_labels = {obj.label() for obj, _ in self.storage.get_all_objects(destination_slot)}
         cloned, skipped_policy, skipped_existing = [], [], []
@@ -201,6 +306,8 @@ class CloningDomainManager:
             "source_slot": source_slot,
             "destination_slot": destination_slot,
             "domain_fingerprint": self.fingerprint(domain),
+            "domain_label": negotiation["domain_label"],
+            "cloning_protocol": negotiation["protocol"],
             "cloned": cloned,
             "skipped_policy": skipped_policy,
             "skipped_existing": skipped_existing,

@@ -116,7 +116,7 @@ class LunaSHCommands:
             return
         if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR, ROLE_AUDIT):
             return
-        sub = args[0]
+        sub = args[0].lower()
 
         if sub == "cpu":
             cpu = self.appliance.get_cpu_status()
@@ -184,7 +184,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "login":
@@ -231,42 +231,43 @@ class LunaSHCommands:
         elif sub == "init":
             if not self._check_role(ROLE_ADMIN):
                 return
-            label = self._get_arg(rest, "-label") or "LunaHSM"
-            ped_mode = "-ped" in rest
-            password_mode = "-password" in rest
-            if ped_mode and password_mode:
-                print("  Error: Choose either -ped or -password authentication.")
+            label = self._get_arg(rest, "-label", "-l") or "LunaHSM"
+            state = self.appliance.hsm_state.load()
+            soft = state["initialized"]
+            if soft and not self.appliance.is_hsm_logged_in():
+                print("  Error: HSM SO login is required to re-initialize this HSM.")
                 return
-            if ped_mode:
-                self.appliance.ped.configure_hsm(label, "ped")
+            if not confirm_proceed(
+                    "Are you sure you wish to re-initialize this HSM?",
+                    "All partitions and data will be erased.",
+                    force=self._has_flag(rest, "-force", "-f")):
+                # Real Luna closes login/activation state even when init is aborted.
                 self.appliance._hsm_logged_in = False
-                print(f"  HSM '{label}' initialized in PED-authenticated mode.")
-                print("  Connect a PED and create a Blue key set before HSM login.")
-            else:
-                print("  Password-authenticated HSM — set HSM SO PIN:")
-                pin = getpass.getpass("  SO PIN: ")
-                confirm = getpass.getpass("  Confirm SO PIN: ")
-                if pin != confirm:
-                    print("  Error: PINs do not match.")
-                    return
-                if self.api:
-                    partitions = self.api.storage.get_all_partitions()
-                    if partitions:
-                        self.api.tokens.init_token(partitions[0]["slot_id"], pin)
-                        self.appliance.ped.configure_hsm(label, "password")
-                        print(f"  HSM '{label}' initialized in password-authenticated mode.")
-                    else:
-                        print("  No partitions to initialize.")
-                else:
-                    print("  HSM init not available (no API connected).")
+                return
 
-        elif sub == "factoryReset":
+            mode = state["auth_mode"] if soft else (
+                "ped" if self._has_flag(rest, "-ped") else "password")
+            password = self._get_arg(rest, "-password", "-p")
+            if mode == "password" and not soft and password is None:
+                password = getpass.getpass("  Enter password for HSM SO: ")
+                confirmation = getpass.getpass("  Re-enter password for HSM SO: ")
+                if password != confirmation:
+                    print("  Error: Passwords do not match.")
+                    return
+            if self.api:
+                self.api.tokens._erase_application_partitions()
+            self.appliance.hsm_state.initialize(label, mode, password, soft=soft)
+            self.appliance.ped.configure_hsm(label, mode)
+            self.appliance._hsm_logged_in = False
+            print(f"  'hsm init' successful ({mode}-authenticated).")
+
+        elif sub == "factoryreset":
             if not self._check_role(ROLE_ADMIN):
                 return
             if not confirm_proceed(
                     "Are you sure you wish to reset this HSM to factory default settings?",
                     "All partitions and data will be erased.",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             if self.api:
                 self.api.tokens.factory_reset()
@@ -281,47 +282,47 @@ class LunaSHCommands:
             if not confirm_proceed(
                     "Are you sure you wish to zeroize this HSM?",
                     "All partitions and key material will be permanently destroyed.",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             if self.api:
-                self.api.tokens.factory_reset()
-                print("  HSM zeroized. All key material destroyed.")
+                self.api.tokens.zeroize()
+                self.appliance._hsm_logged_in = False
+                print("  HSM zeroized. HSM policies, RPV, and Auditor settings retained.")
             else:
                 print("  Zeroize not available.")
 
         elif sub == "firmware":
             self._hsm_firmware(rest)
 
-        elif sub in ("showPolicies", "showpolicies"):
+        elif sub.lower() == "showpolicies":
             if self.api:
-                partitions = self.api.storage.get_all_partitions()
-                if partitions:
-                    print(self.api.tokens.show_policies(partitions[0]["slot_id"], verbose=True))
-                else:
-                    print("  No partitions configured.")
+                print(self.api.tokens.show_hsm_policies(verbose=True))
             else:
                 print("  HSM policies not available.")
 
-        elif sub in ("changePolicy", "changepolicy"):
+        elif sub.lower() == "changepolicy":
             if not self._check_hsm_login():
                 return
-            if self.api:
-                partitions = self.api.storage.get_all_partitions()
-                if not partitions:
-                    print("  No partitions configured.")
+            policy_name = self._get_arg(rest, "-policy", "-p")
+            value = self._get_arg(rest, "-value", "-v")
+            if not policy_name or value is None:
+                print("  Usage: hsm changePolicy -policy <id> -value <value> [-force]")
+                return
+            from hsm.policies import get_hsm_policy
+            policy = get_hsm_policy(policy_name)
+            force = self._has_flag(rest, "-force", "-f")
+            if policy and policy.destructive != "none" and not force:
+                if not confirm_proceed(
+                        "Are you sure you wish to change this destructive HSM policy?",
+                        "All application partitions and their contents will be erased."):
                     return
-                slot_id = partitions[0]["slot_id"]
-                policy_name = self._get_arg(rest, "-policy")
-                value = self._get_arg(rest, "-value")
-                if not policy_name or value is None:
-                    print("  Usage: hsm changePolicy -policy <id> -value <value>")
-                    return
-                try:
-                    self.api.tokens.change_policy(slot_id, policy_name, value,
-                                                    audit=self.api.audit, force=True)
-                    print(f"  Policy '{policy_name}' set to '{value}'.")
-                except PKCS11Error as e:
-                    print(f"  Error: {e}")
+                force = True
+            try:
+                self.api.tokens.change_hsm_policy(
+                    policy_name, value, audit=self.api.audit, force=force)
+                print(f"  HSM policy '{policy_name}' set to '{value}'.")
+            except PKCS11Error as error:
+                print(f"  Error: {error}")
 
         elif sub == "stm":
             self._hsm_stm(rest)
@@ -329,7 +330,7 @@ class LunaSHCommands:
         elif sub == "ped":
             self.cmd_ped(rest)
 
-        elif sub == "selfTest":
+        elif sub == "selftest":
             print("  Running HSM self-test...")
             time.sleep(0.5)
             print("  Self-test PASSED. All cryptographic operations functional.")
@@ -348,7 +349,7 @@ class LunaSHCommands:
             else:
                 print(f"  Unknown information subcommand: {rest[0]}")
 
-        elif sub == "supportInfo":
+        elif sub == "supportinfo":
             self.cmd_support([])
 
         else:
@@ -408,7 +409,7 @@ class LunaSHCommands:
             n = int(self._get_arg(rest, "-n") or 1)
             scope = self._get_arg(rest, "-scope") or "hsm"
             secret = self._get_arg(rest, "-secret")
-            if "-sharedsecret" in rest and secret is None:
+            if self._has_flag(rest, "-sharedsecret") and secret is None:
                 secret = getpass.getpass("  Shared secret: ")
                 if secret != getpass.getpass("  Confirm shared secret: "):
                     raise PEDError("PED_SHARED_SECRET_MISMATCH", "Shared secrets do not match")
@@ -458,7 +459,7 @@ class LunaSHCommands:
         if not args:
             print("  Usage: hsm firmware show | upgrade | rollback")
             return
-        sub = args[0]
+        sub = args[0].lower()
         if sub == "show":
             if self.api:
                 info = self.api.tokens.get_firmware_info()
@@ -499,7 +500,7 @@ class LunaSHCommands:
         if not args:
             print("  Usage: hsm stm show | hsm stm recover -string <s> | hsm stm transport")
             return
-        sub = args[0]
+        sub = args[0].lower()
         if sub == "show":
             print("  Secure Transport Mode (STM): Not active")
             print("  HSM has been initialized and is operational.")
@@ -527,7 +528,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "list":
@@ -541,20 +542,21 @@ class LunaSHCommands:
                 return
             if not self._check_hsm_login():
                 return
-            name = self._get_arg(rest, "-name") or input("  Partition name: ")
-            label = self._get_arg(rest, "-label") or name
-            partition_type = (self._get_arg(rest, "-type") or "ppso").upper()
-            max_objects = int(self._get_arg(rest, "-maxobjects") or 1024)
-            max_storage = int(self._get_arg(rest, "-storage") or 1048576)
+            name = self._get_arg(rest, "-partition", "-pa")
+            size = int(self._get_arg(rest, "-size", "-s") or 1048576)
+            version = int(self._get_arg(rest, "-version", "-v") or 0)
             if not name:
-                print("  Usage: partition create -name <name> [-label <label>] [-type ppso|legacy]")
+                print("  Usage: partition create -partition <name> [-size <bytes>] [-version 0|1] [-force]")
+                return
+            if not confirm_proceed(
+                    f"Create application partition '{name}' using {size} bytes?",
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             try:
                 if self.api:
                     slot_id = self.api.tokens.create_partition(
-                        name, label, max_objects=max_objects, max_storage=max_storage,
-                        partition_type=partition_type)
-                    print(f"  Partition '{name}' created. Slot ID: {slot_id}")
+                        name, max_storage=size, version=version)
+                    print(f"  'partition create' successful. Slot ID: {slot_id}")
             except PKCS11Error as e:
                 print(f"  Error: {e}")
 
@@ -563,13 +565,13 @@ class LunaSHCommands:
                 return
             if not self._check_hsm_login():
                 return
-            name = self._get_arg(rest, "-name")
+            name = self._get_arg(rest, "-partition", "-pa")
             if not name:
-                print("  Usage: partition delete -name <name>")
+                print("  Usage: partition delete -partition <name> [-force]")
                 return
             if not confirm_proceed(
                     f"Are you sure you wish to delete the partition named: {name}",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             try:
                 if self.api:
@@ -599,36 +601,49 @@ class LunaSHCommands:
                 return
             if not self._check_hsm_login():
                 return
-            name = self._get_arg(rest, "-name")
+            name = self._get_arg(rest, "-partition", "-par")
+            label = self._get_arg(rest, "-label", "-l")
             if not name:
-                print("  Usage: partition init -name <name>")
+                print("  Usage: partition init -partition <name> [-label <label>] [-password <PO_password>] [-domain <domain>] [-force]")
                 return
+            label = label or name
             if self.api:
-                p = self.api.storage.get_partition_by_name(name)
-                if not p:
+                partition = self.api.storage.get_partition_by_name(name)
+                if not partition:
                     print(f"  Partition '{name}' not found.")
                     return
-                partition_type = self.api.tokens.lifecycle.partition_type(p["slot_id"])
-                initial_role = "Partition Owner (CO)" if partition_type == "LEGACY" else "Partition SO"
-                print(f"  Set credential for {initial_role}:")
-                pin = getpass.getpass("  Credential: ")
-                confirm = getpass.getpass("  Confirm credential: ")
-                if pin != confirm:
-                    print("  Error: PINs do not match.")
+                if not confirm_proceed(
+                        "You are about to initialize the partition.",
+                        "All contents of the partition will be destroyed.",
+                        force=self._has_flag(rest, "-force", "-f")):
                     return
-                self.api.tokens.init_token(p["slot_id"], pin)
-                print(f"  Partition '{name}' initialized ({partition_type}); {initial_role} credential set.")
+                password = self._get_arg(rest, "-password", "-pas")
+                domain = self._get_arg(rest, "-domain", "-d")
+                if password is None:
+                    password = getpass.getpass("  Enter password for Partition PO: ")
+                    confirmation = getpass.getpass("  Re-enter password for Partition PO: ")
+                    if password != confirmation:
+                        print("  Error: Passwords do not match.")
+                        return
+                if domain is None:
+                    domain = getpass.getpass("  Enter the domain name: ")
+                    confirmation = getpass.getpass("  Re-enter the domain name: ")
+                    if domain != confirmation:
+                        print("  Error: Domains do not match.")
+                        return
+                self.api.tokens.init_token(partition["slot_id"], password, label, domain)
+                print(f"  'partition init' successful; PO credential and cloning domain created.")
 
-        elif sub in ("showPolicies", "showpolicies"):
+        elif sub == "showpolicies":
             if self.api:
                 partitions = self.api.storage.get_all_partitions()
                 if partitions:
-                    verbose = "-verbose" in rest
+                    verbose = self._has_flag(rest, "-verbose", "-v")
                     print(self.api.tokens.show_policies(partitions[0]["slot_id"], verbose=verbose))
                 else:
                     print("  No partitions configured.")
 
-        elif sub in ("changePolicy", "changepolicy"):
+        elif sub == "changepolicy":
             if not self._check_hsm_login():
                 return
             if self.api:
@@ -658,7 +673,7 @@ class LunaSHCommands:
                 return
             if not confirm_proceed(
                     f"Are you sure you wish to delete all objects on partition: {name}",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             if self.api:
                 p = self.api.storage.get_partition_by_name(name)
@@ -759,7 +774,7 @@ class LunaSHCommands:
             elif action == "set":
                 if not self._check_hsm_login():
                     return
-                inherit = "-inherit" in rest
+                inherit = self._has_flag(rest, "-inherit")
                 domain_id = None
                 if not inherit:
                     if self.appliance.ped.get_auth_mode() == "ped":
@@ -780,11 +795,11 @@ class LunaSHCommands:
                                 print("  Error: Cloning domain secrets do not match.")
                                 return
                         domain_id = self.api.tokens.domains.domain_from_secret(domain_secret)
-                target_hsm = "-hsm" in rest
+                target_hsm = self._has_flag(rest, "-hsm")
                 object_count = (sum(self.api.storage.count_objects(p["slot_id"])
                                     for p in self.api.storage.get_all_partitions())
                                 if target_hsm else self.api.storage.count_objects(slot_id))
-                force = "-force" in rest
+                force = self._has_flag(rest, "-force", "-f")
                 if object_count and not force:
                     if not confirm_proceed(
                             "Changing the cloning domain will zeroize all affected objects."):
@@ -817,7 +832,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "list":
@@ -853,7 +868,7 @@ class LunaSHCommands:
                 return
             if not confirm_proceed(
                     f"Are you sure you wish to delete the user: {username}",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             result = self.appliance.delete_user(username)
             if result["success"]:
@@ -917,7 +932,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "list":
@@ -975,7 +990,7 @@ class LunaSHCommands:
             print(f"  Assigned Partitions: {client['assigned_partitions']}")
             print(f"  Created:         {client['created']}")
 
-        elif sub == "assignPartition":
+        elif sub == "assignpartition":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
                 return
             name = self._get_arg(rest, "-name")
@@ -989,7 +1004,7 @@ class LunaSHCommands:
             else:
                 print(f"  Error: {result['error']}")
 
-        elif sub == "revokePartition":
+        elif sub == "revokepartition":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
                 return
             name = self._get_arg(rest, "-name")
@@ -1017,7 +1032,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "show":
@@ -1054,9 +1069,11 @@ class LunaSHCommands:
 
         elif sub == "interface":
             if not rest:
-                print("  Usage: network interface static|dhcp <interface> [-ip <ip> -netmask <mask> -gateway <gw>]")
+                print("  Usage: network interface static|dhcp|bonding ...")
                 return
-            mode = rest[0]
+            if rest[0].lower() == "bonding":
+                return self.cmd_bond(rest[1:])
+            mode = rest[0].lower()
             iface = rest[1] if len(rest) > 1 else "eth0"
             if mode == "static":
                 ip = self._get_arg(rest, "-ip")
@@ -1081,12 +1098,12 @@ class LunaSHCommands:
             if not rest:
                 print("  Usage: network dns add|delete nameserver <ip> | network dns add|delete searchdomain <domain>")
                 return
-            action = rest[0]
+            action = rest[0].lower()
             if action in ("add", "delete"):
                 if len(rest) < 3:
                     print(f"  Usage: network dns {action} nameserver|searchdomain <value>")
                     return
-                dtype = rest[1]
+                dtype = rest[1].lower()
                 value = rest[2]
                 if not self._check_role(ROLE_ADMIN):
                     return
@@ -1104,7 +1121,7 @@ class LunaSHCommands:
             if not rest:
                 print("  Usage: network route add|delete|show")
                 return
-            action = rest[0]
+            action = rest[0].lower()
             if action == "show":
                 routes = self.appliance.show_routes()
                 for r in routes:
@@ -1158,7 +1175,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "show":
@@ -1316,7 +1333,7 @@ class LunaSHCommands:
         if not args:
             print("  Usage: ntls connection list | create | delete | connect | disconnect | restore | show")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "list":
@@ -1483,7 +1500,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "show":
@@ -1588,7 +1605,7 @@ class LunaSHCommands:
                 self.appliance.connections.disable_stc_hmac()
                 print("  STC HMAC disabled.")
 
-        elif sub in ("rekeyThreshold", "rekeythreshold"):
+        elif sub == "rekeythreshold":
             if not rest:
                 print("  Usage: stc rekeyThreshold set <n> | show")
                 return
@@ -1608,7 +1625,7 @@ class LunaSHCommands:
                 else:
                     print(f"  Error: {result['error']}")
 
-        elif sub in ("activationTimeOut", "activationtimeout"):
+        elif sub == "activationtimeout":
             if not rest:
                 print("  Usage: stc activationTimeOut set <n> | show")
                 return
@@ -1639,7 +1656,7 @@ class LunaSHCommands:
             if not confirm_proceed(
                     f"Are you sure you wish to convert the NTLS connection for client",
                     f"'{client}' on slot {slot} to STC?  This operation is irreversible.",
-                    force="-force" in rest):
+                    force=self._has_flag(rest, "-force", "-f")):
                 return
             result = self.appliance.connections.convert_ntls_to_stc(client, int(slot))
             if result["success"]:
@@ -1678,7 +1695,7 @@ class LunaSHCommands:
         if not args:
             print("  Usage: stc identity create | delete | list | show | export")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "create":
@@ -1776,7 +1793,7 @@ class LunaSHCommands:
         if not args:
             print("  Usage: stc connection create | delete | list | connect | disconnect | restore")
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "list":
@@ -1893,14 +1910,19 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
-        if sub in ("regenCert", "regencert"):
+        if sub == "ntp":
+            return self.cmd_ntp(rest)
+        if sub == "license":
+            return self.cmd_license(rest)
+
+        if sub == "regencert":
             if not self._check_role(ROLE_ADMIN):
                 return
-            force = "-force" in rest
-            csr = "-csr" in rest
+            force = self._has_flag(rest, "-force", "-f")
+            csr = self._has_flag(rest, "-csr")
             hostname = self._get_arg(rest, "-hostname")
             key_type = self._get_arg(rest, "-keytype") or "RSA"
             key_size = int(self._get_arg(rest, "-keysize") or 2048)
@@ -2000,7 +2022,7 @@ class LunaSHCommands:
                 else:
                     print("  No banner set.")
 
-        elif sub in ("forceSOLogin", "forcesologin"):
+        elif sub == "forcesologin":
             if not rest:
                 config = self.appliance.get_sysconf()
                 print(f"  Force SO Login: {'Enabled' if config['force_so_login'] else 'Disabled'}")
@@ -2041,14 +2063,14 @@ class LunaSHCommands:
                 if not self._check_role(ROLE_ADMIN):
                     return
                 if confirm_proceed("Are you sure you wish to reboot the appliance?",
-                                   force="-force" in rest):
+                                   force=self._has_flag(rest, "-force", "-f")):
                     result = self.appliance.reboot()
                     print(f"  {result['message']}")
             elif rest[0] == "poweroff":
                 if not self._check_role(ROLE_ADMIN):
                     return
                 if confirm_proceed("Are you sure you wish to power off the appliance?",
-                                   force="-force" in rest):
+                                   force=self._has_flag(rest, "-force", "-f")):
                     result = self.appliance.poweroff()
                     print(f"  {result['message']}")
                 else:
@@ -2074,7 +2096,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
 
         if sub == "list":
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR, ROLE_MONITOR):
@@ -2151,7 +2173,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "show":
@@ -2188,7 +2210,7 @@ class LunaSHCommands:
             if not rest:
                 print("  Usage: syslog remotehost add|delete|list <host>")
                 return
-            action = rest[0]
+            action = rest[0].lower()
             if action == "list":
                 config = self.appliance.get_syslog_config()
                 if config["remote_hosts"]:
@@ -2229,7 +2251,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
 
         if sub == "password":
             if args[1:] and args[1] == "set":
@@ -2275,7 +2297,7 @@ class LunaSHCommands:
             return
         if not self._check_role(ROLE_ADMIN):
             return
-        sub = args[0]
+        sub = args[0].lower()
 
         if sub == "list":
             packages = self.appliance.list_packages()
@@ -2315,7 +2337,7 @@ class LunaSHCommands:
 
         elif sub == "erase":
             if confirm_proceed("Are you sure you wish to erase all package files?",
-                               force="-force" in args[1:]):
+                               force=self._has_flag(args, "-force", "-f")[1:]):
                 print("  All package files erased.")
 
         else:
@@ -2334,7 +2356,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "backup":
@@ -2343,7 +2365,7 @@ class LunaSHCommands:
                 print("         partition list | partition show | partition delete |")
                 print("         update firmware | update show")
                 return
-            bsub = rest[0]
+            bsub = rest[0].lower()
             brest = rest[1:]
 
             if bsub == "show":
@@ -2394,13 +2416,13 @@ class LunaSHCommands:
                 else:
                     print("  Not logged in to backup HSM.")
 
-            elif bsub == "factoryReset":
+            elif bsub == "factoryreset":
                 if not self._check_role(ROLE_ADMIN):
                     return
                 if confirm_proceed(
                         "Are you sure you wish to reset the backup HSM to factory default settings?",
                         "All backup partitions and data will be erased.",
-                        force="-force" in brest):
+                        force=self._has_flag(brest, "-force", "-f")):
                     if self.api:
                         self.api.backup.factory_reset(audit=self.api.audit)
                         print("  Backup HSM reset to factory defaults.")
@@ -2409,7 +2431,7 @@ class LunaSHCommands:
                 if not brest:
                     print("  Usage: token backup partition list | show | delete")
                     return
-                psub = brest[0]
+                psub = brest[0].lower()
                 if psub == "list":
                     if self.api and self.api.backup.is_logged_in():
                         parts = self.api.backup.list_backup_partitions()
@@ -2428,7 +2450,7 @@ class LunaSHCommands:
                 if not brest:
                     print("  Usage: token backup update firmware | show")
                     return
-                usub = brest[0]
+                usub = brest[0].lower()
                 if usub == "firmware":
                     if self.api and self.api.backup.is_connected():
                         info = self.api.backup.get_firmware_info()
@@ -2463,7 +2485,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
 
         if sub == "login":
             if self.appliance.is_audit_logged_in():
@@ -2509,7 +2531,7 @@ class LunaSHCommands:
             if not args[1:]:
                 print("  Usage: audit log list | verify | clear | tail")
                 return
-            lsub = args[1]
+            lsub = args[1].lower()
             if lsub == "list":
                 if self.api:
                     logs = self.api.storage.get_audit_logs()
@@ -2522,7 +2544,7 @@ class LunaSHCommands:
                     print("  Error: Auditor login required.")
                     return
                 if confirm_proceed("Are you sure you wish to clear all audit logs?",
-                                   force="-force" in args[2:]):
+                                   force=self._has_flag(args, "-force", "-f")[2:]):
                     if self.api:
                         self.api.storage.clear_audit_logs()
                         print("  Audit logs cleared.")
@@ -2554,7 +2576,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
         if sub in ("setmode", "recovery", "fail", "recover", "network", "operation", "firmware"):
             if not self._check_role(ROLE_ADMIN, ROLE_OPERATOR):
@@ -2736,7 +2758,7 @@ class LunaSHCommands:
         elif sub == "operation":
             name = self._get_arg(rest, "-name")
             operation = self._get_arg(rest, "-operation") or "crypto-operation"
-            session_object = "-sessionobject" in rest
+            session_object = self._has_flag(rest, "-sessionobject")
             result = self.appliance.deployment.route_ha_operation(name, operation, session_object) if name else {
                 "success": False, "error": "Usage: ha operation -name <group> [-operation <name>] [-sessionobject]"}
             if result["success"]:
@@ -2818,7 +2840,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "show":
@@ -2893,7 +2915,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "show":
@@ -2989,7 +3011,7 @@ class LunaSHCommands:
             return
         if not self._check_login():
             return
-        sub = args[0]
+        sub = args[0].lower()
         rest = args[1:]
 
         if sub == "list":
@@ -3088,207 +3110,41 @@ class LunaSHCommands:
     # ------------------------------------------------------------------
 
     def cmd_help(self, args: list):
-        """Show LunaSH command reference."""
+        """Show the canonical LunaSH top-level hierarchy."""
         print("""
-  LunaSH Command Reference (Luna Network HSM 7 Appliance Shell)
+  LunaSH Commands
 
-  Authentication:
-    login                               Log in to the appliance
-    logout                              Log out of the appliance
+    audit          HSM audit tasks               client       Manage HSM clients
+    cluster        Manage appliance clusters     hsm          Manage the HSM
+    keyring        Manage cluster keyrings        my           Current-user settings
+    network        Network configuration          ntls         Network Trust Link Service
+    package        Secure package updates         partition    Application partitions
+    service        Appliance services             status       Appliance status
+    stc            Secure Trusted Channel         sysconf      Appliance configuration
+    syslog         System logs                    token backup Backup HSM commands
+    user           Appliance users and roles      webserver    REST API service
 
-  System Status:
-    status cpu                          Show CPU usage
-    status mem                          Show memory usage
-    status disk                         Show disk usage
-    status date                         Show current date/time
-    status interface                    Show network interfaces
-    status ps                           Show running processes
-    status netstat                      Show network connections
-    status sensors                      Show hardware sensors
-
-  HSM Management:
-    hsm login                            Log in as HSO (requires SO PIN)
-    hsm logout                           Log out HSM SO
-    hsm show                             Show HSM info
-    hsm init                             Initialize HSM (set SO PIN)
-    hsm factoryReset                     Factory reset HSM (destructive)
-    hsm zeroize                          Zeroize HSM (destroys all keys)
-    hsm firmware show                    Show firmware info
-    hsm firmware upgrade -version <v>   Upgrade HSM firmware
-    hsm firmware rollback                Roll back HSM firmware
-    hsm showPolicies                     Show HSM policies
-    hsm changePolicy -policy <id> -value <v>  Change HSM policy
-    hsm stm show                         Show Secure Transport Mode status
-    hsm stm recover -string <s>          Recover from STM
-    hsm ped show                         Show PED status (also available as 'ped show')
-    ped connect [-remote <host>]          Connect a local or remote PED
-    ped disconnect                       Disconnect the PED
-    ped key create -type <color> [-m M -n N] [-sharedsecret] [-scope <slot>]
-    ped key list                         List PED key sets and recovery status
-    ped key duplicate -serial <s>        Duplicate a PED key share
-    ped key lose -serial <s>             Mark a PED key copy lost
-    hsm selfTest                         Run HSM self-test
-    hsm time                             Show HSM time
-    hsm information show                 Show HSM information
-
-  Partition Management:
-    partition list                       List all partitions
-    partition create -name <n> [-label <l>] [-type ppso|legacy]
-                                           Create an inheriting partition
-    partition delete -name <n>           Delete a partition (HSM SO required)
-    partition show [-partition <n>]      Show complete partition lifecycle status
-    partition init -name <n>             Initialize a partition (set SO PIN)
-    partition showPolicies [-verbose]    Show partition policies
-    partition changePolicy -policy <id> -value <v>  Change partition policy
-    partition clear -name <n>            Clear all objects on a partition
-    partition activate -name <n>          Activate a partition
-    partition deactivate -name <n>       Deactivate a partition
-    partition rename -name <n> -newname <n>  Rename a partition
-    partition resize -name <n> -size <s>  Resize a partition
-    partition domain show [-slot <id>]    Show effective HSM/partition domain
-    partition domain set [-slot <id>] [-inherit|-domain <secret>|-keys <red serials>]
-    partition clone -source <id> -destination <id> [-labels a,b]
-                                           Securely clone matching-domain objects
-
-  User Management:
-    user list                            List all appliance users
-    user add -name <u> -role <r>          Add a user (admin, operator, monitor, audit)
-    user delete -name <u>                 Delete a user
-    user enable -name <u>                 Enable a user account
-    user disable -name <u>                Disable a user account
-    user password -name <u>               Set user password
-
-  Client Management:
-    client list                           List registered clients
-    client register -name <n> [-ip <ip>]  Register a client
-    client delete -name <n>               Delete a client
-    client show -name <n>                 Show client details
-    client assignPartition -name <c> -partition <s>  Assign partition to client
-    client revokePartition -name <c> -partition <s>  Revoke partition from client
-
-  Network:
-    network show                          Show network configuration
-    network hostname <hostname>           Set hostname
-    network interface static <iface> -ip <ip> -netmask <mask> [-gateway <gw>]
-    network interface dhcp <iface>        Set interface to DHCP
-    network dns add|delete nameserver <ip>  Manage DNS nameservers
-    network route add|delete|show         Manage network routes
-    network ping <host>                   Ping a host
-
-  NTLS:
-    ntls show                             Show NTLS status
-    ntls bind <interface>                 Bind NTLS to interface
-    ntls certificate show                 Show NTLS certificate
-
-  System Configuration:
-    sysconf timezone set|show <tz>        Set/show timezone
-    sysconf banner add <text> | clear | show  Manage login banner
-    sysconf forceSOLogin enable|disable   Enable/disable forced SO login
-    sysconf ssh port <port> | show         Configure SSH
-    sysconf regenCert [-csr] [-force] [-hostname <h>]   Regenerate NTLS server certificate
-      [-keytype RSA|EC] [-keysize <n>] [-curve <name>] [-days <n>]
-      [-country <c>] [-state <s>] [-location <l>] [-organization <o>]
-      [-orgunit <u>] [-email <e>] [-san <san>]
-    sysconf appliance reboot | poweroff    Reboot/poweroff appliance
-
-  Services:
-    service list                          List all services
-    service start <name>                  Start a service
-    service stop <name>                   Stop a service
-    service restart <name>                Restart a service
-    service status <name>                 Show service status
-
-  Syslog:
-    syslog show                           Show syslog configuration
-    syslog severity set <level>           Set syslog severity
-    syslog rotate                          Rotate system logs
-    syslog remotehost add|delete|list <h>  Manage remote syslog hosts
-
-  My (current user):
-    my password set                       Change current user's password
-    my password expiry show               Show password expiry
-    my file list                          List current user's files
-    my public-key list                    List current user's public keys
-
-  Package Management:
-    package list                          List available packages
-    package verify <filename>             Verify package signature
-    package update <filename>             Apply package update
-    package listfile                      List files in package directory
-    package deletefile <filename>         Delete a package file
-    package erase                         Erase all package files
-
-  Backup HSM (via LunaSH):
-    token backup show                     Show backup HSM status
-    token backup init                     Initialize backup HSM
-    token backup login                    Login to backup HSM
-    token backup logout                   Logout of backup HSM
-    token backup list                     List backup partitions
-    token backup factoryReset             Factory reset backup HSM
-    token backup partition list           List backup partitions
-    token backup update firmware          Show backup HSM firmware info
-    token backup update show              Show backup HSM update status
-
-  Audit:
-    audit login                           Login as Auditor
-    audit logout                           Logout Auditor
-    audit show                             Show audit summary
-    audit log list                         List audit log entries
-    audit log verify                       Verify audit chain
-    audit log clear                        Clear audit logs
-    audit log tail                         Show recent audit entries
-
-  High Availability:
-    ha list                                List all HA groups
-    ha create -name <n> -slot <id> [-label <l>]  Create an HA group
-    ha delete -name <n>                   Delete an HA group
-    ha show -name <n>                     Show HA group details and members
-    ha addmember -name <n> -slot <id>     Add a partition member to an HA group
-    ha removemember -name <n> -slot <id>  Remove a member from an HA group
-    ha setretry -name <n> -retry <count|-1>  Set retry count (-1 for infinite polling)
-    ha setinterval -name <n> -interval <s>  Set polling interval in seconds
-    ha setmode -name <n> -mode <round-robin|active-standby>
-    ha recovery -name <n> -mode <automatic|manual>
-    ha synchronize -name <n>             Synchronize persistent objects across members
-    ha operation -name <n> -operation <op>  Route a load-balanced operation
-    ha fail|recover -name <n> -slot <id>  Fail or recover a member
-    ha network -name <n> -slot <id> -state <partitioned|restored>
-    ha firmware -name <n> -slot <id> -version <v>  Simulate member firmware
-    ha status -name <n>                   Show member availability and sync status
-
-  NTP:
-    ntp show                               Show NTP configuration
-    ntp add <server>                       Add an NTP server
-    ntp delete <server>                    Delete an NTP server
-    ntp enable                             Enable NTP
-    ntp disable                            Disable NTP
-    ntp sync                               Force NTP synchronization
-
-  Network Bonding:
-    bond show                              Show all configured bonds
-    bond configure -name <bond0|bond1> -members <eth0,eth1> -ip <ip> -netmask <mask> [-gateway <gw>]
-    bond enable -name <bond_name>          Enable a bond
-    bond disable -name <bond_name>         Disable a bond
-    bond delete -name <bond_name>          Delete a bond
-
-  Licenses:
-    license list                           List all installed licenses
-    license show <name>                    Show details of a specific license
-    license setlimit -name <n> -limit <v>  Set a license limit
-    license enable -name <n>               Enable a license
-    license disable -name <n>              Disable a license
-
-  Support:
-    hsm supportInfo                        Generate a sanitized diagnostic support bundle
+  Type 'help <command>' or '<command> ?' for command syntax.
+  Commands and options are case-insensitive. 'exit' leaves LunaSH.
 """)
+
+    def cmd_unavailable(self, args: list):
+        """Expose the documented menu while clearly marking unimplemented groups."""
+        print("  This documented LunaSH command group is not implemented yet.")
 
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
 
-    def _get_arg(self, args: list, flag: str) -> str:
-        """Extract a -flag value from args list."""
-        for i, a in enumerate(args):
-            if a == flag and i + 1 < len(args):
-                return args[i + 1]
+    @staticmethod
+    def _has_flag(args: list, *flags: str) -> bool:
+        wanted = {flag.lower() for flag in flags}
+        return any(arg.lower() in wanted for arg in args)
+
+    def _get_arg(self, args: list, *flags: str) -> str:
+        """Extract an option value; Luna commands and options ignore case."""
+        wanted = {flag.lower() for flag in flags}
+        for index, argument in enumerate(args):
+            if argument.lower() in wanted and index + 1 < len(args):
+                return args[index + 1]
         return None

@@ -83,6 +83,17 @@ class PEDManager:
     def get_auth_mode(self) -> str:
         return self._load()["auth_mode"]
 
+    def zeroize(self):
+        """Erase HSM/partition identities while retaining RPV and Auditor data."""
+        state = self._load()
+        state["hsm_label"] = ""
+        state["connection"] = {"state": "disconnected", "mode": None, "host": None}
+        state["key_sets"] = [
+            key_set for key_set in state["key_sets"]
+            if key_set.get("type") in ("orange", "white")
+        ]
+        self._save(state)
+
     def factory_reset(self):
         """Erase all PED vectors, key sets, and connection state."""
         self._save(self._default_state())

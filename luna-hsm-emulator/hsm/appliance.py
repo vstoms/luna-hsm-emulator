@@ -180,6 +180,8 @@ class Appliance:
         self._boot_time = time.time()
         self.connections = ConnectionManager(storage)
         self.ped = PEDManager(storage)
+        from hsm.hsm_state import HSMStateManager
+        self.hsm_state = HSMStateManager(storage)
         self.deployment = DeploymentManager(storage)
         self._ensure_state()
 
@@ -389,17 +391,36 @@ class Appliance:
             self._hsm_logged_in = True
             return {"success": True, "auth_mode": "ped", "quorum": quorum.shares_presented}
 
-        partitions = self.storage.get_all_partitions()
-        if not partitions:
-            return {"success": False, "error": "No partitions configured"}
-        slot_id = partitions[0]["slot_id"]
-        partition = self.storage.get_partition(slot_id)
-        stored_hash = partition.get("so_pin_hash")
-        stored_salt = partition.get("so_pin_salt")
-        if not stored_hash or not stored_salt:
-            return {"success": False, "error": "HSM SO PIN not initialized"}
-        if not so_pin or not self.storage.verify_pin(so_pin, stored_hash, stored_salt):
-            return {"success": False, "error": "Invalid HSM SO PIN"}
+        state = self.hsm_state.load()
+        if not state["initialized"]:
+            # One-time migration for databases created before HSM-level state
+            # was modeled independently from application partitions.
+            partitions = self.storage.get_all_partitions()
+            legacy = self.storage.get_partition(partitions[0]["slot_id"]) if partitions else None
+            if legacy and legacy.get("so_pin_hash") and legacy.get("so_pin_salt"):
+                state.update({"initialized": True, "zeroized": False,
+                              "label": self.ped.status().get("hsm_label", "LunaHSM"),
+                              "auth_mode": "password",
+                              "so_pin_hash": legacy["so_pin_hash"],
+                              "so_pin_salt": legacy["so_pin_salt"]})
+                self.hsm_state.save(state)
+        authenticated, zeroize_required, remaining = \
+            self.hsm_state.authenticate_password(so_pin)
+        if not authenticated:
+            if zeroize_required:
+                # Three failed HSM SO attempts destroy user material on a Luna 7.
+                from hsm.token import TokenManager
+                from hsm.auth import AuthManager
+                TokenManager(self.storage, AuthManager(self.storage)).zeroize()
+                self._hsm_logged_in = False
+                return {"success": False, "error":
+                        "HSM SO authentication failed three times; HSM zeroized",
+                        "zeroized": True}
+            state = self.hsm_state.load()
+            if not state["initialized"]:
+                return {"success": False, "error": "HSM SO credential is not initialized"}
+            return {"success": False, "error":
+                    f"Invalid HSM SO password; {remaining} attempt(s) remaining"}
         self._hsm_logged_in = True
         return {"success": True, "auth_mode": "password"}
 
