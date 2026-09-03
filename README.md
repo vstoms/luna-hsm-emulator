@@ -7,7 +7,7 @@ A fully functional software emulator of the Thales Luna 7 Network HSM, built for
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![PKCS#11](https://img.shields.io/badge/PKCS%2311-v2.40-green)](https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html)
 [![License](https://img.shields.io/badge/License-Educational-orange)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-274%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-281%20passing-brightgreen)](#testing)
 
 </div>
 
@@ -95,13 +95,32 @@ Four-role hierarchy with PIN lockout policies and PED (PIN Entry Device) simulat
 | **CO** (Crypto Officer) | Key generation, deletion, wrapping, attribute management |
 | **CU** (Crypto User) | Cryptographic operations only (encrypt, decrypt, sign, verify) |
 
+### Cloning Domains, Backup, and High Availability
+
+- HSM-level cloning domains inherited by new partitions, with optional partition overrides
+- Password-derived domains and Red PED-key domains
+- Direct secure partition-to-partition cloning only when domain fingerprints match
+- Cloning-policy enforcement for private and secret keys
+- Backup and HA synchronization use the same domain-matching rules
+- Domain changes on populated partitions require explicit destructive zeroization
+
+Cloning is distinct from wrapping: secure cloning can transfer sensitive, non-extractable objects inside the emulated security boundary, while wrapping exports an encrypted key blob. Backup stores an offline recoverable clone.
+
+```text
+partition domain show
+partition domain set
+partition clone -source 1 -destination 2
+```
+
+Domain mismatches return `LUNA_RET_CLONING_DOMAIN_MISMATCH`.
+
 ### Backup HSM
 
-Luna Backup HSM 7 emulation with STM recovery, cloning protocol, backup/restore, firmware management, and factory reset.
+Luna Backup HSM 7 emulation with STM recovery, secure cloning-based backup/restore, firmware management, and factory reset.
 
 ### High Availability
 
-HA groups with member management, configurable retry/polling (including infinite polling), and key material synchronization across members.
+HA groups with member management, configurable retry/polling (including infinite polling), and domain-validated key synchronization across members.
 
 ### Appliance Management (LunaSH)
 
@@ -616,6 +635,7 @@ luna-hsm-emulator/
 │   ├── session.py               # Session management
 │   ├── auth.py                  # Role-based authentication
 │   ├── ped.py                   # PED colors, M-of-N key sets, local/remote state
+│   ├── domain.py                # Cloning domains and secure object cloning
 │   ├── keystore.py              # Key storage and retrieval
 │   ├── audit.py                 # Audit logging with hash chaining
 │   ├── appliance.py             # Luna 7 appliance emulation (users, network, NTLS, services)
@@ -637,7 +657,8 @@ luna-hsm-emulator/
 │   └── db.py                    # SQLite persistence with AES-GCM encryption
 ├── tests/
 │   ├── test_pkcs11.py           # PKCS#11 and appliance tests
-│   └── test_ped.py              # PED and quorum tests
+│   ├── test_ped.py              # PED and quorum tests
+│   └── test_domain.py           # Domain, cloning, and HA tests
 ├── requirements.txt
 └── README.md
 ```
@@ -684,7 +705,7 @@ The suite covers:
 | `TestDeploymentFeatures` | 50 | HA groups, NTP, network bonding, licenses, support bundles, persistence |
 
 ```
-Ran 274 tests in 3.6s
+Ran 281 tests in 3.8s
 
 OK
 ```

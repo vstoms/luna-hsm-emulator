@@ -863,6 +863,7 @@ class TestBackupHSM(unittest.TestCase):
         self.api = PKCS11API(self.storage)
         self.api.C_Initialize()
         self.slot_id = self.api.tokens.create_partition("test", "Test")
+        self.domain = self.api.tokens.domains.get_partition_domain(self.slot_id)["domain_id"]
         self.session_id = self.api.C_OpenSession(self.slot_id)
 
     def tearDown(self):
@@ -954,7 +955,7 @@ class TestBackupHSM(unittest.TestCase):
         """Test that backup operations require login."""
         self.api.backup.connect()
         with self.assertRaises(PKCS11Error):
-            self.api.backup.backup_objects(self.slot_id, "domain1")
+            self.api.backup.backup_objects(self.slot_id, self.domain)
 
     def test_backup_objects(self):
         """Test backing up objects to the backup HSM."""
@@ -964,13 +965,13 @@ class TestBackupHSM(unittest.TestCase):
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         # Back it up
         result = self.api.backup.backup_objects(
-            self.slot_id, "my_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         self.assertIn("backup_key", result["backed_up"])
-        self.assertEqual(result["domain"], "my_domain")
+        self.assertEqual(result["domain"], self.domain)
 
-    def test_backup_skips_non_extractable(self):
-        """Test that non-extractable objects are skipped during backup."""
+    def test_backup_clones_non_extractable_securely(self):
+        """Secure backup cloning does not require CKA_EXTRACTABLE."""
         self._setup_backup_hsm()
         # Generate a non-extractable AES key (default)
         tmpl = make_aes_key_template("secret_key", 256)
@@ -980,10 +981,11 @@ class TestBackupHSM(unittest.TestCase):
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl2)
         # Back up
         result = self.api.backup.backup_objects(
-            self.slot_id, "my_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         self.assertIn("extractable_key", result["backed_up"])
-        self.assertIn("secret_key", result["skipped_non_extractable"])
+        self.assertIn("secret_key", result["backed_up"])
+        self.assertEqual(result["skipped_non_extractable"], [])
 
     def test_backup_specific_labels(self):
         """Test backing up specific objects by label."""
@@ -993,19 +995,19 @@ class TestBackupHSM(unittest.TestCase):
         tmpl2 = make_aes_key_template("key_two", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl2)
         result = self.api.backup.backup_objects(
-            self.slot_id, "domain1", labels=["key_one"], audit=self.api.audit
+            self.slot_id, self.domain, labels=["key_one"], audit=self.api.audit
         )
         self.assertEqual(len(result["backed_up"]), 1)
         self.assertIn("key_one", result["backed_up"])
 
     def test_backup_no_clonable_objects(self):
-        """Test that backup fails when no clonable objects exist."""
+        """Test that backup fails when cloning policy prohibits all keys."""
         self._setup_backup_hsm()
-        # Generate only non-extractable keys
         tmpl = make_aes_key_template("secret_key", 256)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
+        self.api.tokens.change_policy(self.slot_id, "ALLOW_SECRET_KEY_CLONING", 0)
         with self.assertRaises(PKCS11Error):
-            self.api.backup.backup_objects(self.slot_id, "domain1")
+            self.api.backup.backup_objects(self.slot_id, self.domain)
 
     def test_restore_objects(self):
         """Test restoring objects from backup HSM to a partition."""
@@ -1014,7 +1016,7 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("restore_key", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "restore_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         # Delete the key from the source partition
         obj, _ = self.api.keystore.retrieve_by_label(self.slot_id, "restore_key")
@@ -1022,7 +1024,7 @@ class TestBackupHSM(unittest.TestCase):
         self.assertEqual(self.storage.count_objects(self.slot_id), 0)
         # Restore from backup
         result = self.api.backup.restore_objects(
-            self.slot_id, "restore_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         self.assertIn("restore_key", result["restored"])
         self.assertEqual(self.storage.count_objects(self.slot_id), 1)
@@ -1033,7 +1035,7 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("rkey", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "domain_a", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         with self.assertRaises(PKCS11Error):
             self.api.backup.restore_objects(
@@ -1047,7 +1049,7 @@ class TestBackupHSM(unittest.TestCase):
             tmpl = make_aes_key_template(lbl, 256, extractable=True)
             self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "domain_x", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         # Delete all keys
         for lbl in ["rkey1", "rkey2", "rkey3"]:
@@ -1055,7 +1057,7 @@ class TestBackupHSM(unittest.TestCase):
             self.api.keystore.delete(obj.handle)
         # Restore only rkey2
         result = self.api.backup.restore_objects(
-            self.slot_id, "domain_x", labels=["rkey2"], audit=self.api.audit
+            self.slot_id, self.domain, labels=["rkey2"], audit=self.api.audit
         )
         self.assertEqual(len(result["restored"]), 1)
         self.assertIn("rkey2", result["restored"])
@@ -1066,14 +1068,14 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("update_key", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "domain_u", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         # Backup again — should update, not duplicate
         self.api.backup.backup_objects(
-            self.slot_id, "domain_u", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         partitions = self.api.backup._get_backup_partitions()
-        bp = [p for p in partitions if p.domain == "domain_u"][0]
+        bp = [p for p in partitions if p.domain == self.domain][0]
         self.assertEqual(len(bp.objects), 1)
 
     def test_list_backups(self):
@@ -1082,10 +1084,10 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("list_key", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "list_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         output = self.api.backup.list_backups()
-        self.assertIn("list_domain", output)
+        self.assertIn(self.domain, output)
         self.assertIn("list_key", output)
 
     def test_list_backup_partitions(self):
@@ -1094,11 +1096,11 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("pkey", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "d1", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         parts = self.api.backup.list_backup_partitions()
         self.assertEqual(len(parts), 1)
-        self.assertEqual(parts[0]["domain"], "d1")
+        self.assertEqual(parts[0]["domain"], self.domain)
         self.assertEqual(parts[0]["object_count"], 1)
 
     def test_backup_status(self):
@@ -1139,7 +1141,7 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("rbkey", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "rb_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         # Rollback — should erase all backup partitions
         result = self.api.backup.rollback_firmware(audit=self.api.audit)
@@ -1155,7 +1157,7 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("frkey", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "fr_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         self.api.backup.factory_reset(audit=self.api.audit)
         status = self.api.backup.get_status()
@@ -1168,7 +1170,7 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("persist_key", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "persist_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         serial = self.api.backup._serial
         self.api.C_Finalize()
@@ -1180,7 +1182,7 @@ class TestBackupHSM(unittest.TestCase):
         api2.backup.login("bkupso123", audit=api2.audit)
         parts = api2.backup.list_backup_partitions()
         self.assertEqual(len(parts), 1)
-        self.assertEqual(parts[0]["domain"], "persist_domain")
+        self.assertEqual(parts[0]["domain"], self.domain)
         api2.C_Finalize()
 
     def test_backup_audited(self):
@@ -1189,7 +1191,7 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("audited_key", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "audit_domain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         logs = self.api.storage.get_audit_logs()
         ops = [l["operation"] for l in logs]
@@ -1201,12 +1203,12 @@ class TestBackupHSM(unittest.TestCase):
         tmpl = make_aes_key_template("audited_rkey", 256, extractable=True)
         self.api.C_GenerateKey(self.session_id, CKM_AES_KEY_GEN, tmpl)
         self.api.backup.backup_objects(
-            self.slot_id, "audit_rdomain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         obj, _ = self.api.keystore.retrieve_by_label(self.slot_id, "audited_rkey")
         self.api.keystore.delete(obj.handle)
         self.api.backup.restore_objects(
-            self.slot_id, "audit_rdomain", audit=self.api.audit
+            self.slot_id, self.domain, audit=self.api.audit
         )
         logs = self.api.storage.get_audit_logs()
         ops = [l["operation"] for l in logs]

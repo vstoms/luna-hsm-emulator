@@ -4,6 +4,8 @@ import json
 import time
 from typing import Optional
 
+from hsm.domain import CloningDomainManager, CloningDomainError
+
 
 DEFAULT_LICENSES = {
     "base_configuration": {"id": "621000153-000", "description": "Base configuration", "enabled": True},
@@ -20,6 +22,7 @@ class DeploymentManager:
 
     def __init__(self, storage):
         self.storage = storage
+        self.domains = CloningDomainManager(storage)
         self._ensure_state()
 
     def _read(self, key: str, default):
@@ -85,6 +88,7 @@ class DeploymentManager:
                 "objects": self.storage.count_objects(slot_id),
                 "last_sync": None,
             }],
+            "domain_fingerprint": self.domains.get_partition_domain(slot_id)["fingerprint"],
             "created_at": time.time(),
         }
         groups[name] = group
@@ -109,6 +113,10 @@ class DeploymentManager:
             return {"success": False, "error": f"Partition slot {slot_id} not found"}
         if any(m["slot_id"] == slot_id for m in group["members"]):
             return {"success": False, "error": f"Slot {slot_id} is already in HA group '{group_name}'"}
+        try:
+            self.domains.assert_matching(group["members"][0]["slot_id"], slot_id)
+        except CloningDomainError as exc:
+            return {"success": False, "error": str(exc), "code": exc.code}
         group["members"].append({
             "slot_id": slot_id,
             "serial": serial or f"HA-{slot_id:04d}",
@@ -162,14 +170,30 @@ class DeploymentManager:
         group = groups.get(name)
         if group is None:
             return {"success": False, "error": f"HA group '{name}' not found"}
-        source_objects = max((m["objects"] for m in group["members"]), default=0)
+        if not group["members"]:
+            return {"success": False, "error": f"HA group '{name}' has no members"}
+
+        source_slot = group["members"][0]["slot_id"]
+        cloned = 0
+        try:
+            for member in group["members"][1:]:
+                result = self.domains.clone_objects(source_slot, member["slot_id"])
+                cloned += len(result["cloned"])
+        except Exception as exc:
+            # Keep Luna-style domain errors intact while returning the existing
+            # DeploymentManager result shape used by the CLI.
+            return {"success": False, "error": str(exc),
+                    "code": getattr(exc, "code", "LUNA_RET_HA_SYNCHRONIZE_FAILED")}
+
+        source_objects = self.storage.count_objects(source_slot)
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         for member in group["members"]:
-            member["objects"] = source_objects
+            member["objects"] = self.storage.count_objects(member["slot_id"])
             member["last_sync"] = timestamp
             member["status"] = "active"
         self._write("ha_groups", groups)
-        return {"success": True, "group": name, "objects": source_objects, "members": len(group["members"]), "timestamp": timestamp}
+        return {"success": True, "group": name, "objects": source_objects,
+                "cloned": cloned, "members": len(group["members"]), "timestamp": timestamp}
 
     def get_ha_status(self, name: str) -> dict:
         group = self.get_ha_group(name)

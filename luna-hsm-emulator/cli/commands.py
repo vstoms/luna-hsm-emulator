@@ -30,6 +30,7 @@ from pkcs11.constants import (
     CKM_SHA_1, CKM_SHA256, CKM_SHA384, CKM_SHA512,
 )
 from pkcs11.mechanisms import MECHANISM_NAME_TO_ID
+from hsm.domain import CloningDomainError
 from pkcs11.objects import (
     make_aes_key_template, make_rsa_keypair_templates,
     make_ec_keypair_templates, make_des3_key_template, make_hmac_key_template,
@@ -122,7 +123,7 @@ class CommandHandler:
         """Handle 'partition' commands."""
         if not args:
             print("  Usage: partition create | delete | list | showinfo | init | changelabel | clear | contents |")
-            print("         showmechanism | showpolicies | changepolicy | policytemplate")
+            print("         showmechanism | showpolicies | changepolicy | policytemplate | domain | clone")
             return
         sub = args[0]
         args = self._parse_flags(args[1:])
@@ -200,6 +201,63 @@ class CommandHandler:
                 ])
             except PKCS11Error as e:
                 print(f"  Error: {e}")
+        elif sub == "domain":
+            if self.active_slot is None:
+                print("  No active slot. Use 'slot set -slot <id>' first.")
+                return
+            action = args[0] if args else "show"
+            try:
+                if action == "show":
+                    info = self.api.tokens.show_cloning_domain(self.active_slot)
+                    print(f"  Partition:          {info['partition']} (slot {self.active_slot})")
+                    print(f"  Domain Fingerprint: {info['fingerprint']}")
+                    print(f"  Domain Source:      {info['source']}")
+                elif action == "set":
+                    inherit = "-inherit" in args
+                    if inherit:
+                        domain_id = None
+                    elif self.api.auth.ped.get_auth_mode() == "ped":
+                        keys_arg = self._get_arg(args, "-keys") or input(
+                            "  Present Red PED key serials (comma-separated): ")
+                        secret = getpass.getpass("  PED shared secret: ") if self.api.auth.ped.requires_shared_secret("red") else None
+                        result = self.api.auth.ped.authenticate(
+                            "red", [key.strip() for key in keys_arg.split(",") if key.strip()], secret)
+                        domain_id = result.domain_id
+                    else:
+                        domain_secret = self._get_arg(args, "-domain") or getpass.getpass(
+                            "  Cloning domain secret: ")
+                        domain_id = self.api.tokens.domains.domain_from_secret(domain_secret)
+                    force = "-force" in args
+                    result = self.api.tokens.set_cloning_domain(
+                        self.active_slot, domain_id, inherit, force,
+                        audit=self.api.audit, session_id=self.session_id or 0)
+                    print(f"  Cloning domain set: {result['fingerprint']} ({result['source']}).")
+                    if result["objects_deleted"]:
+                        print(f"  {result['objects_deleted']} object(s) zeroized.")
+                else:
+                    print("  Usage: partition domain show | set [-inherit|-domain <secret>|-keys <red keys>] [-force]")
+            except (CloningDomainError, PKCS11Error) as exc:
+                print(f"  Domain operation failed: {exc}")
+        elif sub == "clone":
+            source = self._get_arg(args, "-source")
+            destination = self._get_arg(args, "-destination")
+            labels_arg = self._get_arg(args, "-labels")
+            if not source or not destination:
+                print("  Usage: partition clone -source <slot> -destination <slot> [-labels a,b]")
+                return
+            try:
+                result = self.api.tokens.clone_partition(
+                    int(source), int(destination),
+                    labels_arg.split(",") if labels_arg else None,
+                    audit=self.api.audit, session_id=self.session_id or 0)
+                print(f"  Secure clone complete: {len(result['cloned'])} object(s).")
+                print(f"  Domain fingerprint: {result['domain_fingerprint']}")
+                self._print_explain([
+                    "Cloning keeps sensitive key material inside the secure boundary and does not require extractability.",
+                    "Wrapping exports an encrypted key blob; backup creates an offline recoverable copy.",
+                ])
+            except (CloningDomainError, PKCS11Error, ValueError) as exc:
+                print(f"  Clone failed: {exc}")
         elif sub == "clear":
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
@@ -1468,9 +1526,10 @@ class CommandHandler:
             slot = self._get_arg(rest, "-slot")
             domain = self._get_arg(rest, "-domain")
             labels_str = self._get_arg(rest, "-labels")
-            if not slot or not domain:
-                print("  Usage: backup backup -slot <src_slot> -domain <domain> [-labels lbl1,lbl2]")
+            if not slot:
+                print("  Usage: backup backup -slot <src_slot> [-domain <domain-id>] [-labels lbl1,lbl2]")
                 return
+            domain = domain or self.api.tokens.domains.get_partition_domain(int(slot))["domain_id"]
             labels = labels_str.split(",") if labels_str else None
             try:
                 result = self.api.backup.backup_objects(
@@ -1481,16 +1540,16 @@ class CommandHandler:
                 print(f"  Backed up: {len(result['backed_up'])} object(s)")
                 for lbl in result["backed_up"]:
                     print(f"    - {lbl}")
-                if result["skipped_non_extractable"]:
-                    print(f"  Skipped (non-extractable): {len(result['skipped_non_extractable'])}")
-                    for lbl in result["skipped_non_extractable"]:
+                if result.get("skipped_by_cloning_policy"):
+                    print(f"  Skipped by cloning policy: {len(result['skipped_by_cloning_policy'])}")
+                    for lbl in result["skipped_by_cloning_policy"]:
                         print(f"    - {lbl}")
-                print(f"  Domain: {result['domain']}")
+                print(f"  Domain fingerprint: {self.api.tokens.domains.fingerprint(result['domain'])}")
                 print(f"  Backup Partition ID: {result['partition_id']}")
                 self._print_explain([
                     "Backup clones objects from the source partition to the backup HSM.",
-                    "Only objects with CKA_EXTRACTABLE=TRUE can be backed up.",
-                    "The cloning domain must match between source and backup.",
+                    "Backup uses secure cloning and can protect non-extractable objects.",
+                    "Cloning policies must allow each key type and domains must match.",
                     "",
                     "On a real Luna 7, this uses the cloning protocol which",
                     "securely transfers encrypted key material over a secure",
@@ -1506,9 +1565,10 @@ class CommandHandler:
             slot = self._get_arg(rest, "-slot")
             domain = self._get_arg(rest, "-domain")
             labels_str = self._get_arg(rest, "-labels")
-            if not slot or not domain:
-                print("  Usage: backup restore -slot <dest_slot> -domain <domain> [-labels lbl1,lbl2]")
+            if not slot:
+                print("  Usage: backup restore -slot <dest_slot> [-domain <domain-id>] [-labels lbl1,lbl2]")
                 return
+            domain = domain or self.api.tokens.domains.get_partition_domain(int(slot))["domain_id"]
             labels = labels_str.split(",") if labels_str else None
             confirm = input(f"  Restore objects to slot {slot}? (yes/no): ")
             if confirm.lower() != "yes":
@@ -1523,7 +1583,7 @@ class CommandHandler:
                 print(f"  Restored: {len(result['restored'])} object(s)")
                 for lbl in result["restored"]:
                     print(f"    - {lbl}")
-                print(f"  Domain: {result['domain']}")
+                print(f"  Domain fingerprint: {self.api.tokens.domains.fingerprint(result['domain'])}")
                 print(f"  From Backup Partition ID: {result['partition_id']}")
                 self._print_explain([
                     "Restore clones objects from the backup HSM back to a",
@@ -1698,6 +1758,10 @@ class CommandHandler:
     partition policytemplate create -name <n> -desc <d> -policies <id=val,...>  Create a custom template
     partition policytemplate delete -name <n>  Delete a custom template
     partition policytemplate apply -name <n> [-force]  Apply a template to the active partition
+    partition domain show                 Show the active partition's effective domain
+    partition domain set [-inherit|-domain <secret>|-keys <red serials>] [-force]
+    partition clone -source <id> -destination <id> [-labels a,b]
+                                          Securely clone matching-domain objects
 
   Authentication:
     role login -name <co|cu|so>        Login as a role

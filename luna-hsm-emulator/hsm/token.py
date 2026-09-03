@@ -19,6 +19,7 @@ from pkcs11.constants import (
     CKR_ACTION_PROHIBITED, CKR_ARGUMENTS_BAD,
 )
 from hsm.auth import AuthManager, ROLE_CO, ROLE_CU, ROLE_SO
+from hsm.domain import CloningDomainManager
 
 # Luna 7 simulated hardware model
 HSM_MODEL = "Luna Network HSM 7"
@@ -70,6 +71,7 @@ class TokenManager:
     def __init__(self, storage: Storage, auth: AuthManager):
         self.storage = storage
         self.auth = auth
+        self.domains = CloningDomainManager(storage)
         self._next_slot = 1
 
     def _generate_serial(self) -> str:
@@ -187,6 +189,8 @@ class TokenManager:
             max_objects=max_objects, max_storage=max_storage,
             max_login_attempts=max_login_attempts,
         )
+        # New partitions inherit the HSM cloning domain by default.
+        self.domains.set_partition_domain(slot_id, inherit=True)
         return slot_id
 
     def delete_partition(self, name: str):
@@ -234,6 +238,8 @@ class TokenManager:
             f"  SO Locked:        {'Yes' if p['so_locked'] else 'No'}",
             f"  CO Locked:        {'Yes' if p['co_locked'] else 'No'}",
             f"  CU Locked:        {'Yes' if p['cu_locked'] else 'No'}",
+            f"  Cloning Domain:   {self.domains.get_partition_domain(slot_id)['fingerprint']} "
+            f"({self.domains.get_partition_domain(slot_id)['source']})",
             f"  Created:          {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p['created_at']))}",
         ]
         return "\n".join(lines)
@@ -268,6 +274,8 @@ class TokenManager:
         self.storage.set_meta("firmware_history", "[]")
         from hsm.ped import PEDManager
         PEDManager(self.storage).factory_reset()
+        self.storage.set_meta(CloningDomainManager.HSM_META, "")
+        self.storage.set_meta(CloningDomainManager.PARTITION_META, "{}")
 
     # ------------------------------------------------------------------
     # Firmware management
@@ -491,6 +499,38 @@ class TokenManager:
                 f"{entry['to_version']:<10} {entry['direction']:<10} {rollback:<8} {notes}"
             )
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Cloning domains and secure partition-to-partition cloning
+    # ------------------------------------------------------------------
+
+    def show_cloning_domain(self, slot_id: int) -> dict:
+        return self.domains.get_partition_domain(slot_id)
+
+    def set_cloning_domain(self, slot_id: int, domain_id: str = None,
+                           inherit: bool = False, force: bool = False,
+                           audit=None, session_id: int = 0) -> dict:
+        result = self.domains.set_partition_domain(slot_id, domain_id, inherit, force)
+        if audit:
+            audit.log(session_id, "SO", "PartitionDomainSet", success=True,
+                      detail=f"slot={slot_id}, fingerprint={result['fingerprint']}, "
+                             f"source={result['source']}, deleted={result['objects_deleted']}")
+        return result
+
+    def clone_partition(self, source_slot: int, destination_slot: int,
+                        labels: list = None, audit=None, session_id: int = 0) -> dict:
+        try:
+            result = self.domains.clone_objects(source_slot, destination_slot, labels)
+        except Exception as exc:
+            if audit:
+                audit.log(session_id, "SO", "PartitionClone", success=False,
+                          detail=f"source={source_slot}, destination={destination_slot}, error={exc}")
+            raise
+        if audit:
+            audit.log(session_id, "SO", "PartitionClone", success=True,
+                      detail=f"source={source_slot}, destination={destination_slot}, "
+                             f"objects={len(result['cloned'])}, domain={result['domain_fingerprint']}")
+        return result
 
     # ------------------------------------------------------------------
     # Partition operations (matching real LunaCM commands)

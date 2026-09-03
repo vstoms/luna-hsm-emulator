@@ -127,7 +127,7 @@ pip install -r requirements.txt
 python tests/test_pkcs11.py -v
 ```
 
-All 267 tests should pass.
+All 281 tests should pass.
 
 ---
 
@@ -766,11 +766,11 @@ backup login
 # Show backup HSM status
 backup show
 
-# Generate an extractable key on your partition
+# Generate a key on your partition (secure cloning does not require extractability)
 slot set -slot 1
 key generate -kt aes -ks 256 -label backup_test_key --explain
-# Note: default keys are non-extractable. For backup testing, generate with
-# extractable=true by modifying the template, or use the API directly.
+# Non-extractable keys can be backed up when the partition's cloning policy
+# permits the key type and the source and backup domains match.
 
 # Back up objects from slot 1 to the backup HSM
 backup backup -slot 1 -domain my_domain --explain
@@ -803,7 +803,7 @@ backup factoryreset
 backup disconnect
 ```
 
-**What you learned**: The Luna Backup HSM 7 lifecycle — connecting, recovering from Secure Transport Mode, initializing with an SO PIN, backing up objects via the cloning protocol (which requires CKA_EXTRACTABLE=TRUE and a shared cloning domain), restoring objects back to a partition, firmware management, and the destructive nature of firmware rollback (zeroizes all backup data).
+**What you learned**: The Luna Backup HSM 7 lifecycle — connecting, recovering from Secure Transport Mode, initializing with an SO PIN, backing up objects via secure cloning (which requires cloning policy permission and a shared cloning domain, but not `CKA_EXTRACTABLE=TRUE`), restoring objects back to a partition, firmware management, and the destructive nature of firmware rollback (zeroizes all backup data).
 
 ---
 
@@ -1258,6 +1258,8 @@ luna-hsm-emulator/
 │   ├── deployment.py        # HA groups, NTP, bonding, licenses, support bundles
 │   ├── session.py           # Session management
 │   ├── auth.py              # Role-based authentication
+│   ├── ped.py               # PED keys and M-of-N quorum
+│   ├── domain.py            # Cloning domains and secure object cloning
 │   ├── keystore.py          # Key storage and retrieval
 │   └── audit.py             # Audit logging with hash chaining
 ├── cli/
@@ -1276,7 +1278,9 @@ luna-hsm-emulator/
 │   ├── __init__.py
 │   └── db.py                # SQLite persistence layer
 ├── tests/
-│   └── test_pkcs11.py       # 267 unit tests for PKCS#11 operations
+│   ├── test_pkcs11.py       # PKCS#11 and appliance tests
+│   ├── test_ped.py          # PED authentication and quorum tests
+│   └── test_domain.py       # Cloning domain and secure cloning tests
 ├── requirements.txt
 └── README.md
 ```
@@ -1355,7 +1359,7 @@ The suite covers:
 | `TestDeploymentFeatures` | 50 | HA groups, NTP, network bonding, licenses, support bundles, persistence |
 
 ```
-Ran 267 tests in 11.0s
+Ran 281 tests in 3.8s
 
 OK
 ```

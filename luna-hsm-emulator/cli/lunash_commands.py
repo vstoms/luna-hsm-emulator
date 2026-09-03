@@ -30,6 +30,7 @@ from hsm.appliance import (
 )
 from pkcs11.constants import PKCS11Error
 from hsm.ped import PED_KEY_TYPES, PEDError
+from hsm.domain import CloningDomainError
 
 
 class LunaSHCommands:
@@ -517,7 +518,8 @@ class LunaSHCommands:
         """Handle 'partition' commands (LunaSH variant)."""
         if not args:
             print("  Usage: partition create | delete | list | show | init | changePolicy |")
-            print("         showPolicies | clear | activate | deactivate | resize | rename")
+            print("         showPolicies | clear | activate | deactivate | resize | rename |")
+            print("         domain show|set | clone -source <slot> -destination <slot>")
             return
         if not self._check_login():
             return
@@ -656,6 +658,38 @@ class LunaSHCommands:
                 else:
                     print(f"  Partition '{name}' not found.")
 
+        elif sub == "domain":
+            self._partition_domain(rest)
+
+        elif sub == "clone":
+            if not self._check_hsm_login():
+                return
+            source = self._get_arg(rest, "-source")
+            destination = self._get_arg(rest, "-destination")
+            labels_arg = self._get_arg(rest, "-labels")
+            if not source or not destination:
+                print("  Usage: partition clone -source <slot> -destination <slot> [-labels a,b]")
+                return
+            try:
+                result = self.api.tokens.clone_partition(
+                    int(source), int(destination),
+                    [label.strip() for label in labels_arg.split(",")] if labels_arg else None,
+                    audit=self.api.audit,
+                )
+                print(f"  Secure clone complete: {len(result['cloned'])} object(s) cloned.")
+                print(f"  Domain fingerprint: {result['domain_fingerprint']}")
+                if result["skipped_policy"]:
+                    print(f"  Skipped by cloning policy: {', '.join(result['skipped_policy'])}")
+                if result["skipped_existing"]:
+                    print(f"  Already present: {', '.join(result['skipped_existing'])}")
+                self._print_explain([
+                    "Cloning transfers objects inside the Luna secure boundary.",
+                    "It preserves sensitive/non-extractable attributes and requires matching domains.",
+                    "Wrapping exports one key under a wrapping key; backup stores a recoverable copy offline.",
+                ])
+            except (CloningDomainError, PKCS11Error, ValueError) as exc:
+                print(f"  Clone failed: {exc}")
+
         elif sub == "activate":
             name = self._get_arg(rest, "-name")
             print(f"  Partition '{name}' activated.")
@@ -682,6 +716,77 @@ class LunaSHCommands:
 
         else:
             print(f"  Unknown partition subcommand: {sub}")
+
+    def _partition_domain(self, args: list):
+        if not args:
+            print("  Usage: partition domain show [-slot <id>] |")
+            print("         partition domain set [-slot <id>|-hsm] [-inherit] [-domain <secret>|-keys <red serials>]")
+            return
+        action, rest = args[0].lower(), args[1:]
+        slot_arg = self._get_arg(rest, "-slot")
+        if slot_arg:
+            slot_id = int(slot_arg)
+        else:
+            partitions = self.api.storage.get_all_partitions()
+            if not partitions:
+                print("  No partitions configured.")
+                return
+            slot_id = partitions[0]["slot_id"]
+        try:
+            if action == "show":
+                hsm_domain = self.api.tokens.domains.get_hsm_domain()
+                print(f"  HSM Domain Fingerprint: {self.api.tokens.domains.fingerprint(hsm_domain)}")
+                info = self.api.tokens.show_cloning_domain(slot_id)
+                print(f"  Partition:             {info['partition']} (slot {slot_id})")
+                print(f"  Domain Fingerprint:    {info['fingerprint']}")
+                print(f"  Domain Source:         {info['source']} ({'inherited' if info['inherited'] else 'explicit'})")
+            elif action == "set":
+                if not self._check_hsm_login():
+                    return
+                inherit = "-inherit" in rest
+                domain_id = None
+                if not inherit:
+                    if self.appliance.ped.get_auth_mode() == "ped":
+                        keys_arg = self._get_arg(rest, "-keys")
+                        if keys_arg is None:
+                            keys_arg = input("  Present Red PED key serials (comma-separated): ")
+                        secret = self._get_arg(rest, "-secret")
+                        if secret is None and self.appliance.ped.requires_shared_secret("red"):
+                            secret = getpass.getpass("  PED shared secret: ")
+                        auth = self.appliance.ped.authenticate(
+                            "red", [key.strip() for key in keys_arg.split(",") if key.strip()], secret)
+                        domain_id = auth.domain_id
+                    else:
+                        domain_secret = self._get_arg(rest, "-domain")
+                        if domain_secret is None:
+                            domain_secret = getpass.getpass("  Cloning domain secret: ")
+                            if domain_secret != getpass.getpass("  Confirm cloning domain secret: "):
+                                print("  Error: Cloning domain secrets do not match.")
+                                return
+                        domain_id = self.api.tokens.domains.domain_from_secret(domain_secret)
+                target_hsm = "-hsm" in rest
+                object_count = (sum(self.api.storage.count_objects(p["slot_id"])
+                                    for p in self.api.storage.get_all_partitions())
+                                if target_hsm else self.api.storage.count_objects(slot_id))
+                force = False
+                if object_count:
+                    confirm = input("  Domain change will zeroize affected objects. Type 'DOMAINCHANGE' to continue: ")
+                    force = confirm == "DOMAINCHANGE"
+                if target_hsm:
+                    if inherit:
+                        raise CloningDomainError("LUNA_RET_INVALID_DOMAIN", "-inherit is valid only for partitions")
+                    result = self.api.tokens.domains.set_hsm_domain(domain_id, force=force)
+                    print(f"  HSM cloning domain set. Fingerprint: {result['fingerprint']}")
+                else:
+                    result = self.api.tokens.set_cloning_domain(
+                        slot_id, domain_id, inherit, force, audit=self.api.audit)
+                    print(f"  Partition cloning domain set. Fingerprint: {result['fingerprint']} ({result['source']})")
+                if result.get("objects_deleted"):
+                    print(f"  {result['objects_deleted']} object(s) zeroized due to domain change.")
+            else:
+                print(f"  Unknown partition domain subcommand: {action}")
+        except (CloningDomainError, PEDError, PKCS11Error, ValueError) as exc:
+            print(f"  Domain operation failed: {exc}")
 
     # ------------------------------------------------------------------
     # user
@@ -2945,6 +3050,10 @@ class LunaSHCommands:
     partition deactivate -name <n>       Deactivate a partition
     partition rename -name <n> -newname <n>  Rename a partition
     partition resize -name <n> -size <s>  Resize a partition
+    partition domain show [-slot <id>]    Show effective HSM/partition domain
+    partition domain set [-slot <id>] [-inherit|-domain <secret>|-keys <red serials>]
+    partition clone -source <id> -destination <id> [-labels a,b]
+                                           Securely clone matching-domain objects
 
   User Management:
     user list                            List all appliance users

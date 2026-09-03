@@ -29,6 +29,7 @@ from pkcs11.constants import (
     CKR_ACTION_PROHIBITED, CKR_FUNCTION_FAILED,
 )
 from hsm.auth import AuthManager, ROLE_SO
+from hsm.domain import CloningDomainManager, CloningDomainError
 
 BACKUP_HSM_MODEL = "Luna Backup HSM 7"
 BACKUP_HSM_DEFAULT_FW = "7.13.0"
@@ -79,6 +80,7 @@ class BackupHSM:
     def __init__(self, storage: Storage):
         self.storage = storage
         self.auth = AuthManager(storage)
+        self.domains = CloningDomainManager(storage)
         self._connected = False
         self._serial = None
         self._login_session = None  # session_id of logged-in SO
@@ -331,14 +333,15 @@ class BackupHSM:
         """Clone objects from a source partition to the backup HSM.
 
         On a real Luna 7: 'partition clone -slot <src> -domain <dom>'
-        Objects must be clonable (CKA_EXTRACTABLE=TRUE) and the domain
-        must match between source and backup partition.
+        Objects must be permitted by the partition cloning policies and the
+        domain must match between source and backup partition. Extractability
+        is a wrapping/export attribute and is not required for secure cloning.
 
         Args:
             source_slot_id: The slot ID of the source partition
             domain: The cloning domain (must match on backup partition)
             labels: Optional list of specific object labels to back up.
-                    If None, backs up all extractable objects.
+                    If None, backs up all objects allowed by cloning policy.
         """
         self._require_login()
 
@@ -348,6 +351,16 @@ class BackupHSM:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT,
                               f"Source slot {source_slot_id} not found")
 
+        try:
+            source_domain = self.domains.get_partition_domain(source_slot_id)["domain_id"]
+            if domain != source_domain:
+                raise CloningDomainError(
+                    "LUNA_RET_CLONING_DOMAIN_MISMATCH",
+                    "Backup cloning failed: supplied domain does not match the source partition",
+                )
+        except CloningDomainError as exc:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, str(exc)) from exc
+
         all_objects = self.storage.get_all_objects(source_slot_id)
 
         # Filter by labels if specified
@@ -355,20 +368,26 @@ class BackupHSM:
             all_objects = [(obj, km) for obj, km in all_objects
                            if obj.label() in labels]
 
-        # Filter to clonable objects only
-        from pkcs11.constants import CKA_EXTRACTABLE
+        # Backup uses secure cloning policy, not CKA_EXTRACTABLE. Sensitive,
+        # non-extractable keys remain protected and retain their attributes.
+        from pkcs11.constants import CKA_CLASS, CKO_PRIVATE_KEY, CKO_SECRET_KEY
         clonable = []
         skipped = []
         for obj, km in all_objects:
-            if obj.is_extractable():
+            object_class = obj.get(CKA_CLASS)
+            allowed = True
+            if object_class == CKO_PRIVATE_KEY:
+                allowed = self.domains._policy_enabled(source_slot_id, "ALLOW_PRIVATE_KEY_CLONING")
+            elif object_class == CKO_SECRET_KEY:
+                allowed = self.domains._policy_enabled(source_slot_id, "ALLOW_SECRET_KEY_CLONING")
+            if allowed:
                 clonable.append((obj, km))
             else:
                 skipped.append(obj.label())
 
         if not clonable:
             raise PKCS11Error(CKR_ACTION_PROHIBITED,
-                              "No clonable objects found on source partition. "
-                              "Objects must have CKA_EXTRACTABLE=TRUE to be backed up.")
+                              "No clonable objects found; partition cloning policies prohibit backup.")
 
         # Find or create a backup partition with matching domain
         partitions = self._get_backup_partitions()
@@ -410,7 +429,8 @@ class BackupHSM:
 
         return {
             "backed_up": backed_up,
-            "skipped_non_extractable": skipped,
+            "skipped_non_extractable": [],  # compatibility: extractability is irrelevant to cloning
+            "skipped_by_cloning_policy": skipped,
             "domain": domain,
             "partition_id": target_bp.partition_id,
         }
@@ -439,6 +459,12 @@ class BackupHSM:
         if dest_partition is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT,
                               f"Destination slot {dest_slot_id} not found")
+        destination_domain = self.domains.get_partition_domain(dest_slot_id)["domain_id"]
+        if domain != destination_domain:
+            raise PKCS11Error(
+                CKR_ACTION_PROHIBITED,
+                "LUNA_RET_CLONING_DOMAIN_MISMATCH: Backup domain does not match destination partition",
+            )
 
         # Find backup partition with matching domain
         partitions = self._get_backup_partitions()
