@@ -12,6 +12,7 @@ PIN-based authentication with configurable lockout (default 10 attempts).
 from typing import Optional
 
 from storage.db import Storage
+from hsm.ped import PEDManager, PEDError
 from pkcs11.constants import (
     PKCS11Error, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_PIN_LEN_RANGE,
     CKR_USER_NOT_LOGGED_IN, CKR_USER_ALREADY_LOGGED_IN,
@@ -41,6 +42,7 @@ class AuthManager:
 
     def __init__(self, storage: Storage):
         self.storage = storage
+        self.ped = PEDManager(storage)
         # session_id -> (slot_id, role)
         self._sessions: dict = {}
 
@@ -58,6 +60,22 @@ class AuthManager:
         for sid, (slid, r) in self._sessions.items():
             if slid == slot_id and r != role:
                 raise PKCS11Error(CKR_USER_ANOTHER_ALREADY_LOGGED_IN)
+
+        # PED-authenticated partitions accept a presentation string in the
+        # form "SERIAL1,SERIAL2|optional shared secret".  This keeps C_Login's
+        # PKCS#11-compatible signature while allowing quorum training.
+        if self.ped.get_auth_mode() == "ped":
+            serial_text, separator, shared_secret = (pin or "").partition("|")
+            serials = [value.strip() for value in serial_text.split(",") if value.strip()]
+            key_type = {ROLE_SO: "blue", ROLE_CO: "black", ROLE_CU: "gray"}.get(role)
+            try:
+                self.ped.authenticate(key_type, serials,
+                                      shared_secret if separator else None,
+                                      scope=str(slot_id))
+            except PEDError as exc:
+                raise PKCS11Error(CKR_PIN_INCORRECT, str(exc)) from exc
+            self._sessions[session_id] = (slot_id, role)
+            return
 
         # Validate PIN length
         if len(pin) < MIN_PIN_LEN or len(pin) > MAX_PIN_LEN:

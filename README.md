@@ -7,7 +7,7 @@ A fully functional software emulator of the Thales Luna 7 Network HSM, built for
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![PKCS#11](https://img.shields.io/badge/PKCS%2311-v2.40-green)](https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html)
 [![License](https://img.shields.io/badge/License-Educational-orange)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-267%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-274%20passing-brightgreen)](#testing)
 
 </div>
 
@@ -561,7 +561,43 @@ The emulator implements the Luna 7's four-role authentication hierarchy:
 └─────────────────────────────────────────────────┘
 ```
 
-PIN-based authentication includes configurable lockout policies (default: 10 failed attempts before lockout). The CLI simulates PED (PIN Entry Device) prompts for realistic training.
+The HSM can be initialized in password-authenticated or PED-authenticated mode. Password authentication includes configurable lockout policies (default: 10 failed attempts before lockout).
+
+### PED authentication and M-of-N quorum
+
+PED mode persists local/remote PED state and colored key sets:
+
+| Color | Identity |
+|-------|----------|
+| Blue | HSM or partition Security Officer |
+| Black | Crypto Officer |
+| Gray | Crypto User |
+| Red | Cloning domain |
+| Orange | Remote PED vector |
+| White | Audit identity |
+
+Each key set supports an M-of-N threshold, an optional shared secret, and duplicate physical keys. A duplicate is another copy of the same share and therefore does not count twice toward quorum. Keys can be marked lost; status output reports whether enough distinct shares remain. Red key validation produces a specific cloning-domain mismatch error, and remote connections require an Orange key set.
+
+```text
+hsm init -label TrainingHSM -ped
+ped connect
+ped key create -type blue -m 2 -n 3
+hsm login
+```
+
+Additional commands:
+
+```text
+ped show
+ped key list
+ped key create -type red -m 2 -n 3 -sharedsecret
+ped key duplicate -serial BL-12345678 -count 2
+ped key lose -serial BL-12345678
+ped disconnect
+ped connect -remote ped.example.test -keys OR-12345678
+```
+
+For partition roles, create key sets with `-scope <slot-id>`. LunaCM's role login accepts the matching Blue, Black, or Gray serials and prompts for a shared secret when configured.
 
 ---
 
@@ -579,6 +615,7 @@ luna-hsm-emulator/
 │   ├── token.py                 # Token/partition management, firmware
 │   ├── session.py               # Session management
 │   ├── auth.py                  # Role-based authentication
+│   ├── ped.py                   # PED colors, M-of-N key sets, local/remote state
 │   ├── keystore.py              # Key storage and retrieval
 │   ├── audit.py                 # Audit logging with hash chaining
 │   ├── appliance.py             # Luna 7 appliance emulation (users, network, NTLS, services)
@@ -599,7 +636,8 @@ luna-hsm-emulator/
 ├── storage/
 │   └── db.py                    # SQLite persistence with AES-GCM encryption
 ├── tests/
-│   └── test_pkcs11.py           # 267 unit tests
+│   ├── test_pkcs11.py           # PKCS#11 and appliance tests
+│   └── test_ped.py              # PED and quorum tests
 ├── requirements.txt
 └── README.md
 ```
@@ -646,7 +684,7 @@ The suite covers:
 | `TestDeploymentFeatures` | 50 | HA groups, NTP, network bonding, licenses, support bundles, persistence |
 
 ```
-Ran 267 tests in 11.0s
+Ran 274 tests in 3.6s
 
 OK
 ```

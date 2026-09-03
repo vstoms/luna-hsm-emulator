@@ -424,9 +424,18 @@ class CommandHandler:
                 return
             if not self._ensure_session():
                 return
-            # PED simulation: prompt for PIN
-            print(f"  [PED Simulation] Enter PIN for role '{role_name.upper()}':")
-            pin = getpass.getpass("  PIN: ")
+            if self.api.auth.ped.get_auth_mode() == "ped":
+                color = {"so": "Blue", "co": "Black", "cu": "Gray"}[role_name]
+                print(f"  Present {color} PED key serials for '{role_name.upper()}'.")
+                serials = input("  Key serials (comma-separated): ")
+                secret = ""
+                if self.api.auth.ped.requires_shared_secret(
+                        color.lower(), scope=str(self.active_slot)):
+                    secret = getpass.getpass("  PED shared secret: ")
+                pin = serials + ("|" + secret if secret else "")
+            else:
+                print(f"  Password-authenticated role '{role_name.upper()}':")
+                pin = getpass.getpass("  PIN: ")
             try:
                 from pkcs11.constants import CKU_SO, CKU_USER
                 user_type = CKU_SO if role_name == "so" else CKU_USER

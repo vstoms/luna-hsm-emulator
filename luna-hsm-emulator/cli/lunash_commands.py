@@ -29,6 +29,7 @@ from hsm.appliance import (
     ROLE_DESCRIPTIONS,
 )
 from pkcs11.constants import PKCS11Error
+from hsm.ped import PED_KEY_TYPES, PEDError
 
 
 class LunaSHCommands:
@@ -187,11 +188,22 @@ class LunaSHCommands:
             if self.appliance.is_hsm_logged_in():
                 print("  HSM SO already logged in.")
                 return
-            print("  [PED Simulation] Enter HSM SO PIN:")
-            pin = getpass.getpass("  SO PIN: ")
-            result = self.appliance.hsm_login(pin)
+            if self.appliance.ped.get_auth_mode() == "ped":
+                keys_arg = self._get_arg(rest, "-keys")
+                if keys_arg is None:
+                    keys_arg = input("  Present Blue PED key serials (comma-separated): ")
+                keys = [k.strip() for k in keys_arg.split(",") if k.strip()]
+                secret = self._get_arg(rest, "-secret")
+                if secret is None and self.appliance.ped.requires_shared_secret("blue"):
+                    secret = getpass.getpass("  PED shared secret: ")
+                result = self.appliance.hsm_login(ped_keys=keys, shared_secret=secret)
+            else:
+                print("  Password-authenticated HSM — enter HSM SO PIN:")
+                pin = self._get_arg(rest, "-password") or getpass.getpass("  SO PIN: ")
+                result = self.appliance.hsm_login(so_pin=pin)
             if result["success"]:
-                print("  HSM SO logged in.")
+                detail = f" ({result.get('quorum')}-share quorum)" if result.get("auth_mode") == "ped" else ""
+                print(f"  HSM SO logged in{detail}.")
             else:
                 print(f"  HSM login failed: {result['error']}")
 
@@ -202,9 +214,12 @@ class LunaSHCommands:
         elif sub == "show":
             if self.api:
                 info = self.api.tokens.get_hsm_info()
+                ped_status = self.appliance.ped.status()
                 print(f"  Model:            {info['model']}")
                 print(f"  Firmware:         {info['firmware']}")
                 print(f"  Serial:           {info['serial']}")
+                print(f"  Label:            {ped_status['hsm_label'] or 'N/A'}")
+                print(f"  Authentication:   {ped_status['auth_mode'].upper()}")
                 print(f"  Partitions:       {info['partition_count']} / {info['max_partitions']}")
                 print(f"  HSM Login:        {'Yes' if self.appliance.is_hsm_logged_in() else 'No'}")
             else:
@@ -213,21 +228,34 @@ class LunaSHCommands:
         elif sub == "init":
             if not self._check_role(ROLE_ADMIN):
                 return
-            print("  [PED Simulation] Initialize the HSM — set SO PIN:")
-            pin = getpass.getpass("  SO PIN: ")
-            confirm = getpass.getpass("  Confirm SO PIN: ")
-            if pin != confirm:
-                print("  Error: PINs do not match.")
+            label = self._get_arg(rest, "-label") or "LunaHSM"
+            ped_mode = "-ped" in rest
+            password_mode = "-password" in rest
+            if ped_mode and password_mode:
+                print("  Error: Choose either -ped or -password authentication.")
                 return
-            if self.api:
-                partitions = self.api.storage.get_all_partitions()
-                if partitions:
-                    self.api.tokens.init_token(partitions[0]["slot_id"], pin)
-                    print("  HSM initialized. SO PIN set.")
-                else:
-                    print("  No partitions to initialize.")
+            if ped_mode:
+                self.appliance.ped.configure_hsm(label, "ped")
+                self.appliance._hsm_logged_in = False
+                print(f"  HSM '{label}' initialized in PED-authenticated mode.")
+                print("  Connect a PED and create a Blue key set before HSM login.")
             else:
-                print("  HSM init not available (no API connected).")
+                print("  Password-authenticated HSM — set HSM SO PIN:")
+                pin = getpass.getpass("  SO PIN: ")
+                confirm = getpass.getpass("  Confirm SO PIN: ")
+                if pin != confirm:
+                    print("  Error: PINs do not match.")
+                    return
+                if self.api:
+                    partitions = self.api.storage.get_all_partitions()
+                    if partitions:
+                        self.api.tokens.init_token(partitions[0]["slot_id"], pin)
+                        self.appliance.ped.configure_hsm(label, "password")
+                        print(f"  HSM '{label}' initialized in password-authenticated mode.")
+                    else:
+                        print("  No partitions to initialize.")
+                else:
+                    print("  HSM init not available (no API connected).")
 
         elif sub == "factoryReset":
             if not self._check_role(ROLE_ADMIN):
@@ -294,19 +322,7 @@ class LunaSHCommands:
             self._hsm_stm(rest)
 
         elif sub == "ped":
-            if not rest:
-                print("  Usage: hsm ped show | hsm ped connect | hsm ped disconnect")
-                return
-            if rest[0] == "show":
-                print("  PED Status: Connected (USB)")
-                print("  PED Vector: Initialized")
-                print("  PED Timeout: 60 seconds")
-            elif rest[0] == "connect":
-                print("  PED connected.")
-            elif rest[0] == "disconnect":
-                print("  PED disconnected.")
-            else:
-                print(f"  Unknown ped subcommand: {rest[0]}")
+            self.cmd_ped(rest)
 
         elif sub == "selfTest":
             print("  Running HSM self-test...")
@@ -332,6 +348,106 @@ class LunaSHCommands:
 
         else:
             print(f"  Unknown hsm subcommand: {sub}")
+
+    def cmd_ped(self, args: list):
+        """Manage PED connections, colored key sets, duplication, and loss."""
+        if not self._check_login():
+            return
+        if not args:
+            print("  Usage: ped show | connect [-remote <host>] | disconnect |")
+            print("         key create|list|duplicate|lose")
+            return
+        sub, rest = args[0].lower(), args[1:]
+        try:
+            if sub == "show":
+                status = self.appliance.ped.status()
+                print(f"  PED Status:       {status['state'].title()}")
+                print(f"  Connection:       {(status['mode'] or 'none').title()}")
+                if status.get("host"):
+                    print(f"  Remote Host:      {status['host']}")
+                print(f"  HSM Auth Mode:    {status['auth_mode'].upper()}")
+                print(f"  PED Key Sets:     {status['key_set_count']}")
+            elif sub == "connect":
+                remote = self._get_arg(rest, "-remote")
+                keys_arg = self._get_arg(rest, "-keys")
+                secret = self._get_arg(rest, "-secret")
+                if remote and keys_arg is None:
+                    keys_arg = input("  Present Orange PED key serials (comma-separated): ")
+                if remote and secret is None and self.appliance.ped.requires_shared_secret("orange"):
+                    secret = getpass.getpass("  PED shared secret: ")
+                keys = [key.strip() for key in keys_arg.split(",") if key.strip()] if keys_arg else None
+                conn = self.appliance.ped.connect(remote, keys, secret)
+                target = f"remote PED at {remote}" if remote else "local PED (USB)"
+                print(f"  Connected to {target}.")
+            elif sub == "disconnect":
+                self.appliance.ped.disconnect()
+                print("  PED disconnected.")
+            elif sub == "key":
+                self._ped_key(rest)
+            else:
+                print(f"  Unknown PED subcommand: {sub}")
+        except (PEDError, ValueError) as exc:
+            print(f"  PED error: {exc}")
+
+    def _ped_key(self, args: list):
+        if not args:
+            print("  Usage: ped key create -type <color> [-m M -n N] [-sharedsecret] | list |")
+            print("         duplicate -serial <serial> [-count N] | lose -serial <serial>")
+            return
+        sub, rest = args[0].lower(), args[1:]
+        if sub == "create":
+            key_type = self._get_arg(rest, "-type")
+            if not key_type:
+                raise PEDError("PED_INVALID_KEY_TYPE", "-type <color> is required")
+            m = int(self._get_arg(rest, "-m") or 1)
+            n = int(self._get_arg(rest, "-n") or 1)
+            scope = self._get_arg(rest, "-scope") or "hsm"
+            secret = self._get_arg(rest, "-secret")
+            if "-sharedsecret" in rest and secret is None:
+                secret = getpass.getpass("  Shared secret: ")
+                if secret != getpass.getpass("  Confirm shared secret: "):
+                    raise PEDError("PED_SHARED_SECRET_MISMATCH", "Shared secrets do not match")
+            key_set = self.appliance.ped.create_key_set(key_type, m, n, secret, scope)
+            color = PED_KEY_TYPES[key_type.lower()]["color"]
+            print(f"  Created {color} PED key set {key_set['id']} ({m}-of-{n}, scope={scope}).")
+            for share in key_set["shares"]:
+                print(f"    Share {share['share']}: {share['copies'][0]['serial']}")
+            if key_set.get("domain_id"):
+                print(f"    Cloning Domain: {key_set['domain_id']}")
+        elif sub == "list":
+            sets = self.appliance.ped.list_key_sets()
+            if not sets:
+                print("  No PED key sets initialized.")
+                return
+            for key_set in sets:
+                available = sum(any(c["status"] == "active" for c in s["copies"])
+                                for s in key_set["shares"])
+                print(f"  {key_set['id']}  {key_set['type'].title():<7} "
+                      f"{key_set['m']}-of-{key_set['n']}  scope={key_set['scope']}  "
+                      f"available={available}  {'RECOVERABLE' if available >= key_set['m'] else 'UNRECOVERABLE'}")
+                for share in key_set["shares"]:
+                    copies = ", ".join(f"{c['serial']} ({c['status']})" for c in share["copies"])
+                    print(f"    Share {share['share']}: {copies}")
+        elif sub == "duplicate":
+            serial = self._get_arg(rest, "-serial")
+            if not serial:
+                raise PEDError("PED_KEY_REQUIRED", "-serial is required")
+            copies = self.appliance.ped.duplicate_key(serial, int(self._get_arg(rest, "-count") or 1))
+            print(f"  Duplicated {serial}: {', '.join(copies)}")
+        elif sub in ("lose", "lost"):
+            serial = self._get_arg(rest, "-serial")
+            if not serial:
+                raise PEDError("PED_KEY_REQUIRED", "-serial is required")
+            consequence = self.appliance.ped.mark_lost(serial)
+            print(f"  PED key {serial} marked lost.")
+            if consequence["recoverable"]:
+                print(f"  Key set remains recoverable ({consequence['available_shares']} distinct shares available; "
+                      f"{consequence['threshold']} required).")
+            else:
+                print("  WARNING: Quorum can no longer be met. The associated identity/domain is permanently inaccessible;")
+                print("           affected keys cannot be recovered unless another duplicate of a missing share exists.")
+        else:
+            print(f"  Unknown PED key subcommand: {sub}")
 
     def _hsm_firmware(self, args: list):
         if not args:
@@ -2233,9 +2349,22 @@ class LunaSHCommands:
             if self.appliance.is_audit_logged_in():
                 print("  Already logged in as Auditor.")
                 return
-            print("  [PED Simulation] Enter Auditor PIN:")
-            pin = getpass.getpass("  PIN: ")
-            result = self.appliance.audit_login(pin)
+            rest = args[1:]
+            if self.appliance.ped.get_auth_mode() == "ped":
+                keys_arg = self._get_arg(rest, "-keys")
+                if keys_arg is None:
+                    keys_arg = input("  Present White PED key serials (comma-separated): ")
+                secret = self._get_arg(rest, "-secret")
+                if secret is None and self.appliance.ped.requires_shared_secret("white"):
+                    secret = getpass.getpass("  PED shared secret: ")
+                result = self.appliance.audit_login(
+                    ped_keys=[key.strip() for key in keys_arg.split(",") if key.strip()],
+                    shared_secret=secret,
+                )
+            else:
+                print("  Enter Auditor PIN:")
+                pin = getpass.getpass("  PIN: ")
+                result = self.appliance.audit_login(audit_pin=pin)
             if result["success"]:
                 print("  Auditor logged in.")
             else:
@@ -2792,7 +2921,13 @@ class LunaSHCommands:
     hsm changePolicy -policy <id> -value <v>  Change HSM policy
     hsm stm show                         Show Secure Transport Mode status
     hsm stm recover -string <s>          Recover from STM
-    hsm ped show                         Show PED status
+    hsm ped show                         Show PED status (also available as 'ped show')
+    ped connect [-remote <host>]          Connect a local or remote PED
+    ped disconnect                       Disconnect the PED
+    ped key create -type <color> [-m M -n N] [-sharedsecret] [-scope <slot>]
+    ped key list                         List PED key sets and recovery status
+    ped key duplicate -serial <s>        Duplicate a PED key share
+    ped key lose -serial <s>             Mark a PED key copy lost
     hsm selfTest                         Run HSM self-test
     hsm time                             Show HSM time
     hsm information show                 Show HSM information

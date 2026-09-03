@@ -266,6 +266,8 @@ class TokenManager:
         self.storage.clear_audit_logs()
         self.storage.set_meta("firmware_version", DEFAULT_FIRMWARE)
         self.storage.set_meta("firmware_history", "[]")
+        from hsm.ped import PEDManager
+        PEDManager(self.storage).factory_reset()
 
     # ------------------------------------------------------------------
     # Firmware management

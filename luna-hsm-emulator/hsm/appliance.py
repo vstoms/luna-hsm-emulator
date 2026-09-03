@@ -24,6 +24,7 @@ from typing import Optional
 
 from hsm.connections import ConnectionManager, CERT_SELF_SIGNED
 from hsm.deployment import DeploymentManager
+from hsm.ped import PEDManager, PEDError
 
 
 # Appliance user roles
@@ -178,6 +179,7 @@ class Appliance:
         self._audit_logged_in = False  # Auditor login state
         self._boot_time = time.time()
         self.connections = ConnectionManager(storage)
+        self.ped = PEDManager(storage)
         self.deployment = DeploymentManager(storage)
         self._ensure_state()
 
@@ -373,14 +375,20 @@ class Appliance:
     # HSM SO login (separate from appliance login)
     # ------------------------------------------------------------------
 
-    def hsm_login(self, so_pin: str) -> dict:
-        """Log in to the HSM as Security Officer.
-
-        On a real Luna 7: 'hsm login' — requires the HSM SO PIN.
-        This is separate from the appliance SSH login.
-        """
+    def hsm_login(self, so_pin: str = None, ped_keys: list = None,
+                  shared_secret: str = None) -> dict:
+        """Log in to the HSM as Security Officer using its configured mode."""
         if not self.is_logged_in():
             return {"success": False, "error": "Must log in to appliance first"}
+
+        if self.ped.get_auth_mode() == "ped":
+            try:
+                quorum = self.ped.authenticate("blue", ped_keys or [], shared_secret, "hsm")
+            except PEDError as exc:
+                return {"success": False, "error": str(exc), "code": exc.code}
+            self._hsm_logged_in = True
+            return {"success": True, "auth_mode": "ped", "quorum": quorum.shares_presented}
+
         partitions = self.storage.get_all_partitions()
         if not partitions:
             return {"success": False, "error": "No partitions configured"}
@@ -390,10 +398,10 @@ class Appliance:
         stored_salt = partition.get("so_pin_salt")
         if not stored_hash or not stored_salt:
             return {"success": False, "error": "HSM SO PIN not initialized"}
-        if not self.storage.verify_pin(so_pin, stored_hash, stored_salt):
+        if not so_pin or not self.storage.verify_pin(so_pin, stored_hash, stored_salt):
             return {"success": False, "error": "Invalid HSM SO PIN"}
         self._hsm_logged_in = True
-        return {"success": True}
+        return {"success": True, "auth_mode": "password"}
 
     def hsm_logout(self):
         """Log out of the HSM."""
@@ -402,10 +410,16 @@ class Appliance:
     def is_hsm_logged_in(self) -> bool:
         return self._hsm_logged_in
 
-    def audit_login(self, audit_pin: str) -> dict:
-        """Log in as the Auditor."""
+    def audit_login(self, audit_pin: str = None, ped_keys: list = None,
+                    shared_secret: str = None) -> dict:
+        """Log in as Auditor, using White keys when PED mode is enabled."""
         if not self.is_logged_in():
             return {"success": False, "error": "Must log in to appliance first"}
+        if self.ped.get_auth_mode() == "ped":
+            try:
+                self.ped.authenticate("white", ped_keys or [], shared_secret, "hsm")
+            except PEDError as exc:
+                return {"success": False, "error": str(exc), "code": exc.code}
         self._audit_logged_in = True
         return {"success": True}
 

@@ -43,6 +43,7 @@ COMMAND_SHORTCUTS = {
     "ntp": "ntp",
     "bond": "bond",
     "lic": "license",
+    "ped": "ped",
 }
 
 # Subcommand completions per top-level command
@@ -68,6 +69,7 @@ SUBCOMMANDS = {
     "ntp": ["show", "add", "delete", "enable", "disable", "sync"],
     "bond": ["show", "configure", "enable", "disable", "delete"],
     "license": ["list", "show", "setlimit", "enable", "disable"],
+    "ped": ["show", "connect", "disconnect", "key"],
 }
 
 
@@ -146,6 +148,7 @@ class LunaSHShell(cmd.Cmd):
             "ntp": self.handler.cmd_ntp,
             "bond": self.handler.cmd_bond,
             "license": self.handler.cmd_license,
+            "ped": self.handler.cmd_ped,
             "help": self.handler.cmd_help,
         }
 
@@ -329,6 +332,7 @@ def run_lunash_command(appliance: Appliance, api: PKCS11API, command_line: str):
         "ntp": handler.cmd_ntp,
         "bond": handler.cmd_bond,
         "license": handler.cmd_license,
+        "ped": handler.cmd_ped,
         "help": handler.cmd_help,
     }
     h = dispatch.get(cmd_name)
