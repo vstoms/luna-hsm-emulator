@@ -73,10 +73,13 @@ class KeyStore:
                               "Key is sensitive and not extractable — cannot read in plaintext")
         return km
 
-    def check_quota(self, slot_id: int) -> bool:
-        """Check if the partition can accept more objects."""
+    def check_quota(self, slot_id: int, additional_objects: int = 1,
+                    additional_bytes: int = 0) -> bool:
+        """Check object-count and persisted-byte quotas before an operation."""
         p = self.storage.get_partition(slot_id)
         if p is None:
             return False
         count = self.storage.count_objects(slot_id)
-        return count < p["max_objects"]
+        used = self.storage.get_partition_storage_used(slot_id)
+        return (count + additional_objects <= p["max_objects"]
+                and used + additional_bytes <= p["max_storage"])

@@ -59,7 +59,10 @@ Both channels support full lifecycle: create, connect, disconnect, restore. NTLS
 
 ### Partition Management & Policies
 
-- Create, initialize, and delete named partitions with per-partition storage quotas
+- PPSO and legacy partition workflows with uninitialized, roles-pending, ready, and deactivated states
+- Separate SO, CO, and CU initialization, activation, lockout, and superior-role reset rules
+- HSM SO-authorized deletion and enforced object/persisted-byte quotas
+- Comprehensive status via `partition show -partition <name>`
 - **30-policy catalog** matching Luna 7 capabilities, including destructive changes and mutual exclusion
 - **Partition Policy Templates (PPT)** — predefined sets (FIPS Strict, High Security, Development, Backup Ready) plus custom templates
 
@@ -127,7 +130,7 @@ pip install -r requirements.txt
 python tests/test_pkcs11.py -v
 ```
 
-All 281 tests should pass.
+All 290 tests should pass.
 
 ---
 
@@ -1260,6 +1263,7 @@ luna-hsm-emulator/
 │   ├── auth.py              # Role-based authentication
 │   ├── ped.py               # PED keys and M-of-N quorum
 │   ├── domain.py            # Cloning domains and secure object cloning
+│   ├── lifecycle.py         # Partition types, lifecycle, and role states
 │   ├── keystore.py          # Key storage and retrieval
 │   └── audit.py             # Audit logging with hash chaining
 ├── cli/
@@ -1280,7 +1284,8 @@ luna-hsm-emulator/
 ├── tests/
 │   ├── test_pkcs11.py       # PKCS#11 and appliance tests
 │   ├── test_ped.py          # PED authentication and quorum tests
-│   └── test_domain.py       # Cloning domain and secure cloning tests
+│   ├── test_domain.py       # Cloning domain and secure cloning tests
+│   └── test_lifecycle.py    # Partition lifecycle and quota tests
 ├── requirements.txt
 └── README.md
 ```
@@ -1357,9 +1362,12 @@ The suite covers:
 | `TestLunaSH` | 50 | Appliance login, HSM SO login, user management, client management, network, services, sysconf, syslog, NTLS, packages, RBAC, persistence |
 | `TestClientPartitionConnections` | 48 | NTLS cert, connection lifecycle, STC identities, STC connections, STC config, NTLS-to-STC conversion, persistence |
 | `TestDeploymentFeatures` | 50 | HA groups, NTP, network bonding, licenses, support bundles, persistence |
+| `TestPEDManager` | 7 | PED colors, quorum, duplication, loss, remote PED, colored-role login |
+| `TestCloningDomains` | 7 | Domain inheritance/change, secure cloning, HA domain enforcement |
+| `TestPartitionLifecycle` | 9 | PPSO/legacy states, role hierarchy, deletion authorization, quotas |
 
 ```
-Ran 281 tests in 3.8s
+Ran 290 tests in 4.1s
 
 OK
 ```

@@ -16,10 +16,11 @@ from pkcs11.constants import (
     PKCS11Error, CKR_TOKEN_NOT_PRESENT, CKR_TOKEN_WRITE_PROTECTED,
     CKR_TOKEN_NOT_RECOGNIZED, CKR_SESSION_READ_ONLY,
     CKF_TOKEN_INITIALIZED, CKF_LOGIN_REQUIRED, CKF_RNG,
-    CKR_ACTION_PROHIBITED, CKR_ARGUMENTS_BAD,
+    CKR_ACTION_PROHIBITED, CKR_ARGUMENTS_BAD, CKR_USER_PIN_NOT_INITIALIZED,
 )
 from hsm.auth import AuthManager, ROLE_CO, ROLE_CU, ROLE_SO
 from hsm.domain import CloningDomainManager
+from hsm.lifecycle import PartitionLifecycleManager, PARTITION_PPSO, PARTITION_LEGACY
 
 # Luna 7 simulated hardware model
 HSM_MODEL = "Luna Network HSM 7"
@@ -72,6 +73,7 @@ class TokenManager:
         self.storage = storage
         self.auth = auth
         self.domains = CloningDomainManager(storage)
+        self.lifecycle = PartitionLifecycleManager(storage)
         self._next_slot = 1
 
     def _generate_serial(self) -> str:
@@ -146,6 +148,7 @@ class TokenManager:
         flags |= CKF_LOGIN_REQUIRED
         flags |= CKF_RNG
         obj_count = self.storage.count_objects(slot_id)
+        storage_used = self.storage.get_partition_storage_used(slot_id)
         return {
             "label": p.get("label") or p["name"],
             "manufacturer": "Thales",
@@ -159,9 +162,9 @@ class TokenManager:
             "max_pin_len": 32,
             "min_pin_len": 4,
             "total_public_memory": p["max_storage"],
-            "free_public_memory": p["max_storage"] - (obj_count * 256),
+            "free_public_memory": max(0, p["max_storage"] - storage_used),
             "total_private_memory": p["max_storage"],
-            "free_private_memory": p["max_storage"] - (obj_count * 256),
+            "free_private_memory": max(0, p["max_storage"] - storage_used),
             "hardware_version": self._get_firmware_version(),
             "firmware_version": self._get_firmware_version(),
             "object_count": obj_count,
@@ -171,11 +174,15 @@ class TokenManager:
     def create_partition(self, name: str, label: str = None,
                          max_objects: int = 1024,
                          max_storage: int = 1048576,
-                         max_login_attempts: int = 10) -> int:
+                         max_login_attempts: int = 10,
+                         partition_type: str = PARTITION_PPSO) -> int:
         """Create a new partition. Returns the slot ID."""
         if self.storage.get_partition_by_name(name):
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
                               f"Partition '{name}' already exists")
+        if max_objects < 1 or max_storage < 1:
+            raise PKCS11Error(CKR_ARGUMENTS_BAD,
+                              "Partition object and storage quotas must be positive")
         partitions = self.storage.get_all_partitions()
         if len(partitions) >= HSM_MAX_PARTITIONS:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, "Maximum partition count reached")
@@ -189,23 +196,35 @@ class TokenManager:
             max_objects=max_objects, max_storage=max_storage,
             max_login_attempts=max_login_attempts,
         )
+        self.lifecycle.register(slot_id, partition_type)
         # New partitions inherit the HSM cloning domain by default.
         self.domains.set_partition_domain(slot_id, inherit=True)
+        self.lifecycle.set_domain_initialized(slot_id, True)
         return slot_id
 
-    def delete_partition(self, name: str):
-        """Delete a partition by name."""
+    def delete_partition(self, name: str, hsm_so_authorized: bool = False,
+                         audit=None, session_id: int = 0):
+        """Delete a partition; explicit HSM SO authorization is mandatory."""
+        if not hsm_so_authorized:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              "HSM Security Officer authorization required for partition deletion")
         p = self.storage.get_partition_by_name(name)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Partition '{name}' not found")
         self.storage.delete_partition(p["slot_id"])
+        self.lifecycle.remove(p["slot_id"])
+        if audit:
+            audit.log(session_id, "HSO", "PartitionDelete", success=True,
+                      detail=f"slot={p['slot_id']}, name={name}")
 
     def init_token(self, slot_id: int, so_pin: str, label: str = None):
-        """Initialize a token (partition) — sets the SO PIN and label."""
+        """Initialize a PPSO partition SO or a legacy Partition Owner (CO)."""
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
-        self.auth.set_pin(slot_id, ROLE_SO, so_pin)
+        initial_role = (ROLE_CO if self.lifecycle.partition_type(slot_id) == PARTITION_LEGACY
+                        else ROLE_SO)
+        self.auth.set_pin(slot_id, initial_role, so_pin)
         updates = {"initialized": 1}
         if label:
             updates["label"] = label
@@ -226,22 +245,29 @@ class TokenManager:
         if p is None:
             return f"  Slot {slot_id}: No partition present"
         obj_count = self.storage.count_objects(slot_id)
-        info = self.get_token_info(slot_id)
+        storage_used = self.storage.get_partition_storage_used(slot_id)
+        lifecycle = self.lifecycle.status(slot_id)
+        domain = self.domains.get_partition_domain(slot_id)
         lines = [
-            f"  Slot ID:          {slot_id}",
-            f"  Partition Name:   {p['name']}",
-            f"  Label:            {p.get('label', '')}",
-            f"  Initialized:      {'Yes' if p['initialized'] else 'No'}",
-            f"  Object Count:     {obj_count} / {p['max_objects']}",
-            f"  Storage Used:     ~{obj_count * 256} bytes / {p['max_storage']} bytes",
-            f"  Max Login Attempts: {p['max_login_attempts']}",
-            f"  SO Locked:        {'Yes' if p['so_locked'] else 'No'}",
-            f"  CO Locked:        {'Yes' if p['co_locked'] else 'No'}",
-            f"  CU Locked:        {'Yes' if p['cu_locked'] else 'No'}",
-            f"  Cloning Domain:   {self.domains.get_partition_domain(slot_id)['fingerprint']} "
-            f"({self.domains.get_partition_domain(slot_id)['source']})",
-            f"  Created:          {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p['created_at']))}",
+            f"  Slot ID:             {slot_id}",
+            f"  Partition Name:      {p['name']}",
+            f"  Label:               {p.get('label', '')}",
+            f"  Partition Type:      {lifecycle['type']}",
+            f"  Lifecycle State:     {lifecycle['state']}",
+            f"  Partition Active:    {'Yes' if lifecycle['active'] else 'No'}",
+            f"  Initialized:         {'Yes' if p['initialized'] else 'No'}",
+            f"  Cloning Domain:      {domain['fingerprint']} ({domain['source']})",
+            f"  Domain Initialized:  {'Yes' if lifecycle['domain_initialized'] else 'No'}",
+            f"  Object Quota:        {obj_count} / {p['max_objects']}",
+            f"  Storage Quota:       {storage_used} / {p['max_storage']} bytes",
+            f"  Max Login Attempts:  {p['max_login_attempts']}",
+            "  Roles:",
         ]
+        for role in ("SO", "CO", "CU"):
+            state = lifecycle["roles"][role]
+            attempts = f", failures={state['failed_attempts']}/{p['max_login_attempts']}" if state["supported"] else ""
+            lines.append(f"    {role:<3} {state['state']}{attempts}")
+        lines.append(f"  Created:             {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p['created_at']))}")
         return "\n".join(lines)
 
     def list_partitions(self) -> str:
@@ -250,18 +276,18 @@ class TokenManager:
         if not partitions:
             return "  No partitions configured. Use 'partition create' to create one."
         lines = [
-            f"  {'Slot':<6} {'Name':<20} {'Label':<20} {'Init':<6} {'Objects':<10} {'SO':<4} {'CO':<4} {'CU':<4}",
-            "  " + "-" * 80,
+            f"  {'Slot':<6} {'Name':<18} {'Type':<8} {'State':<28} {'Objects':<10} {'SO':<14} {'CO':<14} {'CU':<14}",
+            "  " + "-" * 120,
         ]
         for p in partitions:
             obj_count = self.storage.count_objects(p["slot_id"])
-            init = "Yes" if p["initialized"] else "No"
-            so = "L" if p["so_locked"] else "-"
-            co = "L" if p["co_locked"] else "-"
-            cu = "L" if p["cu_locked"] else "-"
+            lifecycle = self.lifecycle.status(p["slot_id"])
             lines.append(
-                f"  {p['slot_id']:<6} {p['name']:<20} {p.get('label', ''):<20} "
-                f"{init:<6} {obj_count:<10} {so:<4} {co:<4} {cu:<4}"
+                f"  {p['slot_id']:<6} {p['name']:<18} {lifecycle['type']:<8} "
+                f"{lifecycle['state']:<28} {obj_count:<10} "
+                f"{lifecycle['roles']['SO']['state']:<14} "
+                f"{lifecycle['roles']['CO']['state']:<14} "
+                f"{lifecycle['roles']['CU']['state']:<14}"
             )
         return "\n".join(lines)
 
@@ -276,6 +302,7 @@ class TokenManager:
         PEDManager(self.storage).factory_reset()
         self.storage.set_meta(CloningDomainManager.HSM_META, "")
         self.storage.set_meta(CloningDomainManager.PARTITION_META, "{}")
+        self.storage.set_meta(PartitionLifecycleManager.META_KEY, "{}")
 
     # ------------------------------------------------------------------
     # Firmware management
@@ -549,7 +576,9 @@ class TokenManager:
         if p.get("initialized"):
             raise PKCS11Error(CKR_TOKEN_WRITE_PROTECTED,
                               "Partition is already initialized. Use 'hsm factoryreset' first.")
-        self.auth.set_pin(slot_id, ROLE_SO, so_pin)
+        initial_role = (ROLE_CO if self.lifecycle.partition_type(slot_id) == PARTITION_LEGACY
+                        else ROLE_SO)
+        self.auth.set_pin(slot_id, initial_role, so_pin)
         updates = {"initialized": 1}
         if label:
             updates["label"] = label
@@ -921,24 +950,18 @@ class TokenManager:
         if p is None:
             return f"  Slot {slot_id}: No partition present"
 
-        roles = [
-            ("SO", "Security Officer", p.get("so_pin_hash") is not None,
-             "LOCKED" if p.get("so_locked") else "Unlocked"),
-            ("CO", "Crypto Officer", p.get("co_pin_hash") is not None,
-             "LOCKED" if p.get("co_locked") else "Unlocked"),
-            ("CU", "Crypto User", p.get("cu_pin_hash") is not None,
-             "LOCKED" if p.get("cu_locked") else "Unlocked"),
-        ]
-
+        lifecycle = self.lifecycle.status(slot_id)
+        descriptions = {"SO": "Security Officer", "CO": "Crypto Officer", "CU": "Crypto User"}
         lines = [
-            f"  Roles on partition '{p['name']}' (slot {slot_id}):",
+            f"  Roles on partition '{p['name']}' (slot {slot_id}, {lifecycle['type']}):",
             "",
             f"  {'Role':<6} {'Description':<25} {'Initialized':<14} {'Status'}",
-            "  " + "-" * 60,
+            "  " + "-" * 65,
         ]
-        for name, desc, initialized, status in roles:
-            init = "Yes" if initialized else "No"
-            lines.append(f"  {name:<6} {desc:<25} {init:<14} {status}")
+        for name in ("SO", "CO", "CU"):
+            role = lifecycle["roles"][name]
+            init = "Yes" if role["initialized"] else "No"
+            lines.append(f"  {name:<6} {descriptions[name]:<25} {init:<14} {role['state']}")
         return "\n".join(lines)
 
     def show_role(self, slot_id: int, role_name: str) -> str:
@@ -956,22 +979,20 @@ class TokenManager:
             return f"  Unknown role: {role_name}. Valid: SO, CO, CU"
 
         prefix, desc = role_map[role_name]
-        initialized = p.get(f"{prefix}_pin_hash") is not None
-        locked = bool(p.get(f"{prefix}_locked", 0))
-        attempts = p.get(f"{prefix}_login_attempts", 0)
+        role = self.lifecycle.status(slot_id)["roles"][role_name]
         max_attempts = p.get("max_login_attempts", 10)
 
         lines = [
             f"  Role: {role_name} ({desc})",
             f"  Partition: {p['name']} (slot {slot_id})",
-            f"  PIN Initialized: {'Yes' if initialized else 'No'}",
-            f"  Status: {'LOCKED' if locked else 'Active'}",
-            f"  Failed Login Attempts: {attempts} / {max_attempts}",
+            f"  PIN Initialized: {'Yes' if role['initialized'] else 'No'}",
+            f"  Status: {role['state']}",
+            f"  Failed Login Attempts: {role['failed_attempts']} / {max_attempts}",
         ]
         return "\n".join(lines)
 
     def init_role(self, slot_id: int, role_name: str, pin: str,
-                  audit=None, session_id: int = 0):
+                  audit=None, session_id: int = 0, actor_role: str = ROLE_SO):
         """Initialize a role on a partition (role init).
 
         This is used to initialize the CU role or re-initialize CO.
@@ -985,6 +1006,14 @@ class TokenManager:
         if role_name not in ("CO", "CU"):
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
                               "Only CO and CU roles can be initialized with 'role init'")
+        ptype = self.lifecycle.partition_type(slot_id)
+        superior = ROLE_SO if ptype == PARTITION_PPSO else ROLE_CO
+        if actor_role != superior:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              f"{superior} authorization required")
+        if p.get(f"{role_name.lower()}_pin_hash"):
+            raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                              f"{role_name} is already initialized; use role resetpw or changepw")
 
         self.auth.set_pin(slot_id, role_name, pin)
         if audit:
@@ -992,11 +1021,9 @@ class TokenManager:
                        detail=f"slot={slot_id}, role={role_name}")
 
     def deactivate_role(self, slot_id: int, role_name: str,
-                        audit=None, session_id: int = 0):
-        """Deactivate a role (role deactivate).
-
-        This clears the PIN for the role, effectively disabling login.
-        """
+                        audit=None, session_id: int = 0,
+                        actor_role: str = ROLE_SO):
+        """Deactivate CO/CU login while retaining its credential for reactivation."""
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
@@ -1006,19 +1033,41 @@ class TokenManager:
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
                               "Only CO and CU roles can be deactivated")
 
-        prefix = role_name.lower()
-        self.storage.update_partition(slot_id, **{
-            f"{prefix}_pin_hash": None,
-            f"{prefix}_pin_salt": None,
-            f"{prefix}_login_attempts": 0,
-            f"{prefix}_locked": 0,
-        })
+        ptype = self.lifecycle.partition_type(slot_id)
+        superior = (ROLE_SO if ptype == PARTITION_PPSO else
+                    ("HSO" if role_name == "CO" else ROLE_CO))
+        if actor_role != superior:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, f"{superior} authorization required")
+        self.lifecycle.set_role_active(slot_id, role_name, False)
         if audit:
             audit.log(session_id, "SO", "RoleDeactivate", success=True,
                        detail=f"slot={slot_id}, role={role_name}")
 
+    def activate_role(self, slot_id: int, role_name: str,
+                      audit=None, session_id: int = 0,
+                      actor_role: str = ROLE_SO):
+        """Reactivate an initialized CO or CU role; requires Partition SO."""
+        role_name = role_name.upper()
+        p = self.storage.get_partition(slot_id)
+        if p is None:
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
+        if role_name not in ("CO", "CU"):
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED, "Only CO and CU can be activated")
+        ptype = self.lifecycle.partition_type(slot_id)
+        superior = (ROLE_SO if ptype == PARTITION_PPSO else
+                    ("HSO" if role_name == "CO" else ROLE_CO))
+        if actor_role != superior:
+            raise PKCS11Error(CKR_ACTION_PROHIBITED, f"{superior} authorization required")
+        if not p.get(f"{role_name.lower()}_pin_hash"):
+            raise PKCS11Error(CKR_USER_PIN_NOT_INITIALIZED, f"{role_name} is not initialized")
+        self.lifecycle.set_role_active(slot_id, role_name, True)
+        if audit:
+            audit.log(session_id, "SO", "RoleActivate", success=True,
+                      detail=f"slot={slot_id}, role={role_name}")
+
     def reset_pin(self, slot_id: int, role_name: str, new_pin: str,
-                  audit=None, session_id: int = 0):
+                  audit=None, session_id: int = 0,
+                  actor_role: str = ROLE_SO):
         """Reset a role's PIN (role resetpw).
 
         On a real HSM, this requires SO authentication. It sets a new
@@ -1029,11 +1078,21 @@ class TokenManager:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
 
         role_name = role_name.upper()
-        if role_name not in ("CO", "CU"):
-            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
-                              "Only CO and CU roles can be reset")
+        if role_name == "SO":
+            if actor_role != "HSO":
+                raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                                  "Only the HSM SO can reset the Partition SO")
+        elif role_name in ("CO", "CU"):
+            ptype = self.lifecycle.partition_type(slot_id)
+            superior = (ROLE_SO if ptype == PARTITION_PPSO else
+                        ("HSO" if role_name == "CO" else ROLE_CO))
+            if actor_role != superior:
+                raise PKCS11Error(CKR_ACTION_PROHIBITED,
+                                  f"{superior} authorization required")
+        else:
+            raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED, "Unknown role")
 
         self.auth.set_pin(slot_id, role_name, new_pin)
         if audit:
-            audit.log(session_id, "SO", "RoleResetPW", success=True,
+            audit.log(session_id, actor_role, "RoleResetPW", success=True,
                        detail=f"slot={slot_id}, role={role_name}")

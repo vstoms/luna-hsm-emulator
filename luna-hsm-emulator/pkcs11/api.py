@@ -21,7 +21,7 @@ from pkcs11.constants import (
     CKR_OBJECT_HANDLE_INVALID, CKR_MECHANISM_INVALID,
     CKR_MECHANISM_PARAM_INVALID, CKR_TEMPLATE_INCOMPLETE,
     CKR_TEMPLATE_INCONSISTENT, CKR_KEY_SIZE_RANGE, CKR_KEY_TYPE_INCONSISTENT,
-    CKR_BUFFER_TOO_SMALL, CKR_DATA_LEN_RANGE, CKR_DATA_INVALID,
+    CKR_BUFFER_TOO_SMALL, CKR_DATA_LEN_RANGE, CKR_DATA_INVALID, CKR_DEVICE_MEMORY,
     CKR_USER_NOT_LOGGED_IN, CKR_ATTRIBUTE_SENSITIVE,
     CKR_FUNCTION_NOT_SUPPORTED, CKR_PIN_INCORRECT, CKR_PIN_LOCKED,
     CKR_TOKEN_NOT_PRESENT, CKR_ACTION_PROHIBITED,
@@ -224,7 +224,7 @@ class PKCS11API:
         """Create an object from a template. Returns handle."""
         s = self.sessions.get_session(session_id)
         if not self.keystore.check_quota(s.slot_id):
-            raise PKCS11Error(CKR_DATA_INVALID, "Partition object quota exceeded")
+            raise PKCS11Error(CKR_DEVICE_MEMORY, "Partition object quota exceeded")
         handle = self.keystore.allocate_handle()
         obj = CKObject(handle, template)
         label = obj.label()
@@ -359,7 +359,7 @@ class PKCS11API:
         """Generate a symmetric key. Returns handle."""
         s = self.sessions.get_session(session_id)
         if not self.keystore.check_quota(s.slot_id):
-            raise PKCS11Error(CKR_DATA_INVALID, "Partition quota exceeded")
+            raise PKCS11Error(CKR_DEVICE_MEMORY, "Partition quota exceeded")
         mech_info = get_mechanism_info(mechanism)
         if not mech_info.supports(MF_GENERATE):
             raise PKCS11Error(CKR_MECHANISM_INVALID,
@@ -399,8 +399,8 @@ class PKCS11API:
                           params: dict = None) -> tuple:
         """Generate an asymmetric key pair. Returns (priv_handle, pub_handle)."""
         s = self.sessions.get_session(session_id)
-        if not self.keystore.check_quota(s.slot_id):
-            raise PKCS11Error(CKR_DATA_INVALID, "Partition quota exceeded")
+        if not self.keystore.check_quota(s.slot_id, additional_objects=2):
+            raise PKCS11Error(CKR_DEVICE_MEMORY, "Partition quota exceeded")
         role = self.auth.get_role(session_id) or "anonymous"
 
         if mechanism == CKM_RSA_PKCS_KEY_PAIR_GEN:
@@ -817,7 +817,7 @@ class PKCS11API:
         """Unwrap (decrypt) a key and store it."""
         s = self.sessions.get_session(session_id)
         if not self.keystore.check_quota(s.slot_id):
-            raise PKCS11Error(CKR_DATA_INVALID, "Partition quota exceeded")
+            raise PKCS11Error(CKR_DEVICE_MEMORY, "Partition quota exceeded")
         unwrap_obj, unwrap_key = self.keystore.retrieve(unwrapping_handle)
         if unwrap_mechanism == CKM_AES_GCM:
             key_material = sym.decrypt(CKM_AES_GCM, unwrap_key, wrapped_key)
@@ -852,7 +852,7 @@ class PKCS11API:
         """Derive a key from a base key."""
         s = self.sessions.get_session(session_id)
         if not self.keystore.check_quota(s.slot_id):
-            raise PKCS11Error(CKR_DATA_INVALID, "Partition quota exceeded")
+            raise PKCS11Error(CKR_DEVICE_MEMORY, "Partition quota exceeded")
         base_obj, base_key = self.keystore.retrieve(base_handle)
         params = params or {}
         if mechanism == CKM_ECDH1_DERIVE:

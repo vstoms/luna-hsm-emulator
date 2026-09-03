@@ -539,12 +539,17 @@ class LunaSHCommands:
                 return
             name = self._get_arg(rest, "-name") or input("  Partition name: ")
             label = self._get_arg(rest, "-label") or name
+            partition_type = (self._get_arg(rest, "-type") or "ppso").upper()
+            max_objects = int(self._get_arg(rest, "-maxobjects") or 1024)
+            max_storage = int(self._get_arg(rest, "-storage") or 1048576)
             if not name:
-                print("  Usage: partition create -name <name> [-label <label>]")
+                print("  Usage: partition create -name <name> [-label <label>] [-type ppso|legacy]")
                 return
             try:
                 if self.api:
-                    slot_id = self.api.tokens.create_partition(name, label)
+                    slot_id = self.api.tokens.create_partition(
+                        name, label, max_objects=max_objects, max_storage=max_storage,
+                        partition_type=partition_type)
                     print(f"  Partition '{name}' created. Slot ID: {slot_id}")
             except PKCS11Error as e:
                 print(f"  Error: {e}")
@@ -564,13 +569,14 @@ class LunaSHCommands:
                 return
             try:
                 if self.api:
-                    self.api.tokens.delete_partition(name)
-                    print(f"  Partition '{name}' deleted.")
+                    self.api.tokens.delete_partition(
+                        name, hsm_so_authorized=True, audit=self.api.audit)
+                    print(f"  Partition '{name}' deleted with HSM SO authorization.")
             except PKCS11Error as e:
                 print(f"  Error: {e}")
 
         elif sub == "show":
-            name = self._get_arg(rest, "-name")
+            name = self._get_arg(rest, "-partition") or self._get_arg(rest, "-name")
             if self.api:
                 partitions = self.api.storage.get_all_partitions()
                 if name:
@@ -598,14 +604,16 @@ class LunaSHCommands:
                 if not p:
                     print(f"  Partition '{name}' not found.")
                     return
-                print("  [PED Simulation] Set SO PIN for partition:")
-                pin = getpass.getpass("  SO PIN: ")
-                confirm = getpass.getpass("  Confirm SO PIN: ")
+                partition_type = self.api.tokens.lifecycle.partition_type(p["slot_id"])
+                initial_role = "Partition Owner (CO)" if partition_type == "LEGACY" else "Partition SO"
+                print(f"  Set credential for {initial_role}:")
+                pin = getpass.getpass("  Credential: ")
+                confirm = getpass.getpass("  Confirm credential: ")
                 if pin != confirm:
                     print("  Error: PINs do not match.")
                     return
                 self.api.tokens.init_token(p["slot_id"], pin)
-                print(f"  Partition '{name}' initialized. SO PIN set.")
+                print(f"  Partition '{name}' initialized ({partition_type}); {initial_role} credential set.")
 
         elif sub in ("showPolicies", "showpolicies"):
             if self.api:
@@ -690,13 +698,17 @@ class LunaSHCommands:
             except (CloningDomainError, PKCS11Error, ValueError) as exc:
                 print(f"  Clone failed: {exc}")
 
-        elif sub == "activate":
-            name = self._get_arg(rest, "-name")
-            print(f"  Partition '{name}' activated.")
-
-        elif sub == "deactivate":
-            name = self._get_arg(rest, "-name")
-            print(f"  Partition '{name}' deactivated.")
+        elif sub in ("activate", "deactivate"):
+            if not self._check_hsm_login():
+                return
+            name = self._get_arg(rest, "-partition") or self._get_arg(rest, "-name")
+            p = self.api.storage.get_partition_by_name(name) if name else None
+            if not p:
+                print(f"  Partition '{name}' not found.")
+                return
+            active = sub == "activate"
+            self.api.tokens.lifecycle.set_partition_active(p["slot_id"], active)
+            print(f"  Partition '{name}' {'activated' if active else 'deactivated'}.")
 
         elif sub == "rename":
             name = self._get_arg(rest, "-name")
@@ -3039,9 +3051,10 @@ class LunaSHCommands:
 
   Partition Management:
     partition list                       List all partitions
-    partition create -name <n> [-label <l>]  Create a partition
-    partition delete -name <n>           Delete a partition
-    partition show [-name <n>]           Show partition info
+    partition create -name <n> [-label <l>] [-type ppso|legacy]
+                                           Create an inheriting partition
+    partition delete -name <n>           Delete a partition (HSM SO required)
+    partition show [-partition <n>]      Show complete partition lifecycle status
     partition init -name <n>             Initialize a partition (set SO PIN)
     partition showPolicies [-verbose]    Show partition policies
     partition changePolicy -policy <id> -value <v>  Change partition policy

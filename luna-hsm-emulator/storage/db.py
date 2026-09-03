@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-from pkcs11.constants import PKCS11Error, CKR_FUNCTION_FAILED
+from pkcs11.constants import PKCS11Error, CKR_FUNCTION_FAILED, CKR_DEVICE_MEMORY
 from pkcs11.objects import CKObject
 
 DEFAULT_DB_PATH = os.path.join(os.path.expanduser("~"), ".luna_hsm_emulator", "hsm.db")
@@ -342,6 +342,19 @@ class Storage:
         encrypted_material = None
         if key_material is not None:
             encrypted_material = self.encrypt_blob(key_material)
+        partition = self.get_partition(slot_id)
+        if partition is None:
+            raise PKCS11Error(CKR_DEVICE_MEMORY, f"Partition slot {slot_id} not found")
+        if self.count_objects(slot_id) >= partition["max_objects"]:
+            raise PKCS11Error(CKR_DEVICE_MEMORY,
+                              f"Partition object quota exceeded ({partition['max_objects']})")
+        payload_size = len(obj_data.encode("utf-8")) + len(encrypted_material or b"")
+        used = self.get_partition_storage_used(slot_id)
+        if used + payload_size > partition["max_storage"]:
+            raise PKCS11Error(
+                CKR_DEVICE_MEMORY,
+                f"Partition storage quota exceeded ({used} + {payload_size} > {partition['max_storage']} bytes)",
+            )
         c = self.conn.cursor()
         c.execute(
             """INSERT INTO objects (handle, slot_id, label, object_data, key_material, created_at)
@@ -356,6 +369,20 @@ class Storage:
         if key_material is not None:
             encrypted_material = self.encrypt_blob(key_material)
         c = self.conn.cursor()
+        current = c.execute(
+            "SELECT slot_id, LENGTH(object_data) AS object_len, "
+            "COALESCE(LENGTH(key_material), 0) AS key_len FROM objects WHERE handle = ?",
+            (handle,),
+        ).fetchone()
+        if current:
+            partition = self.get_partition(current["slot_id"])
+            used = self.get_partition_storage_used(current["slot_id"])
+            old_size = current["object_len"] + current["key_len"]
+            new_key_size = len(encrypted_material) if encrypted_material is not None else current["key_len"]
+            new_size = len(obj_data.encode("utf-8")) + new_key_size
+            if used - old_size + new_size > partition["max_storage"]:
+                raise PKCS11Error(CKR_DEVICE_MEMORY,
+                                  "Partition storage quota exceeded by object update")
         if encrypted_material is not None:
             c.execute(
                 "UPDATE objects SET object_data = ?, key_material = ? WHERE handle = ?",
@@ -419,6 +446,14 @@ class Storage:
             "SELECT COUNT(*) as cnt FROM objects WHERE slot_id = ?", (slot_id,)
         ).fetchone()
         return row["cnt"]
+
+    def get_partition_storage_used(self, slot_id: int) -> int:
+        """Return persisted object metadata plus encrypted material in bytes."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(object_data) + COALESCE(LENGTH(key_material), 0)), 0) AS used "
+            "FROM objects WHERE slot_id = ?", (slot_id,),
+        ).fetchone()
+        return int(row["used"])
 
     def get_max_handle(self) -> int:
         c = self.conn.cursor()

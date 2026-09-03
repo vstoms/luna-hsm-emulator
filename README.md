@@ -7,7 +7,7 @@ A fully functional software emulator of the Thales Luna 7 Network HSM, built for
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![PKCS#11](https://img.shields.io/badge/PKCS%2311-v2.40-green)](https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html)
 [![License](https://img.shields.io/badge/License-Educational-orange)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-281%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-290%20passing-brightgreen)](#testing)
 
 </div>
 
@@ -80,9 +80,19 @@ Both channels support full lifecycle: create, connect, disconnect, restore. NTLS
 
 ### Partition Management & Policies
 
-- Create, initialize, and delete named partitions with per-partition storage quotas
+- Full lifecycle states: uninitialized, initialized with pending roles, ready, and deactivated
+- PPSO partitions with separate Partition SO, CO, and optional CU identities
+- Legacy partitions with a combined Partition Owner/CO identity
+- Superior-role authorization for role initialization, deactivation, reactivation, lockout reset, and SO reset
+- Partition deletion requires an authenticated HSM SO
+- Accurate object-count and persisted-byte storage quota enforcement
+- Cloning-domain initialization and inheritance are included in partition status
 - **30-policy catalog** matching Luna 7 capabilities, including destructive changes and mutual exclusion
 - **Partition Policy Templates (PPT)** — predefined sets (FIPS Strict, High Security, Development, Backup Ready) plus custom templates
+
+```text
+partition show -partition app1
+```
 
 ### Role-Based Authentication
 
@@ -636,6 +646,7 @@ luna-hsm-emulator/
 │   ├── auth.py                  # Role-based authentication
 │   ├── ped.py                   # PED colors, M-of-N key sets, local/remote state
 │   ├── domain.py                # Cloning domains and secure object cloning
+│   ├── lifecycle.py             # Partition types, lifecycle, and role states
 │   ├── keystore.py              # Key storage and retrieval
 │   ├── audit.py                 # Audit logging with hash chaining
 │   ├── appliance.py             # Luna 7 appliance emulation (users, network, NTLS, services)
@@ -658,7 +669,8 @@ luna-hsm-emulator/
 ├── tests/
 │   ├── test_pkcs11.py           # PKCS#11 and appliance tests
 │   ├── test_ped.py              # PED and quorum tests
-│   └── test_domain.py           # Domain, cloning, and HA tests
+│   ├── test_domain.py           # Domain, cloning, and HA tests
+│   └── test_lifecycle.py        # Partition lifecycle and quota tests
 ├── requirements.txt
 └── README.md
 ```
@@ -703,9 +715,12 @@ The suite covers:
 | `TestLunaSH` | 50 | Appliance login, HSM SO login, user management, client management, network, services, sysconf, syslog, NTLS, packages, RBAC, persistence |
 | `TestClientPartitionConnections` | 48 | NTLS cert, connection lifecycle, STC identities, STC connections, STC config, NTLS-to-STC conversion, persistence |
 | `TestDeploymentFeatures` | 50 | HA groups, NTP, network bonding, licenses, support bundles, persistence |
+| `TestPEDManager` | 7 | PED colors, quorum, duplication, loss, remote PED, colored-role login |
+| `TestCloningDomains` | 7 | Domain inheritance/change, secure cloning, HA domain enforcement |
+| `TestPartitionLifecycle` | 9 | PPSO/legacy states, role hierarchy, deletion authorization, quotas |
 
 ```
-Ran 281 tests in 3.8s
+Ran 290 tests in 4.1s
 
 OK
 ```

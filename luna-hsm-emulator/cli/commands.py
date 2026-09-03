@@ -133,7 +133,12 @@ class CommandHandler:
             if not name:
                 print("  Usage: partition create -name <name>")
                 return
-            slot_id = self.api.tokens.create_partition(name)
+            partition_type = (self._get_arg(args, "-type") or "ppso").upper()
+            max_objects = int(self._get_arg(args, "-maxobjects") or 1024)
+            max_storage = int(self._get_arg(args, "-storage") or 1048576)
+            slot_id = self.api.tokens.create_partition(
+                name, max_objects=max_objects, max_storage=max_storage,
+                partition_type=partition_type)
             print(f"  Partition '{name}' created. Slot ID: {slot_id}")
             self._print_explain([
                 "Creating a new Luna partition (PKCS#11 token).",
@@ -145,15 +150,19 @@ class CommandHandler:
             if not name:
                 print("  Usage: partition delete -name <name>")
                 return
-            confirm = input(f"  Are you sure you want to delete partition '{name}'? (yes/no): ")
-            if confirm.lower() != "yes":
-                print("  Cancelled.")
-                return
-            self.api.tokens.delete_partition(name)
-            print(f"  Partition '{name}' deleted.")
+            print("  Error: Partition deletion requires HSM SO authorization in LunaSH.")
+            print("  Use: partition delete -name <name> from an HSM SO-authenticated LunaSH session.")
         elif sub == "list":
             print(self.api.tokens.list_partitions())
-        elif sub == "showinfo":
+        elif sub in ("showinfo", "show"):
+            requested = self._get_arg(args, "-partition")
+            if requested:
+                partition = self.api.storage.get_partition_by_name(requested)
+                if not partition:
+                    print(f"  Partition '{requested}' not found.")
+                    return
+                print(self.api.tokens.show_partition_info(partition["slot_id"]))
+                return
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
@@ -467,7 +476,7 @@ class CommandHandler:
     def cmd_role(self, args: list):
         """Handle 'role' commands."""
         if not args:
-            print("  Usage: role login | logout | changepw | list | show | init | deactivate | resetpw")
+            print("  Usage: role login | logout | changepw | list | show | init | activate | deactivate | resetpw")
             return
         sub = args[0]
 
@@ -495,8 +504,9 @@ class CommandHandler:
                 print(f"  Password-authenticated role '{role_name.upper()}':")
                 pin = getpass.getpass("  PIN: ")
             try:
-                from pkcs11.constants import CKU_SO, CKU_USER
-                user_type = CKU_SO if role_name == "so" else CKU_USER
+                from pkcs11.constants import CKU_SO, CKU_USER, CKU_CONTEXT_SPECIFIC
+                user_type = (CKU_SO if role_name == "so" else
+                             CKU_CONTEXT_SPECIFIC if role_name == "cu" else CKU_USER)
                 self.api.C_Login(self.session_id, user_type, pin)
                 print(f"  Logged in as {role_name.upper()}.")
                 self._print_explain([
@@ -582,10 +592,12 @@ class CommandHandler:
             if pin != confirm:
                 print("  Error: PINs do not match.")
                 return
+            actor = self.api.auth.get_role(self.session_id) if self.session_id else None
             try:
                 self.api.tokens.init_role(
                     self.active_slot, role_name, pin,
-                    audit=self.api.audit, session_id=self.session_id or 0
+                    audit=self.api.audit, session_id=self.session_id or 0,
+                    actor_role=actor,
                 )
                 print(f"  Role '{role_name}' initialized.")
                 self._print_explain([
@@ -605,21 +617,36 @@ class CommandHandler:
             if self.active_slot is None:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
-            confirm = input(f"  Deactivate role '{role_name}'? This will clear its PIN. (yes/no): ")
+            confirm = input(f"  Deactivate role '{role_name}' while retaining its credential? (yes/no): ")
             if confirm.lower() != "yes":
                 print("  Cancelled.")
                 return
+            actor = self.api.auth.get_role(self.session_id) if self.session_id else None
             try:
                 self.api.tokens.deactivate_role(
                     self.active_slot, role_name,
-                    audit=self.api.audit, session_id=self.session_id or 0
+                    audit=self.api.audit, session_id=self.session_id or 0,
+                    actor_role=actor,
                 )
-                print(f"  Role '{role_name}' deactivated. PIN cleared.")
+                print(f"  Role '{role_name}' deactivated. Credential retained for superior-role reactivation.")
                 self._print_explain([
-                    "Deactivating a role clears its PIN, preventing future logins.",
+                    "Deactivating a role blocks login while retaining its credential.",
                     "On a real Luna 7, this requires SO authentication and is",
                     "used as a security measure to disable unused roles.",
                 ])
+            except PKCS11Error as e:
+                print(f"  Error: {e}")
+        elif sub == "activate":
+            role_name = self._get_arg(args[1:], "-name")
+            if not role_name or self.active_slot is None:
+                print("  Usage: role activate -name <co|cu>")
+                return
+            actor = self.api.auth.get_role(self.session_id) if self.session_id else None
+            try:
+                self.api.tokens.activate_role(
+                    self.active_slot, role_name, audit=self.api.audit,
+                    session_id=self.session_id or 0, actor_role=actor)
+                print(f"  Role '{role_name.upper()}' activated.")
             except PKCS11Error as e:
                 print(f"  Error: {e}")
         elif sub == "resetpw":
@@ -640,10 +667,12 @@ class CommandHandler:
             if new_pin != confirm:
                 print("  Error: PINs do not match.")
                 return
+            actor = self.api.auth.get_role(self.session_id) if self.session_id else None
             try:
                 self.api.tokens.reset_pin(
                     self.active_slot, role_name, new_pin,
-                    audit=self.api.audit, session_id=self.session_id or 0
+                    audit=self.api.audit, session_id=self.session_id or 0,
+                    actor_role=actor,
                 )
                 print(f"  PIN reset for role '{role_name}'.")
                 self._print_explain([

@@ -834,7 +834,11 @@ class TestRoleCommands(unittest.TestCase):
         self.api.tokens.deactivate_role(self.slot_id, "CO",
                                          audit=self.api.audit, session_id=self.session_id)
         p = self.storage.get_partition(self.slot_id)
-        self.assertIsNone(p["co_pin_hash"])
+        self.assertIsNotNone(p["co_pin_hash"])
+        self.assertEqual(
+            self.api.tokens.lifecycle.status(self.slot_id)["roles"]["CO"]["state"],
+            "DEACTIVATED",
+        )
 
     def test_role_resetpw(self):
         """Test resetting a role PIN."""

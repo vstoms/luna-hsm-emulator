@@ -13,6 +13,7 @@ from typing import Optional
 
 from storage.db import Storage
 from hsm.ped import PEDManager, PEDError
+from hsm.lifecycle import PartitionLifecycleManager
 from pkcs11.constants import (
     PKCS11Error, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_PIN_LEN_RANGE,
     CKR_USER_NOT_LOGGED_IN, CKR_USER_ALREADY_LOGGED_IN,
@@ -43,6 +44,7 @@ class AuthManager:
     def __init__(self, storage: Storage):
         self.storage = storage
         self.ped = PEDManager(storage)
+        self.lifecycle = PartitionLifecycleManager(storage)
         # session_id -> (slot_id, role)
         self._sessions: dict = {}
 
@@ -51,6 +53,15 @@ class AuthManager:
         partition = self.storage.get_partition(slot_id)
         if partition is None:
             raise PKCS11Error(CKR_USER_NOT_LOGGED_IN, "Partition not found")
+
+        if not partition.get("initialized"):
+            raise PKCS11Error(CKR_USER_PIN_NOT_INITIALIZED,
+                              "Partition is uninitialized")
+        if not self.lifecycle.status(slot_id)["active"]:
+            raise PKCS11Error(CKR_USER_NOT_LOGGED_IN, "Partition is deactivated")
+        if not self.lifecycle.role_active(slot_id, role):
+            raise PKCS11Error(CKR_USER_NOT_LOGGED_IN,
+                              f"{role} role is uninitialized or deactivated")
 
         # Check if already logged in on this session
         if session_id in self._sessions:
@@ -150,6 +161,7 @@ class AuthManager:
             f"{role.lower()}_login_attempts": 0,
             f"{role.lower()}_locked": 0,
         })
+        self.lifecycle.set_role_active(slot_id, role, True)
 
     def change_pin(self, slot_id: int, role: str, old_pin: str, new_pin: str):
         """Change the PIN for a role, verifying the old PIN first."""
