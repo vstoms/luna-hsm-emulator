@@ -196,6 +196,12 @@ class Storage:
         ):
             if name not in columns:
                 c.execute(f"ALTER TABLE partitions ADD COLUMN {name} {declaration}")
+        object_columns = {row[1] for row in c.execute("PRAGMA table_info(objects)")}
+        if "cloning_id" not in object_columns:
+            c.execute("ALTER TABLE objects ADD COLUMN cloning_id TEXT")
+        c.execute("UPDATE objects SET cloning_id = lower(hex(randomblob(16))) "
+                  "WHERE cloning_id IS NULL")
+        c.execute("CREATE INDEX IF NOT EXISTS objects_cloning_id ON objects(slot_id, cloning_id)")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -235,6 +241,8 @@ class Storage:
         """Persist partition policies as JSON in hsm_meta."""
         import json
         self.set_meta(f"policies_slot_{slot_id}", json.dumps(policies))
+        from hsm.activation import ActivationManager
+        ActivationManager(self).policy_changed(slot_id)
 
     def get_partition_policy(self, slot_id: int, policy_id: int) -> Optional[int]:
         policies = self.get_partition_policies(slot_id)
@@ -341,6 +349,8 @@ class Storage:
         self._conn.commit()
 
     def delete_partition(self, slot_id: int):
+        from hsm.activation import ActivationManager
+        ActivationManager(self).invalidate(slot_id, forget=True)
         c = self.conn.cursor()
         c.execute("DELETE FROM objects WHERE slot_id = ?", (slot_id,))
         c.execute("DELETE FROM partitions WHERE slot_id = ?", (slot_id,))
@@ -351,7 +361,7 @@ class Storage:
     # ------------------------------------------------------------------
 
     def insert_object(self, handle: int, slot_id: int, label: str,
-                      obj: CKObject, key_material: bytes = None):
+                      obj: CKObject, key_material: bytes = None, cloning_id: str = None):
         obj_data = json.dumps(obj.to_dict())
         encrypted_material = None
         if key_material is not None:
@@ -371,9 +381,10 @@ class Storage:
             )
         c = self.conn.cursor()
         c.execute(
-            """INSERT INTO objects (handle, slot_id, label, object_data, key_material, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (handle, slot_id, label, obj_data, encrypted_material, obj.created_at),
+            """INSERT INTO objects (handle, slot_id, label, object_data, key_material, created_at, cloning_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (handle, slot_id, label, obj_data, encrypted_material, obj.created_at,
+             cloning_id or os.urandom(16).hex()),
         )
         self._conn.commit()
 
@@ -408,6 +419,17 @@ class Storage:
                 (obj_data, handle),
             )
         self._conn.commit()
+
+    def object_identity(self, handle: int):
+        row = self.conn.execute("SELECT cloning_id FROM objects WHERE handle = ?",
+                                (handle,)).fetchone()
+        return row[0] if row else None
+
+    def object_handle(self, slot_id: int, cloning_id: str):
+        row = self.conn.execute(
+            "SELECT handle FROM objects WHERE slot_id = ? AND cloning_id = ?",
+            (slot_id, cloning_id)).fetchone()
+        return row[0] if row else None
 
     def get_object(self, handle: int) -> tuple:
         """Return (CKObject, key_material_bytes_or_None)."""
@@ -577,6 +599,7 @@ class Storage:
                 "object_data": row["object_data"],
                 "key_material": row["key_material"].hex() if row["key_material"] else None,
                 "created_at": row["created_at"],
+                "cloning_id": row["cloning_id"],
             })
         audit = [dict(r) for r in c.execute("SELECT * FROM audit_log").fetchall()]
         state = {
@@ -611,10 +634,10 @@ class Storage:
         for o in state.get("objects", []):
             km = bytes.fromhex(o["key_material"]) if o["key_material"] else None
             c.execute(
-                """INSERT INTO objects (handle, slot_id, label, object_data, key_material, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO objects (handle, slot_id, label, object_data, key_material, created_at, cloning_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (o["handle"], o["slot_id"], o["label"], o["object_data"],
-                 km, o["created_at"]),
+                 km, o["created_at"], o.get("cloning_id") or os.urandom(16).hex()),
             )
         # Insert audit
         for a in state.get("audit_log", []):

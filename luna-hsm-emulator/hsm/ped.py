@@ -85,6 +85,8 @@ class PEDManager:
 
     def zeroize(self):
         """Erase HSM/partition identities while retaining RPV and Auditor data."""
+        from hsm.activation import ActivationManager
+        ActivationManager(self.storage).invalidate(forget=True)
         state = self._load()
         state["hsm_label"] = ""
         state["connection"] = {"state": "disconnected", "mode": None, "host": None}
@@ -96,6 +98,10 @@ class PEDManager:
 
     def factory_reset(self):
         """Erase all PED vectors, key sets, and connection state."""
+        from hsm.activation import ActivationManager
+        activation = ActivationManager(self.storage)
+        activation.invalidate(forget=True)
+        activation.clear_tamper()
         self._save(self._default_state())
 
     def connect(self, remote_host: str = None, orange_serials: list = None,

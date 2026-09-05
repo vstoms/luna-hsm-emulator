@@ -798,8 +798,10 @@ class Appliance:
         self._save_sysconf(config)
         return {"success": True, "port": port}
 
-    def reboot(self) -> dict:
-        """Simulate an appliance reboot."""
+    def reboot(self, downtime_seconds: float = 0) -> dict:
+        """Simulate power loss; auto-activation survives at most two hours."""
+        from hsm.activation import ActivationManager
+        ActivationManager(self.storage).reboot(downtime_seconds)
         self._boot_time = time.time()
         self._hsm_logged_in = False
         self._audit_logged_in = False
@@ -807,6 +809,10 @@ class Appliance:
 
     def poweroff(self) -> dict:
         """Simulate an appliance power off."""
+        from hsm.activation import ActivationManager
+        ActivationManager(self.storage).poweroff()
+        self._hsm_logged_in = False
+        self._audit_logged_in = False
         return {"success": True, "message": "Appliance powering off."}
 
     # ------------------------------------------------------------------

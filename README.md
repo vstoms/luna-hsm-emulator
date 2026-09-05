@@ -7,7 +7,7 @@ A fully functional software emulator of the Thales Luna 7 Network HSM, built for
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![PKCS#11](https://img.shields.io/badge/PKCS%2311-v2.40-green)](https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html)
 [![License](https://img.shields.io/badge/License-Educational-orange)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-298%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-332%20passing-brightgreen)](#testing)
 
 </div>
 
@@ -130,8 +130,15 @@ Luna Backup HSM 7 emulation with STM recovery, secure cloning-based backup/resto
 
 ### High Availability
 
-HA groups now model operational behavior as well as configuration:
+HA groups are real client-side virtual slots, not just configuration:
 
+- Each group gets an immutable **virtual slot** (`1000000+`) that applications open like any other slot; `C_Login`, `C_GenerateKey`, `C_Encrypt`, `C_Sign`, `C_FindObjects`, etc. are dispatched to healthy members
+- **Logical key handles** are stable across members and failover (mapped by cloning identity, never by label)
+- **HA Only** (`hagroup haonly -enable`) hides member slots from applications; LunaCM still sees them
+- Multipart operations (`C_SignUpdate` …) migrate to another member if the current one fails mid-operation
+- Key mutations replicate immediately to reachable members; deletions are tombstoned so recovery cannot resurrect keys
+- Application-driven recovery honours the retry budget and poll interval (no sleeping inside crypto calls)
+- Session objects stay local to one member and are destroyed on session close
 - Round-robin load balancing and active/standby routing modes
 - Automatic failover with operation and failover counters
 - Per-member active, standby, unavailable, recovering, and incompatible states
@@ -143,6 +150,10 @@ HA groups now model operational behavior as well as configuration:
 - Session objects remain local to the selected member and are never replicated
 
 ```text
+hagroup creategroup -label production-ha -slot 1 -password <co>
+hagroup addmember -group production-ha -slot 2 -password <co>
+hagroup haonly -enable
+hagroup recover -group production-ha
 ha status -name production-ha
 ha operation -name production-ha -operation sign
 ha network -name production-ha -slot 2 -state partitioned
@@ -645,6 +656,26 @@ ped connect -remote ped.example.test -keys OR-12345678
 
 For partition roles, create key sets with `-scope <slot-id>`. LunaCM's role login accepts the matching Blue, Black, or Gray serials and prompts for a shared secret when configured.
 
+### PED activation and auto-activation
+
+Mirrors the Luna activation lifecycle for CO/LCO/CU on PED-authenticated partitions:
+
+- **Partition policy 22** enables activation; the PO sets the CO challenge secret and the CO sets CU/LCO secrets (`role createchallenge -name <role>`)
+- First login requires **both** the challenge secret and the PED-key quorum; the quorum proof is then cached and later logins need only the challenge secret
+- `role deactivate` clears the cache (the role stays initialized); disabling policy 22 clears it too
+- **Partition policy 23** (auto-activation) lets the cache survive `sysconf appliance reboot`/`poweroff` for at most two hours of downtime (`sysconf appliance reboot -downtime <seconds>` for training)
+- A tamper (`hsm tamper simulate|clear|show` in LunaSH) zeroizes all caches and invalidates every application session
+- Failed challenge responses count towards lockout unless policy 15 is on; the superior role resets with `role resetchallenge`
+- Challenge secrets are stored as salted hashes; cached quorum proofs are encrypted at rest and never logged
+
+```text
+role login -name po
+partition changepolicy -policy 22 -value 1
+role createchallenge -name co
+role logout
+role login -name co        # challenge + Black PED keys once, challenge only afterwards
+```
+
 ---
 
 ## Architecture
@@ -658,6 +689,8 @@ luna-hsm-emulator/
 │   ├── objects.py               # CK object classes (keys, certs, data)
 │   └── constants.py             # CKR_, CKA_, CKM_, CKO_ constants
 ├── hsm/
+│   ├── ha.py                    # HA virtual slots: dispatch, logical handles, failover
+│   ├── activation.py            # PED activation cache, challenge secrets, power/tamper events
 │   ├── token.py                 # Token/partition management, firmware
 │   ├── session.py               # Session management
 │   ├── auth.py                  # Role-based authentication
@@ -688,7 +721,9 @@ luna-hsm-emulator/
 │   ├── test_ped.py              # PED and quorum tests
 │   ├── test_domain.py           # Domain and cloning tests
 │   ├── test_lifecycle.py        # Partition lifecycle and quota tests
-│   └── test_ha_behavior.py      # HA routing, failover, and synchronization tests
+│   ├── test_ha_behavior.py      # HA routing, failover, and synchronization tests
+│   ├── test_ha_operations.py    # Real PKCS#11 operations through HA virtual slots
+│   └── test_activation.py       # PED challenge secrets, activation cache, reboot/tamper
 ├── requirements.txt
 └── README.md
 ```
@@ -737,9 +772,11 @@ The suite covers:
 | `TestCloningDomains` | 7 | Domain inheritance/change, secure cloning, HA domain enforcement |
 | `TestPartitionLifecycle` | 9 | PPSO/legacy states, role hierarchy, deletion authorization, quotas |
 | `TestHABehavior` | 8 | Load balancing, failover, recovery, network failures, compatibility, session objects |
+| `HAOperationsTest` | 10 | Virtual slots, HA Only, logical handles, multipart failover, tombstones, retry budget |
+| `ActivationTest` | 16 | Challenge secrets, cached quorum, auto-activation window, poweroff, tamper, lockout |
 
 ```
-Ran 298 tests in 4.1s
+Ran 332 tests in 7.6s
 
 OK
 ```

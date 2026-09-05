@@ -78,6 +78,10 @@ import crypto.digest as dig
 import crypto.kdf as kdf_mod
 
 
+from hsm.ha import HAClient, ha_sessions
+
+
+@ha_sessions
 class PKCS11API:
     """Full PKCS#11 v2.40 API implementation for the Luna 7 emulator."""
 
@@ -90,6 +94,39 @@ class PKCS11API:
         self.audit = AuditLogger(storage)
         self.backup = BackupHSM(storage)
         self._initialized = False
+        self.ha = None
+        self._device_epoch = None
+
+    def _check_device(self, allow_offline=False):
+        if not self._initialized:
+            raise PKCS11Error(CKR_FUNCTION_FAILED, "Library not initialized")
+        activation = self.auth.activation
+        epoch = activation.device_status()["epoch"]
+        if epoch != self._device_epoch:
+            # Device events invalidate every application session, including HA
+            # child sessions and buffered cryptographic operations.
+            for state in self.ha.sessions.values():
+                for slot in state["children"]:
+                    for identity in state["owned"]:
+                        handle = self.storage.object_handle(slot, identity)
+                        if handle is not None:
+                            self.storage.delete_object(handle)
+            self.ha.sessions.clear()
+            self.ha.handles.clear()
+            self.sessions.close_all_sessions()
+            self.auth._sessions.clear()
+            self._device_epoch = epoch
+        if not allow_offline:
+            activation.require_online()
+
+    def simulate_reboot(self, downtime_seconds=0):
+        result = self.auth.activation.reboot(downtime_seconds)
+        self._check_device(allow_offline=True)
+        return result
+
+    def simulate_tamper(self):
+        self.auth.activation.tamper()
+        self._check_device(allow_offline=True)
 
     # ==================================================================
     # Initialization / Finalization
@@ -100,6 +137,8 @@ class PKCS11API:
         if self._initialized:
             return CKR_OK
         self.storage.open()
+        self.ha = HAClient(self)
+        self._device_epoch = self.auth.activation.device_status()["epoch"]
         self._initialized = True
         return CKR_OK
 
@@ -107,7 +146,8 @@ class PKCS11API:
         """Finalize the PKCS#11 library."""
         if not self._initialized:
             return CKR_OK
-        self.sessions.close_all_sessions()
+        self.C_CloseAllSessions()
+        self.ha = None
         self.storage.close()
         self._initialized = False
         return CKR_OK
@@ -116,12 +156,19 @@ class PKCS11API:
     # Session Management
     # ==================================================================
 
-    def C_OpenSession(self, slot_id: int, flags: int = CKF_SERIAL_SESSION) -> int:
+    def C_OpenSession(self, slot_id: int, flags: int = CKF_SERIAL_SESSION,
+                      include_members: bool = False) -> int:
         """Open a session with a token. Returns session handle."""
         if not self._initialized:
             raise PKCS11Error(CKR_FUNCTION_FAILED, "Library not initialized")
+        self._check_device()
         if not (flags & CKF_SERIAL_SESSION):
             raise PKCS11Error(CKR_FUNCTION_FAILED, "Only serial sessions supported")
+        group = self.ha.deployment.group_for_slot(slot_id)
+        if group:
+            return self.ha.open(group, flags)
+        if slot_id not in self.ha.deployment.client_slots(include_members):
+            raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, "Slot hidden by HA-only mode or absent")
         p = self.storage.get_partition(slot_id)
         if p is None:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
@@ -140,14 +187,21 @@ class PKCS11API:
 
     def C_CloseAllSessions(self, slot_id: int = None) -> int:
         """Close all sessions."""
-        self.sessions.close_all_sessions(slot_id)
+        self._check_device(allow_offline=True)
+        for sid in list(self.ha.sessions):
+            if slot_id is None or self.sessions.get_session(sid).slot_id == slot_id:
+                self.ha.close(sid)
+        for sid, session in list(self.sessions._sessions.items()):
+            if slot_id is None or session.slot_id == slot_id:
+                self.C_CloseSession(sid)
         return CKR_OK
 
     def C_GetSessionInfo(self, session_id: int) -> dict:
         """Return session information."""
         return self.sessions.get_session_info(session_id)
 
-    def C_Login(self, session_id: int, user_type: int, pin: str) -> int:
+    def C_Login(self, session_id: int, user_type: int, pin: str,
+                ped_keys: list = None, ped_secret: str = None) -> int:
         """Login to a session."""
         s = self.sessions.get_session(session_id)
         # Map CKU_ to role
@@ -158,7 +212,7 @@ class PKCS11API:
         else:
             role = ROLE_CU
         try:
-            self.auth.login(session_id, s.slot_id, role, pin)
+            self.auth.login(session_id, s.slot_id, role, pin, ped_keys, ped_secret)
             s.user_type = user_type
             self.audit.log(session_id, role, "C_Login", success=True,
                            detail=f"slot={s.slot_id}")
@@ -181,16 +235,30 @@ class PKCS11API:
     # Slot and Token Management
     # ==================================================================
 
-    def C_GetSlotList(self, token_present: bool = True) -> list:
-        """Return list of slot IDs."""
-        return self.tokens.list_slots()
+    def C_GetSlotList(self, token_present: bool = True, include_members: bool = False) -> list:
+        """Return client slots; LunaCM may explicitly include hidden members."""
+        return self.ha.deployment.client_slots(include_members)
 
     def C_GetSlotInfo(self, slot_id: int) -> dict:
         """Return slot info."""
+        group = self.ha.deployment.group_for_slot(slot_id)
+        if group:
+            return {"slot_id": slot_id, "description": "Luna HA " + group["label"],
+                    "manufacturer": "Thales (emulated)", "token_present": True,
+                    "virtual": True, "group": group["name"]}
         return self.tokens.get_slot_info(slot_id)
 
     def C_GetTokenInfo(self, slot_id: int) -> dict:
         """Return token info."""
+        group = self.ha.deployment.group_for_slot(slot_id)
+        if group:
+            member = next((m for m in group["members"]
+                           if self.storage.get_partition(m["slot_id"])), None)
+            if member is None:
+                raise PKCS11Error(CKR_TOKEN_NOT_PRESENT)
+            info = self.tokens.get_token_info(member["slot_id"])
+            info.update({"label": group["label"], "serial": str(slot_id), "virtual": True})
+            return info
         return self.tokens.get_token_info(slot_id)
 
     def C_InitToken(self, slot_id: int, so_pin: str, label: str = None) -> int:
@@ -212,7 +280,12 @@ class PKCS11API:
         """Set/change the PIN."""
         s = self.sessions.get_session(session_id)
         role = self.auth.get_role(session_id) or ROLE_CO
-        self.auth.change_pin(s.slot_id, role, old_pin, new_pin)
+        if (self.auth.ped.get_auth_mode() == "ped" and
+                self.auth.activation.status(s.slot_id, role)["challenge_configured"]):
+            self.auth.activation.change_challenge(s.slot_id, role, old_pin, new_pin,
+                                                  self.auth.get_role(session_id))
+        else:
+            self.auth.change_pin(s.slot_id, role, old_pin, new_pin)
         self.audit.log(session_id, role, "C_SetPIN", success=True)
         return CKR_OK
 

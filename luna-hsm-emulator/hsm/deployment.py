@@ -73,6 +73,14 @@ class DeploymentManager:
 
     def _normalize_ha_group(self, group: dict) -> dict:
         """Upgrade HA groups persisted by earlier emulator versions in place."""
+        if "virtual_slot" not in group:
+            next_slot = int(self.storage.get_meta("ha_next_slot", "1000000"))
+            group["virtual_slot"] = next_slot
+            self.storage.set_meta("ha_next_slot", str(next_slot + 1))
+            groups = self._read("ha_groups", {})
+            groups[group["name"]] = group
+            self._write("ha_groups", groups)
+        group.setdefault("deleted_objects", [])
         group.setdefault("mode", "round-robin")
         group.setdefault("recovery_mode", "automatic")
         group.setdefault("round_robin_cursor", 0)
@@ -110,13 +118,18 @@ class DeploymentManager:
         partition = self.storage.get_partition(slot_id)
         if partition is None:
             return {"success": False, "error": f"Partition slot {slot_id} not found"}
+        virtual_slot = int(self.storage.get_meta("ha_next_slot", "1000000"))
+        self.storage.set_meta("ha_next_slot", str(virtual_slot + 1))
+        settings = self._read("ha_client_settings", {})
         group = {
+            "virtual_slot": virtual_slot,
+            "deleted_objects": [],
             "name": name,
             "label": label or name,
             "state": "active",
-            "retry_count": 216,
-            "poll_interval": 0,
-            "infinite_polling": False,
+            "retry_count": settings.get("retry_count", 216),
+            "poll_interval": settings.get("poll_interval", 0),
+            "infinite_polling": settings.get("retry_count", 216) == -1,
             "synchronize_on_add": True,
             "mode": "round-robin",
             "recovery_mode": "automatic",
@@ -146,6 +159,59 @@ class DeploymentManager:
         groups[name] = group
         self._write("ha_groups", groups)
         return {"success": True, "group": group}
+
+    def group_for_slot(self, slot_id: int):
+        return next((g for g in self.list_ha_groups() if g["virtual_slot"] == slot_id), None)
+
+    def set_ha_only(self, enabled: bool):
+        settings = self._read("ha_client_settings", {})
+        settings["ha_only"] = bool(enabled)
+        self._write("ha_client_settings", settings)
+
+    def ha_only(self) -> bool:
+        return bool(self._read("ha_client_settings", {}).get("ha_only", False))
+
+    def client_slots(self, include_members: bool = False) -> list:
+        groups = self.list_ha_groups()
+        hidden = {m["slot_id"] for g in groups for m in g["members"]}
+        physical = [p["slot_id"] for p in self.storage.get_all_partitions()
+                    if include_members or not self.ha_only() or p["slot_id"] not in hidden]
+        return physical + [g["virtual_slot"] for g in groups]
+
+    def record_deletion(self, name: str, identity: str):
+        groups = self._read("ha_groups", {})
+        group = self._normalize_ha_group(groups[name])
+        if identity not in group["deleted_objects"]:
+            group["deleted_objects"].append(identity)
+        self._save_ha_group(groups, group)
+
+    def _apply_deletions(self, group: dict, slot_id: int):
+        for identity in group.get("deleted_objects", []):
+            handle = self.storage.object_handle(slot_id, identity)
+            if handle is not None:
+                self.storage.delete_object(handle)
+
+    def poll_ha_recovery(self, name: str):
+        """Client-driven bounded recovery; never sleep in a crypto call."""
+        group = self.get_ha_group(name)
+        if not group or group["recovery_mode"] != "automatic":
+            return
+        now = time.time()
+        for member in group["members"]:
+            if member["state"] not in ("unavailable", "recovering"):
+                continue
+            limit = group["retry_count"]
+            if limit != -1 and member["retry_attempts"] >= limit:
+                continue
+            if now - member.get("last_retry", 0) < group["poll_interval"]:
+                continue
+            groups = self._read("ha_groups", {})
+            current = self._normalize_ha_group(groups[name])
+            target = self._find_ha_member(current, member["slot_id"])
+            target["retry_attempts"] += 1
+            target["last_retry"] = now
+            self._save_ha_group(groups, current)
+            self.recover_ha_member(name, member["slot_id"])
 
     def delete_ha_group(self, name: str) -> dict:
         groups = self._read("ha_groups", {})
@@ -252,7 +318,8 @@ class DeploymentManager:
         if member is None:
             return {"success": False, "error": f"Slot {slot_id} is not an HA member"}
         member.update({"state": "unavailable", "status": "unavailable",
-                       "sync_status": "out-of-sync", "failure_reason": reason})
+                       "sync_status": "out-of-sync", "failure_reason": reason,
+                       "retry_attempts": 0, "last_retry": time.time()})
         if member["role"] == "active":
             replacement = next((m for m in group["members"]
                                 if m is not member and m["state"] in ("active", "standby")), None)
@@ -331,7 +398,7 @@ class DeploymentManager:
         return {"success": True, "firmware": firmware}
 
     def route_ha_operation(self, group_name: str, operation: str,
-                           session_object: bool = False) -> dict:
+                           session_object: bool = False, allowed_slots: set = None) -> dict:
         """Route an operation to a healthy member with load balancing/failover."""
         groups = self._read("ha_groups", {})
         group = groups.get(group_name)
@@ -339,7 +406,8 @@ class DeploymentManager:
             return {"success": False, "error": f"HA group '{group_name}' not found"}
         group = self._normalize_ha_group(group)
         eligible = [m for m in group["members"]
-                    if m["state"] in ("active", "standby") and not m["network_partition"]]
+                    if m["state"] in ("active", "standby") and not m["network_partition"]
+                    and (allowed_slots is None or m["slot_id"] in allowed_slots)]
         if not eligible:
             return {"success": False, "error": "LUNA_RET_HA_NO_AVAILABLE_MEMBER",
                     "code": "LUNA_RET_HA_NO_AVAILABLE_MEMBER"}
@@ -383,12 +451,18 @@ class DeploymentManager:
                        if m["slot_id"] != slot_id and m["state"] in ("active", "standby")), None)
         if source:
             try:
-                self.domains.clone_objects(source["slot_id"], slot_id, token_objects_only=True)
+                self._apply_deletions(group, source["slot_id"])
+                self._apply_deletions(group, slot_id)
+                result = self.domains.clone_objects(source["slot_id"], slot_id,
+                                                   token_objects_only=True, synchronize=True)
+                if result["skipped_policy"]:
+                    raise ValueError("Cloning policy prevented complete recovery")
             except Exception as exc:
                 member["failure_reason"] = str(exc)
                 member["sync_status"] = "partial"
                 self._save_ha_group(groups, group)
                 return {"success": False, "error": str(exc), "partial": True}
+        self._apply_deletions(group, slot_id)
         member.update({"state": "active", "status": "active", "sync_status": "current",
                        "failure_reason": None, "retry_attempts": 0,
                        "objects": len(self._token_objects(slot_id)),
@@ -435,7 +509,7 @@ class DeploymentManager:
         self._write("ha_groups", groups)
         return {"success": True, "poll_interval": seconds}
 
-    def synchronize_ha_group(self, name: str) -> dict:
+    def synchronize_ha_group(self, name: str, source_slot: int = None) -> dict:
         """Replicate persistent keys independently and report partial failures."""
         groups = self._read("ha_groups", {})
         group = groups.get(name)
@@ -445,7 +519,8 @@ class DeploymentManager:
         if not group["members"]:
             return {"success": False, "error": f"HA group '{name}' has no members"}
         source = next((m for m in group["members"]
-                       if m["state"] in ("active", "standby") and not m["network_partition"]), None)
+                       if m["state"] in ("active", "standby") and not m["network_partition"]
+                       and (source_slot is None or m["slot_id"] == source_slot)), None)
         if source is None:
             return {"success": False, "error": "LUNA_RET_HA_NO_AVAILABLE_MEMBER"}
 
@@ -476,8 +551,13 @@ class DeploymentManager:
                 failures.append({"slot_id": member["slot_id"], "error": member["failure_reason"]})
                 continue
             try:
+                self._apply_deletions(group, source["slot_id"])
+                self._apply_deletions(group, member["slot_id"])
                 result = self.domains.clone_objects(
-                    source["slot_id"], member["slot_id"], token_objects_only=True)
+                    source["slot_id"], member["slot_id"], token_objects_only=True,
+                    synchronize=True)
+                if result["skipped_policy"]:
+                    raise ValueError("Cloning policy prevented complete synchronization")
                 cloned += len(result["cloned"])
                 member.update({"state": "active", "status": "active", "sync_status": "current",
                                "objects": len(self._token_objects(member["slot_id"])),

@@ -330,6 +330,23 @@ class LunaSHCommands:
         elif sub == "ped":
             self.cmd_ped(rest)
 
+        elif sub == "tamper":
+            action = rest[0].lower() if rest else "show"
+            activation = self.api.auth.activation
+            if action == "show":
+                print(f"  Tamper: {'TRIPPED' if activation.device_status()['tampered'] else 'Not tripped'}")
+            elif action in ("simulate", "clear"):
+                if not self._check_role(ROLE_ADMIN) or not self._check_hsm_login():
+                    return
+                if action == "simulate":
+                    self.api.simulate_tamper()
+                else:
+                    activation.clear_tamper()
+                print("  Tamper simulated; all PED caches and application sessions invalidated."
+                      if action == "simulate" else "  Tamper cleared; fresh PED quorum is required.")
+            else:
+                print("  Usage: hsm tamper show|simulate|clear (emulator fault injection)")
+
         elif sub == "selftest":
             print("  Running HSM self-test...")
             time.sleep(0.5)
@@ -2064,7 +2081,8 @@ class LunaSHCommands:
                     return
                 if confirm_proceed("Are you sure you wish to reboot the appliance?",
                                    force=self._has_flag(rest, "-force", "-f")):
-                    result = self.appliance.reboot()
+                    downtime = float(self._get_arg(rest, "-downtime") or 0)
+                    result = self.appliance.reboot(downtime_seconds=downtime)
                     print(f"  {result['message']}")
             elif rest[0] == "poweroff":
                 if not self._check_role(ROLE_ADMIN):
@@ -2078,6 +2096,7 @@ class LunaSHCommands:
             elif rest[0] == "hardReboot":
                 if not self._check_role(ROLE_ADMIN):
                     return
+                self.appliance.reboot()
                 print("  Hard reboot initiated.")
             else:
                 print(f"  Unknown appliance subcommand: {rest[0]}")

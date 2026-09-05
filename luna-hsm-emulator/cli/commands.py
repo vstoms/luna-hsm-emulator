@@ -56,10 +56,15 @@ class CommandHandler:
 
     def _ensure_session(self):
         """Open a session on the active slot if not already open."""
+        self.api._check_device()
+        self._slot_sessions = {slot: sid for slot, sid in self._slot_sessions.items()
+                               if sid in self.api.sessions._sessions}
+        if self.session_id not in self.api.sessions._sessions:
+            self.session_id = None
         if self.session_id is None and self.active_slot is not None:
             self.session_id = self._slot_sessions.get(self.active_slot)
             if self.session_id is None:
-                self.session_id = self.api.C_OpenSession(self.active_slot)
+                self.session_id = self.api.C_OpenSession(self.active_slot, include_members=True)
                 self._slot_sessions[self.active_slot] = self.session_id
         if self.session_id is None:
             print("  Error: No active session. Use 'slot set' to select a slot.")
@@ -88,7 +93,7 @@ class CommandHandler:
             return
         sub = args[0].lower()
         if sub == "list":
-            slots = self.api.C_GetSlotList()
+            slots = self.api.C_GetSlotList(include_members=True)
             if not slots:
                 print("  No slots/partitions available.")
                 return
@@ -110,7 +115,7 @@ class CommandHandler:
             if slot_id is None:
                 print("  Usage: slot set -slot <id>")
                 return
-            if slot_id not in self.api.C_GetSlotList():
+            if slot_id not in self.api.C_GetSlotList(include_members=True):
                 print(f"  Error: Slot {slot_id} does not exist.")
                 return
             self.active_slot = slot_id
@@ -616,6 +621,7 @@ class CommandHandler:
         """Handle 'role' commands."""
         if not args:
             print("  Usage: role login | logout | changepw | list | show | init | activate | deactivate | resetpw")
+            print("         role createchallenge | changechallenge | resetchallenge -name <co|lco|cu>")
             return
         sub = args[0].lower()
 
@@ -631,16 +637,21 @@ class CommandHandler:
             mapped_role = ROLE_MAP[role_name]
             if not self._ensure_session():
                 return
+            ped_keys, ped_secret = None, None
             if self.api.auth.ped.get_auth_mode() == "ped":
                 color = {ROLE_SO: "Blue", ROLE_CO: "Black", "LCO": "Black",
                          ROLE_CU: "Gray"}[mapped_role]
-                print(f"  Present {color} PED key serials for '{role_name.upper()}'.")
-                serials = input("  Key serials (comma-separated): ")
-                secret = ""
-                if self.api.auth.ped.requires_shared_secret(
-                        color.lower(), scope=str(self.active_slot)):
-                    secret = getpass.getpass("  PED shared secret: ")
-                pin = serials + ("|" + secret if secret else "")
+                group = self.api.ha.deployment.group_for_slot(self.active_slot)
+                auth_slot = group["members"][0]["slot_id"] if group else self.active_slot
+                status = self.api.auth.activation.status(auth_slot, mapped_role)
+                challenge = status["activation_enabled"] and status["challenge_configured"]
+                pin = getpass.getpass("  Challenge secret: ") if challenge else ""
+                if not challenge or not status["activated"]:
+                    print(f"  Present {color} PED key serials for '{role_name.upper()}'.")
+                    serials = input("  Key serials (comma-separated): ")
+                    ped_keys = [value.strip() for value in serials.split(",") if value.strip()]
+                    if self.api.auth.ped.requires_shared_secret(color.lower(), scope=str(auth_slot)):
+                        ped_secret = getpass.getpass("  PED shared secret: ")
             else:
                 print(f"  Password-authenticated role '{role_name.upper()}':")
                 pin = getpass.getpass("  PIN: ")
@@ -649,10 +660,11 @@ class CommandHandler:
                 user_type = (CKU_SO if mapped_role == ROLE_SO else
                              CKU_CONTEXT_SPECIFIC if mapped_role == ROLE_CU else CKU_USER)
                 if mapped_role == "LCO":
-                    self.api.auth.login(self.session_id, self.active_slot, mapped_role, pin)
+                    self.api.auth.login(self.session_id, self.active_slot, mapped_role, pin,
+                                        ped_keys, ped_secret)
                     self.api.sessions.get_session(self.session_id).user_type = CKU_USER
                 else:
-                    self.api.C_Login(self.session_id, user_type, pin)
+                    self.api.C_Login(self.session_id, user_type, pin, ped_keys, ped_secret)
                 display_role = "PO" if mapped_role == ROLE_SO else mapped_role
                 print(f"  Logged in as {display_role}.")
                 self._print_explain([
@@ -677,6 +689,27 @@ class CommandHandler:
                 return
             self.api.C_Logout(self.session_id)
             print("  Logged out.")
+        elif sub in ("createchallenge", "changechallenge", "resetchallenge"):
+            role_name = (self._get_arg(args[1:], "-name") or "").upper()
+            if self.active_slot is None or role_name not in ("CO", "LCO", "CU"):
+                print(f"  Usage: role {sub} -name <co|lco|cu> (select a physical partition)")
+                return
+            actor = self.api.auth.get_role(self.session_id) if self.session_id else None
+            try:
+                old = getpass.getpass("  Old challenge secret: ") if sub == "changechallenge" else None
+                secret = getpass.getpass("  New challenge secret: ")
+                if secret != getpass.getpass("  Confirm challenge secret: "):
+                    print("  Error: Challenge secrets do not match.")
+                    return
+                activation = self.api.auth.activation
+                if sub == "changechallenge":
+                    activation.change_challenge(self.active_slot, role_name, old, secret, actor)
+                else:
+                    activation.create_challenge(self.active_slot, role_name, secret, actor,
+                                                reset=sub == "resetchallenge")
+                print("  Challenge secret updated.")
+            except PKCS11Error as error:
+                print(f"  Error: {error}")
         elif sub == "changepw":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
@@ -697,7 +730,14 @@ class CommandHandler:
                 print("  Error: New PINs do not match.")
                 return
             try:
-                self.api.auth.change_pin(self.active_slot, ROLE_MAP[role_name], old_pin, new_pin)
+                role = ROLE_MAP[role_name]
+                if (self.api.auth.ped.get_auth_mode() == "ped" and
+                        self.api.auth.activation.status(self.active_slot, role)["challenge_configured"]):
+                    self.api.auth.activation.change_challenge(
+                        self.active_slot, role, old_pin, new_pin,
+                        self.api.auth.get_role(self.session_id))
+                else:
+                    self.api.auth.change_pin(self.active_slot, role, old_pin, new_pin)
                 print(f"  PIN changed for {role_name.upper()}.")
             except PKCS11Error as e:
                 print(f"  Failed: {e}")
@@ -720,6 +760,10 @@ class CommandHandler:
                 print("  No active slot. Use 'slot set -slot <id>' first.")
                 return
             print(self.api.tokens.show_role(self.active_slot, role_name))
+            if self.api.auth.ped.get_auth_mode() == "ped":
+                status = self.api.auth.activation.status(self.active_slot, role_name)
+                for key, value in status.items():
+                    print(f"  {key.replace('_', ' ').title()}: {value}")
         elif sub == "init":
             role_name = self._get_arg(args[1:], "-name")
             if not role_name:
@@ -775,6 +819,9 @@ class CommandHandler:
                     audit=self.api.audit, session_id=self.session_id or 0,
                     actor_role=actor,
                 )
+                if self.api.auth.ped.get_auth_mode() == "ped":
+                    print(f"  Role '{role_name}' PED cache cleared; next login requires quorum again.")
+                    return
                 print(f"  Role '{role_name}' deactivated. Credential retained for superior-role reactivation.")
                 self._print_explain([
                     "Deactivating a role blocks login while retaining its credential.",
@@ -784,6 +831,10 @@ class CommandHandler:
             except PKCS11Error as e:
                 print(f"  Error: {e}")
         elif sub == "activate":
+            if self.api.auth.ped.get_auth_mode() == "ped":
+                print("  PED roles activate on login with their challenge secret and PED quorum.")
+                print("  Enable policy 22, use role createchallenge, then role login.")
+                return
             role_name = self._get_arg(args[1:], "-name")
             if not role_name or self.active_slot is None:
                 print("  Usage: role activate -name <co|lco|cu>")
@@ -1581,7 +1632,7 @@ class CommandHandler:
             if not groups:
                 print("  No HA groups configured.")
             for group in groups:
-                print(f"  HA Group Label: {group['name']}  Members: {len(group['members'])}  State: {group['state']}")
+                print(f"  HA Group Label: {group['name']}  Virtual Slot: {group['virtual_slot']}  Members: {len(group['members'])}  State: {group['state']}")
         elif sub == "creategroup":
             label = self._get_arg(rest, "-label", "-group", "-g")
             if not label or slot is None:
@@ -1655,8 +1706,29 @@ class CommandHandler:
                 print(f"  Recovery mode: {'activeBasic' if mapped == 'manual' else 'activeEnhanced'}.")
             else:
                 print("  Error: Unable to update recovery mode")
-        elif sub in ("halog", "haonly", "recover"):
-            print(f"  hagroup {sub} is recognized but not implemented yet.")
+        elif sub == "haonly":
+            if self._has_flag(rest, "-enable") and self._has_flag(rest, "-disable"):
+                print("  Error: Choose -enable or -disable, not both.")
+                return
+            if self._has_flag(rest, "-enable"):
+                deployment.set_ha_only(True)
+            elif self._has_flag(rest, "-disable"):
+                deployment.set_ha_only(False)
+            print(f"  HA Only: {'enabled' if deployment.ha_only() else 'disabled'}")
+        elif sub == "recover":
+            if not group_name:
+                print("  Usage: hagroup recover -group <label> [-slot <id>]")
+                return
+            group = deployment.get_ha_group(group_name)
+            if not group:
+                print("  Error: HA group not found")
+                return
+            for member in group["members"]:
+                if slot is None or member["slot_id"] == int(slot):
+                    result = deployment.recover_ha_member(group_name, member["slot_id"])
+                    print(f"  Slot {member['slot_id']}: " + ("recovered" if result["success"] else result["error"]))
+        elif sub == "halog":
+            print("  hagroup halog is recognized but not implemented yet.")
         else:
             print(f"  Unknown hagroup subcommand: {sub}")
 

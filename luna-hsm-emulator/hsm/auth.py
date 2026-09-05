@@ -15,6 +15,7 @@ from typing import Optional
 from storage.db import Storage
 from hsm.ped import PEDManager, PEDError
 from hsm.lifecycle import PartitionLifecycleManager
+from hsm.activation import ActivationManager
 from pkcs11.constants import (
     PKCS11Error, CKR_PIN_INCORRECT, CKR_PIN_LOCKED, CKR_PIN_LEN_RANGE,
     CKR_USER_NOT_LOGGED_IN, CKR_USER_ALREADY_LOGGED_IN,
@@ -50,11 +51,22 @@ class AuthManager:
         self.storage = storage
         self.ped = PEDManager(storage)
         self.lifecycle = PartitionLifecycleManager(storage)
+        self.activation = ActivationManager(storage)
+        self._epoch = None
         # session_id -> (slot_id, role)
         self._sessions: dict = {}
 
-    def login(self, session_id: int, slot_id: int, role: str, pin: str):
-        """Authenticate *session_id* as *role* on partition *slot_id*."""
+    def _check_epoch(self):
+        epoch = self.activation.device_status()["epoch"]
+        if self._epoch is not None and epoch != self._epoch:
+            self._sessions.clear()
+        self._epoch = epoch
+
+    def login(self, session_id: int, slot_id: int, role: str, pin: str,
+              ped_keys: list = None, ped_secret: str = None):
+        """PIN is a challenge when configured; PED quorum is a separate factor."""
+        self._check_epoch()
+        self.activation.require_online()
         partition = self.storage.get_partition(slot_id)
         if partition is None:
             raise PKCS11Error(CKR_USER_NOT_LOGGED_IN, "Partition not found")
@@ -81,13 +93,18 @@ class AuthManager:
         # form "SERIAL1,SERIAL2|optional shared secret".  This keeps C_Login's
         # PKCS#11-compatible signature while allowing quorum training.
         if self.ped.get_auth_mode() == "ped":
+            activation = self.activation.status(slot_id, role)
+            if activation["activation_enabled"] and activation["challenge_configured"]:
+                self.activation.authenticate(slot_id, role, pin, ped_keys, ped_secret)
+                self._sessions[session_id] = (slot_id, role)
+                return
             serial_text, separator, shared_secret = (pin or "").partition("|")
-            serials = [value.strip() for value in serial_text.split(",") if value.strip()]
+            serials = ped_keys if ped_keys is not None else [value.strip() for value in serial_text.split(",") if value.strip()]
             key_type = {ROLE_SO: "blue", ROLE_CO: "black",
                         ROLE_LCO: "black", ROLE_CU: "gray"}.get(role)
             try:
                 self.ped.authenticate(key_type, serials,
-                                      shared_secret if separator else None,
+                                      ped_secret if ped_keys is not None else (shared_secret if separator else None),
                                       scope=str(slot_id))
             except PEDError as exc:
                 raise PKCS11Error(CKR_PIN_INCORRECT, str(exc)) from exc
@@ -148,6 +165,7 @@ class AuthManager:
 
     def get_role(self, session_id: int) -> Optional[str]:
         """Return the role of the logged-in session, or None."""
+        self._check_epoch()
         entry = self._sessions.get(session_id)
         return entry[1] if entry else None
 
@@ -157,6 +175,7 @@ class AuthManager:
         return entry[0] if entry else None
 
     def is_logged_in(self, session_id: int) -> bool:
+        self._check_epoch()
         return session_id in self._sessions
 
     def set_pin(self, slot_id: int, role: str, pin: str):

@@ -230,6 +230,7 @@ class TokenManager:
             raise PKCS11Error(CKR_TOKEN_NOT_PRESENT, f"Slot {slot_id} not found")
         initial_role = (ROLE_CO if self.lifecycle.partition_type(slot_id) == PARTITION_LEGACY
                         else ROLE_SO)
+        self.auth.activation.invalidate(slot_id, forget=True)
         self.auth.set_pin(slot_id, initial_role, so_pin)
         updates = {"initialized": 1}
         if label:
@@ -1114,6 +1115,9 @@ class TokenManager:
             raise PKCS11Error(CKR_TOKEN_NOT_RECOGNIZED,
                               "Only CO, LCO, and CU roles can be deactivated")
 
+        if self.auth.ped.get_auth_mode() == "ped":
+            self.auth.activation.deactivate(slot_id, role_name, actor_role)
+            return
         ptype = self.lifecycle.partition_type(slot_id)
         superior = (ROLE_SO if ptype == PARTITION_PPSO else
                     ("HSO" if role_name == "CO" else ROLE_CO))

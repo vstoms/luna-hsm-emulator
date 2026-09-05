@@ -261,7 +261,8 @@ class CloningDomainManager:
         return bool(stored.get(policy.policy_id, policy.default_value))
 
     def clone_objects(self, source_slot: int, destination_slot: int,
-                      labels: list = None, token_objects_only: bool = False) -> dict:
+                      labels: list = None, token_objects_only: bool = False,
+                      synchronize: bool = False) -> dict:
         if source_slot == destination_slot:
             raise PKCS11Error(CKR_ARGUMENTS_BAD, "Source and destination partitions must differ")
         if self.storage.get_partition(source_slot) is None:
@@ -289,7 +290,15 @@ class CloningDomainManager:
                            or not self._policy_enabled(destination_slot, policy)):
                 skipped_policy.append(obj.label())
                 continue
-            if obj.label() in existing_labels:
+            identity = self.storage.object_identity(obj.handle)
+            existing_handle = self.storage.object_handle(destination_slot, identity)
+            if synchronize and existing_handle is not None:
+                replica = CKObject.from_dict(obj.to_dict())
+                replica.handle = existing_handle
+                self.storage.update_object(existing_handle, replica, material)
+                skipped_existing.append(obj.label())
+                continue
+            if not synchronize and obj.label() in existing_labels:
                 skipped_existing.append(obj.label())
                 continue
             destination = self.storage.get_partition(destination_slot)
@@ -298,7 +307,8 @@ class CloningDomainManager:
             cloned_obj = CKObject.from_dict(obj.to_dict())
             cloned_obj.handle = self.storage.get_max_handle() + 1
             self.storage.insert_object(cloned_obj.handle, destination_slot,
-                                       cloned_obj.label(), cloned_obj, material)
+                                       cloned_obj.label(), cloned_obj, material,
+                                       cloning_id=identity)
             existing_labels.add(cloned_obj.label())
             cloned.append(cloned_obj.label())
 
