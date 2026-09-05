@@ -15,6 +15,7 @@ A **software emulator** of the Thales Luna 7 Network HSM for educational and tra
 - [lunacm Command Reference](#lunacm-command-reference)
 - [LunaSH Command Reference](#lunash-command-reference)
 - [Training Exercises](#training-exercises)
+  - [Real-World Operational Scenarios](#real-world-operational-scenarios)
 - [Architecture](#architecture)
 - [Supported Algorithms](#supported-algorithms)
 - [Testing](#testing)
@@ -439,7 +440,7 @@ sysconf regenCert [-force] [-csr] [-hostname <h>] [-keytype RSA|EC] [-keysize <n
 
 ## Training Exercises
 
-These exercises cover common HSM workflows, from basic key generation to advanced NTLS certificate management, HA groups, and audit verification.
+These exercises cover common HSM workflows, from basic key generation to advanced NTLS certificate management, HA groups, and audit verification. Exercises 1–21 teach individual features; [Exercises 22–31](#real-world-operational-scenarios) chain them into the change tickets, incidents, and ceremonies you will meet in production.
 
 ### Exercise 1: Initialize and Explore the HSM
 
@@ -1242,6 +1243,429 @@ hsm supportInfo
 ```
 
 **What you learned**: The Luna 7 uses software licenses to enable features like HA, STC, key backup, and maximum partition counts. You can view, enable, disable, and configure license limits. The support bundle (`hsm supportInfo`) generates a diagnostic report safe to share with support teams — it excludes all credentials, PINs, password hashes, private keys, encrypted key blobs, and secret values.
+
+---
+
+## Real-World Operational Scenarios
+
+Exercises 22–31 are written the way HSM work actually happens in production: as change tickets, incidents, and ceremonies rather than isolated commands. Each one uses both shells where an operator would, and ends with the checks an auditor or change board expects to see.
+
+> **Lab assumptions:** Start each exercise from a clean database snapshot unless it names a prerequisite. Replace example addresses, names, domains, and credentials with values from your change ticket. Commands marked **emulator-only** inject failures that would be caused by real hardware, networking, or facilities events. “Application checkpoint” steps name the PKCS#11 calls a real application performs; real LunaCM intentionally does not serve as a general key-management application. Exact command options can vary by Luna Appliance Software and Client release, so verify the runbook against the Thales documentation for your deployed versions.
+
+### Exercise 22: Day-One Appliance Commissioning
+
+**Scenario**: A new Luna Network HSM 7 has arrived in the data center. Bring it from factory state to "ready for an application team" in a single change window.
+
+```bash
+python hsm_emulator.py --lunash
+login                                   # admin / default password
+
+# 1. Network identity first — NTLS certificates embed the hostname
+network hostname hsm-prod-01
+network interface static eth0 -ip 10.20.30.40 -netmask 255.255.255.0 -gateway 10.20.30.1
+network dns add nameserver 10.20.0.53
+sysconf timezone set Europe/Oslo
+ntp add ntp1.corp.example
+ntp sync
+status date                             # audit timestamps depend on correct time
+
+# 2. Central logging before anything sensitive happens
+syslog remotehost add 10.20.0.100
+syslog severity set info
+
+# 3. Separate duties: no shared admin account
+user add -name ops_jane -role operator
+user add -name sec_audit -role audit
+user list
+
+# 4. Initialize the HSM (password-authenticated) and create the first partition
+hsm init -label PROD-HSM-01
+hsm login
+hsm show
+partition create -partition payments -version 1
+partition init -partition payments -label "Payments Prod" -domain payments-domain-2026
+partition list
+
+# 5. Regenerate the NTLS server certificate now that hostname/IP are final
+sysconf regenCert -force -hostname hsm-prod-01 -organization "Example Corp" -country NO -days 730
+ntls bind eth0
+service restart ntls
+ntls show
+
+# 6. Register the application server and grant it the partition
+client register -name pay-app-01 -ip 10.20.31.10
+client assignPartition -name pay-app-01 -partition 1
+ntls connection create -client pay-app-01 -slot 1 -ip 10.20.31.10 -hostname pay-app-01.corp.example
+ntls connection connect -client pay-app-01 -slot 1
+client show -name pay-app-01
+hsm logout
+```
+
+**What you learned**: The order matters. Hostname and time are set before certificates and audit logs depend on them; logging is configured before roles and keys exist; the HSM SO logs out when finished. This is a representative commissioning order; validate it against the installation guide for your appliance and client releases.
+
+---
+
+### Exercise 23: Onboarding a PED-Authenticated Partition with Activation
+
+**Scenario**: A signing service needs a partition on a multifactor (PED) HSM, but the application restarts nightly and cannot have someone standing at the PED each time. Enable activation so the app logs in with a challenge secret.
+
+```bash
+python hsm_emulator.py --lunash
+login
+hsm init -label PED-HSM-01 -ped -force
+ped connect
+ped key create -type blue -m 2 -n 3           # HSM SO quorum (2 of 3 custodians)
+ped key create -type red -m 1 -n 2            # cloning-domain custodians
+ped key create -type white -m 2 -n 3          # independent Auditor quorum
+ped key list                                  # record serials for the key ceremony log
+hsm login                                     # present two Blue serials
+partition create -partition signer
+ped key create -type blue -m 1 -n 2 -scope 1  # Partition SO keys
+ped key create -type black -m 2 -n 3 -scope 1 # Crypto Officer quorum
+partition init -partition signer -label "Code Signing"
+# Emulator note: partition init currently asks for a typed domain secret.
+# A physical multifactor Luna ceremony presents the Red PED-key quorum here.
+hsm logout
+exit
+
+python hsm_emulator.py
+slot set -slot 1
+role login -name po                           # Blue key (scope 1)
+role init -name co                            # Black keys
+partition changepolicy -policy 22 -value 1    # Allow activation
+partition changepolicy -policy 23 -value 1    # Allow auto-activation
+role createchallenge -name co                 # PO sets the CO's initial challenge secret
+role logout
+
+# First CO login: challenge secret AND Black PED key quorum
+role login -name co
+role show -name co                            # Activated: True, Auto Activation Armed: True
+role logout
+
+# From now on the application needs only the challenge secret
+role login -name co                           # no PED prompt
+role changepw -name co                        # CO rotates the challenge secret (HSM policy 21 style)
+# The signing application now calls PKCS#11 C_GenerateKeyPair on this session;
+# production private-key templates set CKA_SENSITIVE=TRUE and CKA_EXTRACTABLE=FALSE.
+role logout
+```
+
+**What you learned**: Activation caches the PED-key secret after one quorum login; the challenge secret becomes the application credential. The PO sets the CO's challenge, the CO sets CU/LCO challenges, and the PO itself can never be activated. This mirrors the production activation pattern: the first login satisfies the quorum, while subsequent application logins use the challenge secret.
+
+---
+
+### Exercise 24: Planned Maintenance Window with Auto-Activation
+
+**Prerequisite**: Complete Exercise 23 and take a database snapshot.
+
+**Scenario**: The appliance needs a firmware update and a reboot. Prove to the change board that the signing service resumes without a PED ceremony — and understand the two-hour limit.
+
+```bash
+# Prerequisite: Exercise 23 completed and CO logged in at least once
+python hsm_emulator.py --lunash
+login
+hsm login
+hsm firmware upgrade -version 7.14.0
+sysconf appliance reboot -force               # brief reboot, cache retained
+exit
+
+python hsm_emulator.py
+slot set -slot 1
+role login -name co                           # challenge only — still activated
+role logout
+exit
+
+# Now simulate an extended outage (power work, > 2 hours)
+python hsm_emulator.py --lunash
+login
+sysconf appliance reboot -downtime 7300 -force
+exit
+
+python hsm_emulator.py
+slot set -slot 1
+role login -name co                           # challenge accepted, but Black PED keys are now demanded
+role show -name co
+```
+
+**What you learned**: Auto-activation keeps the cached credential through a reboot or power loss of up to two hours. Longer outages, or a reboot without policy 23, require a fresh PED quorum. Schedule custodians for long maintenance windows; don't assume the app will come back on its own.
+
+---
+
+### Exercise 25: Production HA — Member Outage During Live Traffic
+
+**Scenario**: Payments run against a two-member HA group. One HSM loses network. Verify that the application keeps working, that keys created during the outage reach the recovered member, and that a key deleted during the outage stays deleted.
+
+```bash
+python hsm_emulator.py --lunash
+login
+hsm login
+partition create -partition pay-a -version 1
+partition create -partition pay-b -version 1
+partition init -partition pay-a -domain payments-domain-2026
+partition init -partition pay-b -domain payments-domain-2026   # same domain is mandatory
+hsm logout
+exit
+
+python hsm_emulator.py
+slot set -slot 1
+role login -name po
+role init -name co
+role logout
+slot set -slot 2
+role login -name po
+role init -name co
+role logout
+
+hagroup creategroup -label pay-ha -slot 1 -password <co-password>
+hagroup addmember -group pay-ha -slot 2 -password <co-password>
+hagroup haonly -enable                        # applications only ever see the virtual slot
+hagroup listgroups                            # note the Virtual Slot id (1000000)
+slot list
+slot set -slot 1000000
+role login -name co
+# Application checkpoint: call C_GenerateKey(CKM_AES_KEY_GEN) with label
+# pan-wrap-key on this session. The returned logical handle is valid after failover.
+role logout
+exit
+
+# Take member 2 off the network (LunaSH fault injection)
+python hsm_emulator.py --lunash
+login
+ha network -name pay-ha -slot 2 -state partitioned
+ha status -name pay-ha                        # degraded, failover count incremented
+exit
+
+python hsm_emulator.py
+slot set -slot 1000000
+role login -name co
+# Application checkpoint: C_EncryptInit/C_Encrypt still succeeds. Then call
+# C_GenerateKey for created-during-outage and C_DestroyObject for pan-wrap-key.
+role logout
+exit
+
+# Restore the network and let the member recover
+python hsm_emulator.py --lunash
+login
+ha network -name pay-ha -slot 2 -state restored
+ha status -name pay-ha                        # both members active, sync current
+exit
+
+python hsm_emulator.py
+slot set -slot 2                              # LunaCM can inspect members despite HA Only
+role login -name co
+# Verification application: C_FindObjects finds created-during-outage and does
+# not find pan-wrap-key on the recovered member.
+```
+
+**What you learned**: Applications bind to the HA virtual slot and never to a member. Crypto continues on surviving members, mutations replicate when members return, and deletions are tombstoned so recovery cannot resurrect a revoked key. HA Only prevents an engineer from "helpfully" pointing an app at a physical slot.
+
+---
+
+### Exercise 26: Incident Response — Tamper Event
+
+**Prerequisite**: Use the PED partition and White Auditor key set from Exercise 23.
+
+**Scenario**: The data-center team reports the HSM chassis was opened during a rack move. Walk the incident: confirm the tamper, understand what was lost, recover safely, and document it.
+
+```bash
+python hsm_emulator.py --lunash
+login
+hsm login
+hsm tamper simulate                           # emulator-only fault injection
+hsm tamper show                               # Tamper: TRIPPED
+exit
+
+python hsm_emulator.py
+slot set -slot 1
+role login -name co                           # fails: device error / PED quorum required
+exit
+
+python hsm_emulator.py --lunash
+login
+hsm login                                     # controlled-recovery authorization
+hsm tamper clear                              # controlled recovery after physical inspection
+sysconf appliance reboot -force
+audit login                                 # present two White PED-key shares
+audit log list                                # HSMTamper, HSMClearTamper, HSMReboot entries
+audit log verify
+exit
+
+python hsm_emulator.py
+slot set -slot 1
+role login -name co                           # challenge + Black PED keys: cache was zeroized
+role show -name co
+```
+
+**What you learned**: A tamper zeroizes cached PED credentials and invalidates every application session — even with auto-activation enabled. The emulator preserves partition keys while clearing activation caches; on real hardware, key availability depends on the tamper type and controlled-recovery policy. Each activated role must be re-quorumed. The audit trail must show the tamper, the clearance, and who did it.
+
+---
+
+### Exercise 27: NTLS Certificate Expiry and Rotation
+
+**Scenario**: Monitoring flags that the appliance's NTLS server certificate expires in 30 days. Rotate it with minimal client disruption and prove every client is back.
+
+```bash
+python hsm_emulator.py --lunash
+login
+ntls certificate show                         # note expiry and fingerprint
+ntls connection list                          # inventory of clients that will break
+
+# Change window: regenerate with the corporate DN, longer validity
+sysconf regenCert -force -hostname hsm-prod-01 -organization "Example Corp" -orgunit "Payments" -country NO -days 730 -san hsm-prod-01.corp.example
+ntls connection list                          # every connection now shows invalidated
+ntls certificate show                         # new fingerprint — publish to app teams
+
+# Each client re-exchanges certificates (what `vtl addServer` does on the client)
+ntls connection restore -client pay-app-01 -slot 1
+ntls connection connect -client pay-app-01 -slot 1
+ntls connection show -client pay-app-01 -slot 1
+service status ntls
+```
+
+**What you learned**: Regenerating the server certificate breaks trust with *every* registered client at once. Plan it as a coordinated change: inventory connections first, publish the new fingerprint, and verify each client individually afterwards.
+
+---
+
+### Exercise 28: Lost PED Key — Custodian Offboarding
+
+**Scenario**: A key custodian leaves the company and their Black PED key cannot be recovered. Determine whether the CO quorum is still reachable, restore redundancy, and re-key if required.
+
+```bash
+python hsm_emulator.py --lunash
+login
+ped connect
+ped key list                                  # identify the departed custodian's serial
+ped key lose -serial BL-XXXXXXXX              # marks it lost; shows shares remaining vs threshold
+
+# Still recoverable (2-of-3 with 2 active shares)?  Restore redundancy:
+hsm login
+ped key duplicate -serial BL-YYYYYYYY -count 1   # duplicate is another copy of the SAME share
+ped key list
+
+# If quorum can no longer be met, conduct a replacement-key ceremony.
+# The emulator creates a replacement Black set; physical Luna uses role reset
+# with the superior credential and PED prompts.
+ped key create -type black -m 2 -n 3 -scope 1
+exit
+python hsm_emulator.py
+slot set -slot 1
+role login -name po
+role resetchallenge -name co                  # new application challenge
+role logout
+```
+
+**What you learned**: Marking a key lost tells you immediately whether the quorum is still reachable. Duplicates do not add shares; they only protect against loss of the same share. If a threshold becomes unreachable, the superior role must re-initialize the credential — which is why M-of-N is chosen with staff turnover in mind.
+
+---
+
+### Exercise 29: Locked-Out Crypto Officer
+
+**Scenario**: An application deploy shipped the wrong password. The CO role is locked, the service is down, and the on-call engineer needs a safe recovery path — without weakening the lockout policy.
+
+```bash
+python hsm_emulator.py
+slot set -slot 1
+partition showpolicies                        # note policy 20 (max failed logins) and 15
+role login -name co                           # wrong PIN … repeat until "LOCKED"
+role show -name co
+
+# Recovery is a superior-role action, not a policy change
+role login -name po
+role resetpw -name co                         # or: role resetchallenge -name co on a PED partition
+role logout
+role login -name co                           # new credential works
+role logout
+exit
+python hsm_emulator.py --lunash
+login
+audit log list                                # failed C_Login entries followed by RoleResetPW
+audit log verify
+```
+
+**What you learned**: Lockout is doing its job; the fix is credential reset by the superior role and a corrected deployment, never raising the attempt limit "temporarily". The audit chain should show the failures and the reset together.
+
+---
+
+### Exercise 30: Signing-Key Ceremony with Backup and Evidence
+
+**Scenario**: Create a production code-signing key under two-person control, prove it can never leave the HSM in the clear, back it up to a Backup HSM, and produce the evidence package.
+
+```bash
+python hsm_emulator.py
+slot set -slot 1
+role login -name po
+partition changepolicy -policy 1 -value 0     # disallow private-key wrapping
+partition showpolicies -verbose
+role logout
+
+role login -name co
+# Ceremony application performs:
+# 1. C_GenerateKeyPair(CKM_RSA_PKCS_KEY_PAIR_GEN, RSA-3072)
+# 2. Private template: CKA_LABEL=release-signing-2026,
+#    CKA_SENSITIVE=TRUE, CKA_EXTRACTABLE=FALSE
+# 3. Negative test: C_WrapKey must return CKR_ATTRIBUTE_SENSITIVE
+# 4. C_Sign/C_Verify over the independently hashed release artifact
+role logout
+exit
+
+# Prerequisite: initialize and recover the Backup HSM as in Exercise 14.
+# Day-to-day Backup HSM administration uses LunaSH's token backup family.
+python hsm_emulator.py --lunash
+login
+token backup login
+token backup list
+# Perform partition archive/restore following the site's Luna Backup HSM runbook;
+# this emulator's detailed cloning exercise remains Exercise 14.
+audit log list
+audit log verify
+hsm supportInfo
+```
+
+**What you learned**: Non-extractable, non-wrappable keys can still be backed up because cloning happens inside the security boundary between HSMs sharing a domain. The ceremony record is the audit chain plus the policy snapshot, not a screenshot.
+
+---
+
+### Exercise 31: Partition Decommissioning
+
+**Scenario**: An application is retired. Remove its access, destroy its keys with proof, and free the partition slot — in the order that keeps the audit trail intact.
+
+```bash
+python hsm_emulator.py --lunash
+login
+
+# 1. Cut access first so nothing can use the keys during teardown
+ntls connection disconnect -client pay-app-01 -slot 1
+client revokePartition -name pay-app-01 -partition 1
+client delete -name pay-app-01
+
+# 2. Destroy key material with an audited command
+hsm login
+partition clear -name payments -force
+exit
+
+# 3. Verify from the client side and capture evidence before deleting
+python hsm_emulator.py
+slot set -slot 1
+# Verification application: C_FindObjects returns no objects.
+exit
+
+python hsm_emulator.py --lunash
+login
+audit log list
+audit log verify
+exit
+
+# 4. Remove the partition (HSM SO only) and confirm capacity is released
+python hsm_emulator.py --lunash
+login
+hsm login
+partition delete -partition payments -force
+partition list
+license show max_partitions
+hsm logout
+```
+
+**What you learned**: Decommissioning runs in reverse of commissioning: revoke access, destroy keys, verify and preserve the audit trail, then delete. Deleting the partition first would erase the objects without a clear audit story.
 
 ---
 

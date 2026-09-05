@@ -785,7 +785,7 @@ OK
 
 ## Training Exercises
 
-The emulator includes **21 hands-on training exercises** covering real-world HSM workflows. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
+The emulator includes **31 hands-on training exercises**. Exercises 1–21 teach individual capabilities; exercises 22–31 combine them into realistic commissioning changes, key ceremonies, outages, certificate rotations, lockout recovery, and decommissioning. See the [detailed exercise guide](luna-hsm-emulator/README.md#training-exercises) for step-by-step instructions.
 
 | # | Exercise | Skills Learned |
 |---|----------|---------------|
@@ -810,6 +810,16 @@ The emulator includes **21 hands-on training exercises** covering real-world HSM
 | 19 | NTP Configuration | NTP server management, enable/disable, synchronization |
 | 20 | Network Bonding | Interface bonding for redundancy, bond0/bond1 configuration |
 | 21 | Licenses and Support | License management, support-bundle generation |
+| 22 | Day-One Appliance Commissioning | Ordered network, time, logging, RBAC, partition, NTLS, and client setup |
+| 23 | PED Partition Onboarding | Custodian key sets, activation policy, challenge secrets, initial quorum |
+| 24 | Planned Maintenance Reboot | Auto-activation validation and the two-hour outage boundary |
+| 25 | Production HA Outage | Virtual slots, HA Only, live failover, mutation recovery, deletion tombstones |
+| 26 | Tamper Incident Response | Session invalidation, controlled recovery, fresh quorum, audit evidence |
+| 27 | NTLS Certificate Rotation | Trust-impact inventory, certificate renewal, client restoration |
+| 28 | PED Custodian Offboarding | Lost-share analysis, duplication, replacement-key ceremony |
+| 29 | Crypto Officer Lockout | Superior-role credential reset and incident audit trail |
+| 30 | Signing-Key Ceremony | Restrictive key templates, negative export test, backup and evidence |
+| 31 | Partition Decommissioning | Revoke access, destroy keys, verify evidence, release capacity |
 
 ---
 
